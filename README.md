@@ -35,7 +35,7 @@ await portal.connect(url, token)
 def on_action(action):
     robot.send_action(action)
 
-portal.set_action_callback(on_action)
+portal.on_action(on_action)
 
 while True:
     obs = robot.get_observation()
@@ -60,7 +60,7 @@ def on_observation(obs):
     action = model.select_action(obs)
     portal.send_action(action)
 
-portal.set_observation_callback(on_observation)
+portal.on_observation(on_observation)
 ```
 
 ## Synchronization

@@ -7,8 +7,8 @@
 | Video publish | `NativeVideoSource` + `LocalVideoTrack` + `capture_frame()` | One per camera. User timestamp set via `FrameMetadata` packet trailer. |
 | Video timestamp | `PacketTrailerFeatures` + `FrameMetadata` ([PR #890](https://github.com/livekit/rust-sdks/pull/890)) | Embeds `user_timestamp` (u64 µs) as a binary trailer on encoded frames. Survives full WebRTC pipeline including E2EE. |
 | Video subscribe | `NativeVideoStream` (async `Stream` trait) | One per subscribed track. Yields `BoxVideoFrame` with `frame_metadata.user_timestamp`. |
-| State/action publish | `DataTrack<Local>` + `try_push(DataTrackFrame)` | One data track for state, one for action. `user_timestamp` in ms. |
-| State/action subscribe | `DataTrack<Remote>` (async stream) | Mirror of publish side. |
+| State/action publish | `LocalParticipant::publish_data(DataPacket)` | Reliable SCTP delivery via `reliable: true`. Topic-based routing (`portal_state`, `portal_action`). |
+| State/action receive | `RoomEvent::DataReceived` | Dispatched synchronously by topic in the room event handler. No async task needed. |
 | Session | LiveKit Room | `session` param maps to room name. |
 | Role | Participant identity | `role` sets identity. Unique per room — prevents duplicate robots. |
 
@@ -30,7 +30,7 @@ Prefix with a `u64` timestamp (system time in microseconds), so every state/acti
 [u64 timestamp_us][f64 val1][f64 val2]...[f64 valN]
 ```
 
-Total overhead per state/action: 8 bytes for timestamp. The `DataTrackFrame.user_timestamp` also exists but is in milliseconds — we embed our own microsecond timestamp in the payload for consistency with video frame `timestamp_us`.
+Total overhead per state/action: 8 bytes for timestamp.
 
 ## Components
 
@@ -59,22 +59,21 @@ Main struct. Owns the LiveKit room connection and all sub-components. Created fr
 
 ```rust
 struct Portal {
-    config: PortalConfig,
+    config: PortalConfigData,
     room: Room,
     // Role determines which of these are active:
     video_publishers: HashMap<String, VideoPublisher>,   // Robot only
-    state_publisher: Option<DataTrackPublisher>,          // Robot only
-    action_publisher: Option<DataTrackPublisher>,         // Operator only
+    state_publisher: Option<DataPublisher>,               // Robot only
+    action_publisher: Option<DataPublisher>,              // Operator only
     video_receivers: HashMap<String, VideoReceiver>,      // Operator only
-    state_receiver: Option<DataTrackReceiver>,            // Operator only
-    action_receiver: Option<DataTrackReceiver>,           // Robot only
     sync_buffer: Option<SyncBuffer>,                      // Operator only
 }
 ```
 
 On `connect()`:
-- Robot: creates `VideoPublisher` per camera, `DataTrackPublisher` for state, `DataTrackReceiver` for action
-- Operator: waits for track subscriptions via `RoomEvent::TrackSubscribed`, creates `VideoReceiver` per matched camera name, `DataTrackReceiver` for state, `DataTrackPublisher` for action
+- Robot: creates `VideoPublisher` per camera, `DataPublisher` for state (reliable `publish_data` with topic `portal_state`)
+- Operator: creates `SyncBuffer`, `DataPublisher` for action (reliable `publish_data` with topic `portal_action`), waits for `RoomEvent::TrackSubscribed` to create `VideoReceiver` per matched camera name
+- Both: room event handler dispatches `RoomEvent::DataReceived` by topic for state/action receive
 
 ### 3. `VideoPublisher`
 
@@ -93,19 +92,21 @@ Track is published with `packet_trailer_features: PacketTrailerFeatures { user_t
 
 Frame input: user provides raw pixel data. Portal wraps it in an `I420Buffer` (or accepts a pre-built `VideoFrame`). The Python layer would accept numpy arrays and convert.
 
-### 4. `DataTrackPublisher`
+### 4. `DataPublisher`
 
-Wraps one `DataTrack<Local>` for state or action.
+Wraps `LocalParticipant::publish_data` for reliable state/action delivery.
 
 ```rust
-struct DataTrackPublisher {
-    fields: Vec<String>,  // schema
-    track: DataTrack<Local>,
+struct DataPublisher {
+    fields: Vec<String>,           // schema
+    topic: String,                 // "portal_state" or "portal_action"
+    local_participant: LocalParticipant,
 }
 ```
 
-- `send(values: &[f64], timestamp_us: Option<u64>)`: serializes to `[timestamp][f64...]`, pushes as `DataTrackFrame`
+- `send(values: &[f64], timestamp_us: Option<u64>)`: serializes to `[timestamp][f64...]`, sends via `publish_data(DataPacket { payload, topic, reliable: true })`
 - If no custom timestamp, uses `SystemTime::now()` converted to µs
+- Fire-and-forget: `publish_data` is async but spawned as a task to keep `send` synchronous
 
 ### 5. `VideoReceiver`
 
@@ -121,13 +122,14 @@ struct VideoReceiver {
 
 Each received `BoxVideoFrame` carries `frame_metadata.user_timestamp` — the sender's system time embedded via the packet trailer. This is the key used for sync matching (not `timestamp_us`, which is the RTP capture timestamp and not user-controllable end-to-end).
 
-### 6. `DataTrackReceiver`
+### 6. Data Receive (no dedicated struct)
 
-Wraps a subscribed `DataTrack<Remote>`. Deserializes bytes back to `(timestamp_us, Vec<f64>)`.
+Handled synchronously in the room event handler via `RoomEvent::DataReceived`. The `handle_data_received` function dispatches by topic:
 
-For action receiver (robot side): deserializes and fires `on_action` callback directly — no sync needed.
+- `portal_action` (robot receives): deserializes and fires `on_action` callback directly
+- `portal_state` (operator receives): deserializes, fires raw `on_state` callback, and pushes into `SyncBuffer`
 
-For state receiver (operator side): deserializes and pushes into `SyncBuffer`.
+No async task or dedicated receiver struct needed — data arrives as room events.
 
 ### 7. `SyncBuffer`
 
@@ -135,29 +137,22 @@ The core synchronization engine. Lives on the operator side only.
 
 ```rust
 struct SyncBuffer {
-    video_buffers: HashMap<String, VecDeque<TimestampedFrame>>,  // per track
-    state_buffer: VecDeque<TimestampedState>,
-    config: SyncConfig,  // search_range, buffer sizes
-    drop_callback: Option<Box<dyn Fn(Vec<TimestampedState>)>>,
-    observation_callback: Option<Box<dyn Fn(Observation)>>,
-}
-
-struct TimestampedFrame {
-    timestamp_us: u64,  // from frame_metadata.user_timestamp (packet trailer)
-    frame: BoxVideoFrame,
-}
-
-struct TimestampedState {
-    timestamp_us: i64,
-    values: HashMap<String, f64>,
+    video_buffers: HashMap<String, VecDeque<Arc<VideoFrameData>>>,  // per track
+    state_buffer: VecDeque<(u64, Vec<f64>)>,  // (timestamp_us, values)
+    state_fields: Vec<String>,
+    config: SyncConfig,
+    observation_cb: Option<Box<dyn Fn(Observation)>>,
+    drop_cb: Option<Box<dyn Fn(Vec<HashMap<String, f64>>)>>,
 }
 
 struct Observation {
     state: HashMap<String, f64>,
-    frames: HashMap<String, BoxVideoFrame>,  // camera_name -> frame
-    timestamp_us: i64,
+    frames: HashMap<String, VideoFrameData>,  // camera_name -> owned frame data
+    timestamp_us: u64,
 }
 ```
+
+No wrapper types — `Arc<VideoFrameData>` stores frames directly (VideoFrameData already has `timestamp_us`), and state is a `(u64, Vec<f64>)` tuple.
 
 **Sync algorithm** (runs whenever a new state or frame arrives):
 
@@ -305,19 +300,20 @@ set_search_range(30)            → config.search_range_us = 30_000
     │
     ▼
 connect()                       → Room::connect(url, token)
-                                → based on role, create publishers/receivers
-                                → Robot: publish video tracks + state data track, subscribe action
-                                → Operator: subscribe video + state, publish action data track
+                                → based on role, create publishers
+                                → Robot: publish video tracks, create DataPublisher for state
+                                → Operator: create SyncBuffer, create DataPublisher for action
+                                → Both: room event handler dispatches DataReceived + TrackSubscribed
     │
     ▼
 send_video_frame("cam1", frame) → VideoPublisher["cam1"].send_frame(frame, now_us())
-send_state({...})               → DataTrackPublisher.send(values, now_us())
-send_action({...})              → DataTrackPublisher.send(values, now_us())
+send_state({...})               → DataPublisher.send(values, now_us()) via publish_data(reliable)
+send_action({...})              → DataPublisher.send(values, now_us()) via publish_data(reliable)
     │
     ▼
-on_action(cb)                   → DataTrackReceiver sets callback
-on_observation(cb)              → SyncBuffer sets observation callback
-on_drop(cb)                     → SyncBuffer sets drop callback
+on_action(cb)                   → callback stored, fired on DataReceived(topic="portal_action")
+on_observation(cb)              → SyncBuffer observation callback
+on_drop(cb)                     → SyncBuffer drop callback
 ```
 
 ## Crate Structure
@@ -326,21 +322,26 @@ on_drop(cb)                     → SyncBuffer sets drop callback
 livekit-portal/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs              // pub mod everything, UniFFI proc macros
-│   ├── portal.rs           // Portal struct, connect(), role-based setup
-│   ├── config.rs           // PortalConfig, builder methods
-│   ├── video_publisher.rs  // VideoPublisher
-│   ├── video_receiver.rs   // VideoReceiver
-│   ├── data_publisher.rs   // DataTrackPublisher, serialization
-│   ├── data_receiver.rs    // DataTrackReceiver, deserialization
-│   └── sync_buffer.rs      // SyncBuffer, sync algorithm, Observation
+│   ├── lib.rs              // pub mod everything, UniFFI scaffolding
+│   ├── portal.rs           // Portal struct, connect(), role-based setup, room event handler
+│   ├── config.rs           // PortalConfig (UniFFI Object), PortalConfigData
+│   ├── video.rs            // VideoPublisher + VideoReceiver + frame conversion helpers
+│   ├── data.rs             // DataPublisher (reliable publish_data) + handle_data_received
+│   ├── sync_buffer.rs      // SyncBuffer, sync algorithm, Observation
+│   ├── serialization.rs    // compact binary wire format for state/action
+│   ├── types.rs            // Role, Observation, VideoFrameData, SyncConfig
+│   └── error.rs            // PortalError
 ├── python/
 │   └── livekit_portal/     // generated by UniFFI + thin helpers for numpy conversion
 ```
 
 ## Open Questions
 
-1. **Room token generation**: who provides the LiveKit token? Does Portal generate it (needs API key/secret) or does the user pass it in?
-2. **Video encoding options**: should Portal expose `TrackPublishOptions` (codec, bitrate, simulcast) or pick sensible defaults for robotics (low-latency H.264, no simulcast)?
-3. **Frame input format on Python side**: accept numpy RGBA/RGB arrays and convert to I420 internally? Or require I420?
-4. **Reconnection**: the spec says "stateless, graceful reconnect" — LiveKit's `Room` handles reconnection internally. Portal just needs to re-subscribe on `TrackSubscribed` events after reconnect. State/observation buffers should be flushed on disconnect.
+1. **Frame input format on Python side**: accept numpy RGBA/RGB arrays and convert to I420 internally? Or require I420?
+
+## Resolved
+
+- **Room token generation**: user provides the token. Portal calls `Room::connect(url, token)` directly.
+- **Video encoding options**: sensible defaults for robotics (H.264, no simulcast). Not configurable for now.
+- **Data transport**: uses reliable `publish_data` (SCTP) for lossless, ordered state/action delivery. Not lossy data tracks.
+- **Reconnection**: `RoomEvent::Reconnected` flushes sync buffers. LiveKit SDK handles reconnection internally.
