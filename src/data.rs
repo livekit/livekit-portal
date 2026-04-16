@@ -15,12 +15,18 @@ use crate::video::now_us;
 pub(crate) struct DataPublisher {
     fields: Vec<String>,
     topic: String,
+    reliable: bool,
     local_participant: LocalParticipant,
 }
 
 impl DataPublisher {
-    pub fn new(fields: Vec<String>, topic: &str, local_participant: LocalParticipant) -> Self {
-        Self { fields, topic: topic.to_string(), local_participant }
+    pub fn new(
+        fields: Vec<String>,
+        topic: &str,
+        reliable: bool,
+        local_participant: LocalParticipant,
+    ) -> Self {
+        Self { fields, topic: topic.to_string(), reliable, local_participant }
     }
 
     pub fn send(&self, values: &[f64], timestamp_us: Option<u64>) -> PortalResult<()> {
@@ -35,7 +41,7 @@ impl DataPublisher {
         let packet = DataPacket {
             payload,
             topic: Some(self.topic.clone()),
-            reliable: true,
+            reliable: self.reliable,
             destination_identities: Vec::new(),
         };
         // publish_data is async but we fire-and-forget via spawn

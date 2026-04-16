@@ -12,6 +12,8 @@ pub(crate) struct PortalConfigData {
     pub video_tracks: Vec<String>,
     pub state_fields: Vec<String>,
     pub action_fields: Vec<String>,
+    pub state_reliable: bool,
+    pub action_reliable: bool,
     pub sync_config: SyncConfig,
 }
 
@@ -32,6 +34,8 @@ impl PortalConfig {
                 video_tracks: Vec::new(),
                 state_fields: Vec::new(),
                 action_fields: Vec::new(),
+                state_reliable: true,
+                action_reliable: true,
                 sync_config: SyncConfig::default(),
             }),
         })
@@ -63,6 +67,14 @@ impl PortalConfig {
 
     pub fn set_observation_buffer(&self, size: u32) {
         self.data.lock().sync_config.observation_buffer_size = size;
+    }
+
+    pub fn set_state_reliable(&self, reliable: bool) {
+        self.data.lock().state_reliable = reliable;
+    }
+
+    pub fn set_action_reliable(&self, reliable: bool) {
+        self.data.lock().action_reliable = reliable;
     }
 }
 

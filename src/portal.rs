@@ -227,10 +227,15 @@ impl Portal {
         }
 
         if !config.state_fields.is_empty() {
-            let publisher =
-                DataPublisher::new(config.state_fields.clone(), "portal_state", lp.clone());
+            let publisher = DataPublisher::new(
+                config.state_fields.clone(),
+                "portal_state",
+                config.state_reliable,
+                lp.clone(),
+            );
+            let mode = if config.state_reliable { "reliable" } else { "unreliable" };
             log::info!(
-                "ready to publish state via reliable data ({} fields)",
+                "ready to publish state via {mode} data ({} fields)",
                 config.state_fields.len()
             );
             self.inner.lock().state_publisher = Some(publisher);
@@ -267,10 +272,15 @@ impl Portal {
         self.inner.lock().sync_buffer = Some(sync_buffer);
 
         if !config.action_fields.is_empty() {
-            let publisher =
-                DataPublisher::new(config.action_fields.clone(), "portal_action", lp.clone());
+            let publisher = DataPublisher::new(
+                config.action_fields.clone(),
+                "portal_action",
+                config.action_reliable,
+                lp.clone(),
+            );
+            let mode = if config.action_reliable { "reliable" } else { "unreliable" };
             log::info!(
-                "ready to publish action via reliable data ({} fields)",
+                "ready to publish action via {mode} data ({} fields)",
                 config.action_fields.len()
             );
             self.inner.lock().action_publisher = Some(publisher);
