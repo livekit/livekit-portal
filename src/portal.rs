@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use livekit::prelude::*;
@@ -9,39 +9,113 @@ use tokio::task::JoinHandle;
 use crate::config::PortalConfig;
 use crate::data::{handle_data_received, DataCb, DataPublisher};
 use crate::error::{PortalError, PortalResult};
-use crate::sync_buffer::SyncBuffer;
+use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver};
 
-type ObservationCb = Box<dyn Fn(Observation) + Send + Sync>;
+type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
 type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 
-struct PortalInner {
-    config: PortalConfig,
+/// Drains the buffers returned by `SyncBuffer::push_*` and dispatches them to
+/// the user — callback first (by reference, no clone), then into the pull-based
+/// observation buffer. Kept separate from `SyncBuffer` so callbacks run with no
+/// sync-buffer lock held.
+pub(crate) struct ObservationSink {
+    observation_cb: Mutex<Option<ObservationCb>>,
+    drop_cb: Mutex<Option<DropCb>>,
+    buffer: Mutex<VecDeque<Observation>>,
+    buffer_size: usize,
+}
+
+impl ObservationSink {
+    pub(crate) fn new(buffer_size: usize) -> Self {
+        Self {
+            observation_cb: Mutex::new(None),
+            drop_cb: Mutex::new(None),
+            buffer: Mutex::new(VecDeque::new()),
+            buffer_size,
+        }
+    }
+
+    pub(crate) fn dispatch(&self, output: SyncOutput) {
+        let SyncOutput { observations, drops } = output;
+
+        if !observations.is_empty() {
+            // Fire callback by reference — no clone, even with a registered consumer.
+            {
+                let cb_slot = self.observation_cb.lock();
+                if let Some(cb) = cb_slot.as_ref() {
+                    for obs in &observations {
+                        cb(obs);
+                    }
+                }
+            }
+            if self.buffer_size > 0 {
+                let mut buf = self.buffer.lock();
+                for obs in observations {
+                    buf.push_back(obs);
+                    while buf.len() > self.buffer_size {
+                        buf.pop_front();
+                    }
+                }
+            }
+        }
+
+        if !drops.is_empty() {
+            if let Some(cb) = self.drop_cb.lock().as_ref() {
+                cb(drops);
+            }
+        }
+    }
+
+    pub(crate) fn take(&self) -> Vec<Observation> {
+        self.buffer.lock().drain(..).collect()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.buffer.lock().clear();
+    }
+
+    pub(crate) fn set_observation_cb(&self, cb: ObservationCb) {
+        *self.observation_cb.lock() = Some(cb);
+    }
+
+    pub(crate) fn set_drop_cb(&self, cb: DropCb) {
+        *self.drop_cb.lock() = Some(cb);
+    }
+}
+
+struct ConnectionState {
     room: Option<Room>,
-
-    // Robot side
-    video_publishers: HashMap<String, VideoPublisher>,
-    state_publisher: Option<DataPublisher>,
-
-    // Operator side
-    video_receivers: HashMap<String, VideoReceiver>,
-    action_publisher: Option<DataPublisher>,
-    sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
-
-    // Callbacks
-    action_cb: Arc<Mutex<Option<DataCb>>>,
-    observation_cb: Arc<Mutex<Option<ObservationCb>>>,
-    state_cb: Arc<Mutex<Option<DataCb>>>,
-    video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
-    drop_cb: Arc<Mutex<Option<DropCb>>>,
-
     event_task: Option<JoinHandle<()>>,
 }
 
 pub struct Portal {
-    inner: Arc<Mutex<PortalInner>>,
+    config: PortalConfig,
+
+    // Lifecycle state (connect/disconnect).
+    state: Mutex<ConnectionState>,
+
+    // Video receivers are spawned by the event loop (on TrackSubscribed) and
+    // torn down by `disconnect`, so they live in an Arc shared with both.
+    video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+
+    // Hot-path publishers. Each is guarded by its own mutex so send methods
+    // can clone the Arc out and drop the lock before doing any IO.
+    video_publishers: Mutex<HashMap<String, Arc<VideoPublisher>>>,
+    state_publisher: Mutex<Option<Arc<DataPublisher>>>,
+    action_publisher: Mutex<Option<Arc<DataPublisher>>>,
+
+    // Operator-side sync + dispatch.
+    sync_buffer: Mutex<Option<Arc<Mutex<SyncBuffer>>>>,
+    obs_sink: Arc<ObservationSink>,
+
+    // Data callbacks.
+    action_cb: Arc<Mutex<Option<DataCb>>>,
+    state_cb: Arc<Mutex<Option<DataCb>>>,
+    // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
+    video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
 }
 
 impl Portal {
@@ -52,62 +126,66 @@ impl Portal {
             .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
             .collect();
 
+        let obs_sink =
+            Arc::new(ObservationSink::new(config.sync_config.observation_buffer_size as usize));
+
         Self {
-            inner: Arc::new(Mutex::new(PortalInner {
-                config,
-                room: None,
-                video_publishers: HashMap::new(),
-                state_publisher: None,
-                video_receivers: HashMap::new(),
-                action_publisher: None,
-                sync_buffer: None,
-                action_cb: Arc::new(Mutex::new(None)),
-                observation_cb: Arc::new(Mutex::new(None)),
-                state_cb: Arc::new(Mutex::new(None)),
-                video_cbs,
-                drop_cb: Arc::new(Mutex::new(None)),
-                event_task: None,
-            })),
+            config,
+            state: Mutex::new(ConnectionState { room: None, event_task: None }),
+            video_receivers: Arc::new(Mutex::new(HashMap::new())),
+            video_publishers: Mutex::new(HashMap::new()),
+            state_publisher: Mutex::new(None),
+            action_publisher: Mutex::new(None),
+            sync_buffer: Mutex::new(None),
+            obs_sink,
+            action_cb: Arc::new(Mutex::new(None)),
+            state_cb: Arc::new(Mutex::new(None)),
+            video_cbs,
         }
     }
 
     pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
-        let config = {
-            let inner = self.inner.lock();
-            if inner.room.is_some() {
-                return Err(PortalError::AlreadyConnected);
-            }
-            inner.config.clone()
-        };
+        if self.state.lock().room.is_some() {
+            return Err(PortalError::AlreadyConnected);
+        }
 
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
 
-        log::info!("[{}] connecting as {:?} to {}", config.session, config.role, url);
+        log::info!("[{}] connecting as {:?} to {}", self.config.session, self.config.role, url);
 
         let (room, events) = Room::connect(url, token, options)
             .await
             .map_err(|e| PortalError::Room(e.to_string()))?;
 
-        match config.role {
-            Role::Robot => self.setup_robot(&room, &config).await?,
-            Role::Operator => self.setup_operator(&room, &config),
+        match self.config.role {
+            Role::Robot => self.setup_robot(&room).await?,
+            Role::Operator => self.setup_operator(&room),
         }
 
-        log::info!("[{}] connected as {:?}", config.session, config.role);
+        log::info!("[{}] connected as {:?}", self.config.session, self.config.role);
 
-        let inner_ref = self.inner.clone();
-        let config_clone = config.clone();
+        // Event dispatch runs off a snapshot of the fields it touches, not the
+        // whole Portal, so it doesn't need any outer lock.
+        let ctx = EventContext {
+            config: self.config.clone(),
+            sync_buffer: self.sync_buffer.lock().clone(),
+            obs_sink: self.obs_sink.clone(),
+            action_cb: self.action_cb.clone(),
+            state_cb: self.state_cb.clone(),
+            video_cbs: self.video_cbs.clone(),
+            video_receivers: self.video_receivers.clone(),
+        };
         let event_handle = tokio::spawn(async move {
             let mut events = events;
             while let Some(event) = events.recv().await {
-                handle_room_event(&inner_ref, &config_clone, event);
+                handle_room_event(&ctx, event);
             }
         });
 
-        let mut inner = self.inner.lock();
-        inner.room = Some(room);
-        inner.event_task = Some(event_handle);
+        let mut state = self.state.lock();
+        state.room = Some(room);
+        state.event_task = Some(event_handle);
         Ok(())
     }
 
@@ -119,11 +197,12 @@ impl Portal {
         height: u32,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let inner = self.inner.lock();
-        let publisher = inner
-            .video_publishers
-            .get(track_name)
-            .ok_or_else(|| PortalError::UnknownVideoTrack { name: track_name.to_string() })?;
+        let publisher = {
+            let map = self.video_publishers.lock();
+            map.get(track_name).cloned().ok_or_else(|| PortalError::UnknownVideoTrack {
+                name: track_name.to_string(),
+            })?
+        };
         publisher.send_frame(i420_data, width, height, timestamp_us)
     }
 
@@ -132,9 +211,11 @@ impl Portal {
         values: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let inner = self.inner.lock();
-        let publisher =
-            inner.state_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Operator))?;
+        let publisher = self
+            .state_publisher
+            .lock()
+            .clone()
+            .ok_or(PortalError::WrongRole(Role::Operator))?;
         publisher.send_map(values, timestamp_us)
     }
 
@@ -143,56 +224,60 @@ impl Portal {
         values: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let inner = self.inner.lock();
         let publisher =
-            inner.action_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Robot))?;
+            self.action_publisher.lock().clone().ok_or(PortalError::WrongRole(Role::Robot))?;
         publisher.send_map(values, timestamp_us)
     }
 
     pub async fn disconnect(&self) -> PortalResult<()> {
-        let room = self.inner.lock().room.take();
+        let room = self.state.lock().room.take();
         log::info!("disconnecting");
         if let Some(room) = room {
             room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
         }
 
-        let mut inner = self.inner.lock();
-        if let Some(task) = inner.event_task.take() {
-            task.abort();
+        {
+            let mut state = self.state.lock();
+            if let Some(task) = state.event_task.take() {
+                task.abort();
+            }
         }
-        for receiver in inner.video_receivers.values() {
-            receiver.abort();
+        {
+            let mut receivers = self.video_receivers.lock();
+            for receiver in receivers.values() {
+                receiver.abort();
+            }
+            receivers.clear();
         }
-        if let Some(sb) = &inner.sync_buffer {
+
+        self.video_publishers.lock().clear();
+        *self.state_publisher.lock() = None;
+        *self.action_publisher.lock() = None;
+
+        if let Some(sb) = self.sync_buffer.lock().take() {
             sb.lock().clear();
         }
-        inner.video_publishers.clear();
-        inner.video_receivers.clear();
-        inner.state_publisher = None;
-        inner.action_publisher = None;
+        self.obs_sink.clear();
+
         Ok(())
     }
 
     pub fn take_observations(&self) -> Vec<Observation> {
-        let sb = self.inner.lock().sync_buffer.clone();
-        match sb {
-            Some(sb) => sb.lock().take_observations(),
-            None => Vec::new(),
-        }
+        self.obs_sink.take()
     }
 
     // --- Callback registration ---
 
     pub fn on_action(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
-        *self.inner.lock().action_cb.lock() = Some(Box::new(callback));
+        *self.action_cb.lock() = Some(Box::new(callback));
     }
 
-    pub fn on_observation(&self, callback: impl Fn(Observation) + Send + Sync + 'static) {
-        *self.inner.lock().observation_cb.lock() = Some(Box::new(callback));
+    pub fn on_observation(&self, callback: impl Fn(&Observation) + Send + Sync + 'static) {
+        self.obs_sink.set_observation_cb(Box::new(callback));
     }
 
     pub fn on_state(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
-        *self.inner.lock().state_cb.lock() = Some(Box::new(callback));
+        *self.state_cb.lock() = Some(Box::new(callback));
     }
 
     pub fn on_video(
@@ -200,8 +285,7 @@ impl Portal {
         track_name: &str,
         callback: impl Fn(&str, &VideoFrameData) + Send + Sync + 'static,
     ) {
-        let inner = self.inner.lock();
-        match inner.video_cbs.get(track_name) {
+        match self.video_cbs.get(track_name) {
             Some(cb_slot) => *cb_slot.lock() = Some(Box::new(callback)),
             None => {
                 log::warn!("on_video: track '{track_name}' is not registered — callback ignored")
@@ -210,101 +294,95 @@ impl Portal {
     }
 
     pub fn on_drop(&self, callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static) {
-        *self.inner.lock().drop_cb.lock() = Some(Box::new(callback));
+        self.obs_sink.set_drop_cb(Box::new(callback));
     }
 
     // --- Internal ---
 
-    async fn setup_robot(&self, room: &Room, config: &PortalConfig) -> PortalResult<()> {
+    async fn setup_robot(&self, room: &Room) -> PortalResult<()> {
         let lp = room.local_participant();
 
-        for track_name in &config.video_tracks {
+        for track_name in &self.config.video_tracks {
             let publisher = VideoPublisher::new(track_name);
             publisher.publish(&lp).await?;
-            log::info!("[{}] published video track '{track_name}'", config.session);
-            self.inner.lock().video_publishers.insert(track_name.clone(), publisher);
+            log::info!("[{}] published video track '{track_name}'", self.config.session);
+            self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
         }
 
-        if !config.state_fields.is_empty() {
+        if !self.config.state_fields.is_empty() {
             let publisher = DataPublisher::new(
-                config.state_fields.clone(),
+                self.config.state_fields.clone(),
                 "portal_state",
-                config.state_reliable,
+                self.config.state_reliable,
                 lp.clone(),
             );
-            let mode = if config.state_reliable { "reliable" } else { "unreliable" };
+            let mode = if self.config.state_reliable { "reliable" } else { "unreliable" };
             log::info!(
                 "[{}] ready to publish state via {mode} data ({} fields)",
-                config.session,
-                config.state_fields.len()
+                self.config.session,
+                self.config.state_fields.len()
             );
-            self.inner.lock().state_publisher = Some(publisher);
+            *self.state_publisher.lock() = Some(Arc::new(publisher));
         }
 
         Ok(())
     }
 
-    fn setup_operator(&self, room: &Room, config: &PortalConfig) {
+    fn setup_operator(&self, room: &Room) {
         let lp = room.local_participant();
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
-            &config.video_tracks,
-            config.state_fields.clone(),
-            config.sync_config,
+            &self.config.video_tracks,
+            self.config.state_fields.clone(),
+            self.config.sync_config,
         )));
+        *self.sync_buffer.lock() = Some(sync_buffer);
 
-        let (obs_cb, drop_cb) = {
-            let inner = self.inner.lock();
-            (inner.observation_cb.clone(), inner.drop_cb.clone())
-        };
-        {
-            let mut sb = sync_buffer.lock();
-            sb.set_observation_callback(Box::new(move |obs| {
-                if let Some(cb) = obs_cb.lock().as_ref() {
-                    cb(obs);
-                }
-            }));
-            sb.set_drop_callback(Box::new(move |dropped| {
-                if let Some(cb) = drop_cb.lock().as_ref() {
-                    cb(dropped);
-                }
-            }));
-        }
-
-        let action_publisher = (!config.action_fields.is_empty()).then(|| {
-            let mode = if config.action_reliable { "reliable" } else { "unreliable" };
+        if !self.config.action_fields.is_empty() {
+            let mode = if self.config.action_reliable { "reliable" } else { "unreliable" };
             log::info!(
                 "[{}] ready to publish action via {mode} data ({} fields)",
-                config.session,
-                config.action_fields.len()
+                self.config.session,
+                self.config.action_fields.len()
             );
-            DataPublisher::new(
-                config.action_fields.clone(),
+            let publisher = DataPublisher::new(
+                self.config.action_fields.clone(),
                 "portal_action",
-                config.action_reliable,
+                self.config.action_reliable,
                 lp,
-            )
-        });
-
-        let mut inner = self.inner.lock();
-        inner.sync_buffer = Some(sync_buffer);
-        inner.action_publisher = action_publisher;
+            );
+            *self.action_publisher.lock() = Some(Arc::new(publisher));
+        }
     }
 }
 
-fn handle_room_event(inner_ref: &Arc<Mutex<PortalInner>>, config: &PortalConfig, event: RoomEvent) {
+/// Snapshot of the fields the room event loop needs, so it doesn't take any
+/// Portal-level lock on the hot path.
+struct EventContext {
+    config: PortalConfig,
+    sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
+    obs_sink: Arc<ObservationSink>,
+    action_cb: Arc<Mutex<Option<DataCb>>>,
+    state_cb: Arc<Mutex<Option<DataCb>>>,
+    video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
+    video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+}
+
+fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
     match event {
         RoomEvent::TrackSubscribed { track, publication, .. } => {
-            if config.role != Role::Operator {
+            if ctx.config.role != Role::Operator {
                 return;
             }
             if let RemoteTrack::Video(video_track) = track {
                 let track_name = publication.name();
-                if config.video_tracks.contains(&track_name.to_string()) {
-                    log::info!("[{}] subscribed to video track '{track_name}'", config.session);
-                    let inner = inner_ref.lock();
-                    if let Some(sync_buffer) = &inner.sync_buffer {
-                        let raw_cb = inner
+                if ctx.config.video_tracks.contains(&track_name.to_string()) {
+                    log::info!(
+                        "[{}] subscribed to video track '{track_name}'",
+                        ctx.config.session
+                    );
+                    if let Some(sync_buffer) = &ctx.sync_buffer {
+                        let raw_cb = ctx
                             .video_cbs
                             .get(track_name.as_str())
                             .cloned()
@@ -316,32 +394,33 @@ fn handle_room_event(inner_ref: &Arc<Mutex<PortalInner>>, config: &PortalConfig,
                             stream,
                             sync_buffer.clone(),
                             raw_cb,
+                            ctx.obs_sink.clone(),
                         );
-                        drop(inner);
-                        inner_ref.lock().video_receivers.insert(track_name.to_string(), receiver);
+                        ctx.video_receivers.lock().insert(track_name.to_string(), receiver);
                     }
                 }
             }
         }
         RoomEvent::DataReceived { payload, topic, .. } => {
             if let Some(topic) = &topic {
-                let inner = inner_ref.lock();
-                handle_data_received(
+                let output = handle_data_received(
                     &payload,
                     topic,
-                    config.role,
-                    &config.action_fields,
-                    &config.state_fields,
-                    &inner.action_cb,
-                    &inner.state_cb,
-                    &inner.sync_buffer,
+                    ctx.config.role,
+                    &ctx.config.action_fields,
+                    &ctx.config.state_fields,
+                    &ctx.action_cb,
+                    &ctx.state_cb,
+                    ctx.sync_buffer.as_ref(),
                 );
+                if !output.is_empty() {
+                    ctx.obs_sink.dispatch(output);
+                }
             }
         }
         RoomEvent::Reconnected => {
-            log::info!("[{}] reconnected, clearing sync buffers", config.session);
-            let inner = inner_ref.lock();
-            if let Some(sb) = &inner.sync_buffer {
+            log::info!("[{}] reconnected, clearing sync buffers", ctx.config.session);
+            if let Some(sb) = &ctx.sync_buffer {
                 sb.lock().clear();
             }
         }

@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::error::{PortalError, PortalResult};
+use crate::portal::ObservationSink;
 use crate::sync_buffer::SyncBuffer;
 use crate::types::VideoFrameData;
 
@@ -90,6 +91,7 @@ impl VideoReceiver {
         stream: NativeVideoStream,
         sync_buffer: Arc<Mutex<SyncBuffer>>,
         raw_callback: Arc<Mutex<Option<VideoCb>>>,
+        obs_sink: Arc<ObservationSink>,
     ) -> Self {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
@@ -101,7 +103,10 @@ impl VideoReceiver {
                 if let Some(cb) = raw_callback.lock().as_ref() {
                     cb(&name, &frame_arc);
                 }
-                sync_buffer.lock().push_frame(&name, frame_arc);
+                let output = sync_buffer.lock().push_frame(&name, frame_arc);
+                if !output.is_empty() {
+                    obs_sink.dispatch(output);
+                }
             }
         });
         Self { task_handle: handle }
@@ -124,7 +129,7 @@ fn convert_frame<T: AsRef<dyn VideoBuffer>>(
     data.extend_from_slice(y);
     data.extend_from_slice(u);
     data.extend_from_slice(v);
-    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
+    VideoFrameData { width: i420.width(), height: i420.height(), data: data.into(), timestamp_us }
 }
 
 fn copy_i420_data(src: &[u8], buffer: &mut I420Buffer) {

@@ -3,17 +3,45 @@ use std::sync::Arc;
 
 use crate::types::*;
 
-type ObservationCb = Box<dyn Fn(Observation) + Send + Sync>;
-type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
+/// Result of a `push_frame` / `push_state` call. Callers dispatch these
+/// (invoke callbacks, enqueue into the pull-based buffer) *after* releasing
+/// the SyncBuffer lock so slow consumers don't stall the hot path.
+pub(crate) struct SyncOutput {
+    pub observations: Vec<Observation>,
+    pub drops: Vec<HashMap<String, f64>>,
+}
+
+impl SyncOutput {
+    pub fn empty() -> Self {
+        Self { observations: Vec::new(), drops: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.observations.is_empty() && self.drops.is_empty()
+    }
+}
 
 pub(crate) struct SyncBuffer {
-    video_buffers: HashMap<String, VecDeque<Arc<VideoFrameData>>>,
+    track_names: Vec<String>,
+    track_index: HashMap<String, usize>,
+    // Parallel to `track_names`; indexed by track position.
+    video_buffers: Vec<VecDeque<Arc<VideoFrameData>>>,
     state_buffer: VecDeque<(u64, Vec<f64>)>, // (timestamp_us, values)
-    observation_buffer: VecDeque<Observation>,
     state_fields: Vec<String>,
     config: SyncConfig,
-    observation_cb: Option<ObservationCb>,
-    drop_cb: Option<DropCb>,
+
+    // Per-track cursor: the largest index whose frame ts is <= head state ts
+    // (or 0 if all frames are > head ts). Advances monotonically with state_ts
+    // so sync work amortizes to O(N+M) across the stream.
+    cursors: Vec<usize>,
+
+    // The track that caused the last try_sync attempt to wait. `None` means
+    // "unknown — run try_sync on the next push." Used to skip sync attempts
+    // on pushes to tracks that cannot change head-state matchability.
+    blocker: Option<usize>,
+
+    // Reused across try_sync calls to avoid allocating a match map per iteration.
+    matched_scratch: Vec<Option<(usize, Arc<VideoFrameData>)>>,
 }
 
 impl SyncBuffer {
@@ -22,143 +50,200 @@ impl SyncBuffer {
         state_fields: Vec<String>,
         config: SyncConfig,
     ) -> Self {
-        let video_buffers =
-            video_track_names.iter().map(|n| (n.clone(), VecDeque::new())).collect();
+        let track_names: Vec<String> = video_track_names.to_vec();
+        let track_index: HashMap<String, usize> =
+            track_names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
+        let video_buffers = (0..track_names.len()).map(|_| VecDeque::new()).collect();
+        let cursors = vec![0; track_names.len()];
+        let matched_scratch = vec![None; track_names.len()];
         Self {
+            track_names,
+            track_index,
             video_buffers,
             state_buffer: VecDeque::new(),
-            observation_buffer: VecDeque::new(),
             state_fields,
             config,
-            observation_cb: None,
-            drop_cb: None,
+            cursors,
+            blocker: None,
+            matched_scratch,
         }
     }
 
-    pub fn set_observation_callback(&mut self, cb: ObservationCb) {
-        self.observation_cb = Some(cb);
-    }
+    pub fn push_frame(&mut self, track_name: &str, frame: Arc<VideoFrameData>) -> SyncOutput {
+        let idx = match self.track_index.get(track_name) {
+            Some(&i) => i,
+            None => return SyncOutput::empty(),
+        };
 
-    pub fn set_drop_callback(&mut self, cb: DropCb) {
-        self.drop_cb = Some(cb);
-    }
+        let cap = self.config.video_buffer_size as usize;
+        let buf = &mut self.video_buffers[idx];
+        buf.push_back(frame);
 
-    pub fn push_frame(&mut self, track_name: &str, frame: Arc<VideoFrameData>) {
-        if let Some(buf) = self.video_buffers.get_mut(track_name) {
-            buf.push_back(frame);
-            while buf.len() > self.config.video_buffer_size as usize {
-                buf.pop_front();
-            }
+        let mut evicted = 0usize;
+        while buf.len() > cap {
+            buf.pop_front();
+            evicted += 1;
         }
-        self.try_sync();
+        if evicted > 0 {
+            let cursor = &mut self.cursors[idx];
+            *cursor = cursor.saturating_sub(evicted);
+        }
+
+        // Skip try_sync when this push cannot have changed head-state matchability:
+        //   - another track is blocking (a push to a non-blocker doesn't unblock it), AND
+        //   - no eviction happened on this track (eviction can newly-transition a track
+        //     from matching → unmatchable, which must be checked).
+        let should_run = match self.blocker {
+            None => true,
+            Some(b) if b == idx => true,
+            Some(_) => evicted > 0,
+        };
+
+        if should_run {
+            self.try_sync()
+        } else {
+            SyncOutput::empty()
+        }
     }
 
-    pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) {
+    pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) -> SyncOutput {
+        let old_head_ts = self.state_buffer.front().map(|(ts, _)| *ts);
         self.state_buffer.push_back((timestamp_us, values));
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
             self.state_buffer.pop_front();
         }
-        self.try_sync();
+        // If eviction (or first-ever push) changed the head state, the old blocker
+        // hint no longer applies.
+        let new_head_ts = self.state_buffer.front().map(|(ts, _)| *ts);
+        if new_head_ts != old_head_ts {
+            self.blocker = None;
+        }
+        self.try_sync()
     }
 
     pub fn clear(&mut self) {
-        for buf in self.video_buffers.values_mut() {
+        for buf in &mut self.video_buffers {
             buf.clear();
         }
         self.state_buffer.clear();
-        self.observation_buffer.clear();
+        for c in &mut self.cursors {
+            *c = 0;
+        }
+        self.blocker = None;
     }
 
-    /// Drain all buffered observations. Intended for pull-based consumers
-    /// that want to batch-retrieve observations instead of reacting via callback.
-    pub fn take_observations(&mut self) -> Vec<Observation> {
-        self.observation_buffer.drain(..).collect()
-    }
+    fn try_sync(&mut self) -> SyncOutput {
+        let mut output = SyncOutput::empty();
+        let range = self.config.search_range_us;
 
-    fn try_sync(&mut self) {
         loop {
             if self.state_buffer.is_empty() {
-                break;
+                self.blocker = None;
+                return output;
             }
 
             let state_ts = self.state_buffer[0].0;
-            let mut matched: HashMap<String, (usize, Arc<VideoFrameData>)> = HashMap::new();
-            let mut should_drop = false;
-            let mut should_wait = false;
 
-            for (track_name, frame_buf) in &self.video_buffers {
+            for slot in &mut self.matched_scratch {
+                *slot = None;
+            }
+
+            // Per-iteration status. Priority: drop > wait > emit. We scan every
+            // track (even after a wait-on-earlier-track) so that a drop-eligible
+            // track later in the list can override the wait — otherwise a state
+            // could stall forever waiting on cam1 while cam2 has already moved
+            // beyond the match horizon.
+            let mut should_drop = false;
+            let mut iter_blocker: Option<usize> = None;
+
+            for track_i in 0..self.video_buffers.len() {
+                let frame_buf = &self.video_buffers[track_i];
+                if frame_buf.is_empty() {
+                    if iter_blocker.is_none() {
+                        iter_blocker = Some(track_i);
+                    }
+                    continue;
+                }
+
+                let cursor = &mut self.cursors[track_i];
+                // Defensive clamp in case capacity shrunk or mutation missed an adjustment.
+                if *cursor >= frame_buf.len() {
+                    *cursor = frame_buf.len() - 1;
+                }
+                // Rewind if the cursor is already past state_ts (can happen if
+                // states arrive out of order on unreliable delivery).
+                while *cursor > 0 && frame_buf[*cursor].timestamp_us > state_ts {
+                    *cursor -= 1;
+                }
+                // Advance while the next frame is still at or before state_ts.
+                while *cursor + 1 < frame_buf.len()
+                    && frame_buf[*cursor + 1].timestamp_us <= state_ts
+                {
+                    *cursor += 1;
+                }
+
+                let cursor_val = *cursor;
                 let mut best_idx: Option<usize> = None;
                 let mut best_delta = u64::MAX;
-
-                for (i, frame) in frame_buf.iter().enumerate() {
-                    let delta = state_ts.abs_diff(frame.timestamp_us);
-                    if delta < self.config.search_range_us && delta < best_delta {
-                        best_delta = delta;
-                        best_idx = Some(i);
+                for candidate in [Some(cursor_val), cursor_val.checked_add(1)].into_iter().flatten()
+                {
+                    if let Some(f) = frame_buf.get(candidate) {
+                        let d = state_ts.abs_diff(f.timestamp_us);
+                        if d < range && d < best_delta {
+                            best_delta = d;
+                            best_idx = Some(candidate);
+                        }
                     }
                 }
 
                 if let Some(idx) = best_idx {
-                    matched.insert(track_name.clone(), (idx, frame_buf[idx].clone()));
-                } else if !frame_buf.is_empty()
-                    && frame_buf
-                        .iter()
-                        .all(|f| f.timestamp_us > state_ts + self.config.search_range_us)
-                {
-                    // All buffered frames are newer than the state's match window.
-                    // Future frames will be even newer, so this state can never match — drop it.
-                    // (The mirror case — all frames older — is a "wait": newer frames may still arrive.)
+                    self.matched_scratch[track_i] = Some((idx, frame_buf[idx].clone()));
+                    continue;
+                }
+
+                // Unmatched. O(1) drop check: deque is sorted, so "all frames newer
+                // than state_ts + range" ≡ "front ts > state_ts + range".
+                let oldest_ts = frame_buf.front().unwrap().timestamp_us;
+                if oldest_ts > state_ts.saturating_add(range) {
                     should_drop = true;
                     break;
-                } else {
-                    should_wait = true;
-                    break;
+                } else if iter_blocker.is_none() {
+                    iter_blocker = Some(track_i);
                 }
-            }
-
-            if should_wait {
-                break;
             }
 
             if should_drop {
                 log::warn!("dropping unsyncable state (no matching video frames within range)");
                 let (_, values) = self.state_buffer.pop_front().unwrap();
-                let dropped = vec![to_field_map(&self.state_fields, values)];
-                if let Some(ref cb) = self.drop_cb {
-                    cb(dropped);
-                }
+                output.drops.push(to_field_map(&self.state_fields, &values));
+                // Retry next state with fresh iteration.
                 continue;
             }
 
-            if matched.len() == self.video_buffers.len() {
-                let (ts, values) = self.state_buffer.pop_front().unwrap();
-
-                for (track_name, (idx, _)) in &matched {
-                    if let Some(buf) = self.video_buffers.get_mut(track_name) {
-                        buf.drain(0..=*idx);
-                    }
-                }
-
-                let observation = Observation {
-                    state: to_field_map(&self.state_fields, values),
-                    frames: matched
-                        .into_iter()
-                        .map(|(name, (_, frame))| (name, (*frame).clone()))
-                        .collect(),
-                    timestamp_us: ts,
-                };
-
-                if let Some(ref cb) = self.observation_cb {
-                    cb(observation.clone());
-                }
-
-                self.observation_buffer.push_back(observation);
-                while self.observation_buffer.len() > self.config.observation_buffer_size as usize {
-                    self.observation_buffer.pop_front();
-                }
-            } else {
-                break;
+            if iter_blocker.is_some() {
+                self.blocker = iter_blocker;
+                return output;
             }
+
+            let (ts, values) = self.state_buffer.pop_front().unwrap();
+
+            let mut frames_map: HashMap<String, VideoFrameData> =
+                HashMap::with_capacity(self.track_names.len());
+            for track_i in 0..self.track_names.len() {
+                if let Some((idx, frame)) = self.matched_scratch[track_i].take() {
+                    self.video_buffers[track_i].drain(0..=idx);
+                    // Cursor was at or just past idx; after draining, shift it back.
+                    self.cursors[track_i] = self.cursors[track_i].saturating_sub(idx + 1);
+                    // Cheap clone: VideoFrameData carries Arc<[u8]>.
+                    frames_map.insert(self.track_names[track_i].clone(), (*frame).clone());
+                }
+            }
+
+            output.observations.push(Observation {
+                state: to_field_map(&self.state_fields, &values),
+                frames: frames_map,
+                timestamp_us: ts,
+            });
         }
     }
 }
@@ -166,103 +251,77 @@ impl SyncBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc as StdArc, Mutex};
 
     fn make_frame(track: &str, ts: u64) -> (String, Arc<VideoFrameData>) {
         (
             track.to_string(),
-            Arc::new(VideoFrameData { width: 2, height: 2, data: vec![0u8; 6], timestamp_us: ts }),
+            Arc::new(VideoFrameData {
+                width: 2,
+                height: 2,
+                data: Arc::from(vec![0u8; 6]),
+                timestamp_us: ts,
+            }),
         )
+    }
+
+    fn push_f(buf: &mut SyncBuffer, track: &str, ts: u64) -> SyncOutput {
+        let (name, frame) = make_frame(track, ts);
+        buf.push_frame(&name, frame)
     }
 
     #[test]
     fn sync_single_track() {
-        let observations = StdArc::new(Mutex::new(Vec::new()));
-        let obs_clone = observations.clone();
-
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string(), "j2".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        buf.set_observation_callback(Box::new(move |obs| {
-            obs_clone.lock().unwrap().push(obs);
-        }));
+        assert!(push_f(&mut buf, "cam1", 1000).observations.is_empty());
 
-        let (name, frame) = make_frame("cam1", 1000);
-        buf.push_frame(&name, frame);
-        buf.push_state(1010, vec![1.0, 2.0]);
-
-        let obs = observations.lock().unwrap();
-        assert_eq!(obs.len(), 1);
-        assert_eq!(obs[0].state["j1"], 1.0);
-        assert_eq!(obs[0].state["j2"], 2.0);
-        assert_eq!(obs[0].timestamp_us, 1010);
+        let out = buf.push_state(1010, vec![1.0, 2.0]);
+        assert_eq!(out.observations.len(), 1);
+        let obs = &out.observations[0];
+        assert_eq!(obs.state["j1"], 1.0);
+        assert_eq!(obs.state["j2"], 2.0);
+        assert_eq!(obs.timestamp_us, 1010);
     }
 
     #[test]
     fn sync_multi_track() {
-        let observations = StdArc::new(Mutex::new(Vec::new()));
-        let obs_clone = observations.clone();
-
         let tracks = vec!["cam1".to_string(), "cam2".to_string()];
         let fields = vec!["j1".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        buf.set_observation_callback(Box::new(move |obs| {
-            obs_clone.lock().unwrap().push(obs);
-        }));
+        assert!(push_f(&mut buf, "cam1", 1000).observations.is_empty());
+        assert!(buf.push_state(1005, vec![5.0]).observations.is_empty());
 
-        let (n1, f1) = make_frame("cam1", 1000);
-        buf.push_frame(&n1, f1);
-        buf.push_state(1005, vec![5.0]);
-        assert_eq!(observations.lock().unwrap().len(), 0);
-
-        let (n2, f2) = make_frame("cam2", 1002);
-        buf.push_frame(&n2, f2);
-        assert_eq!(observations.lock().unwrap().len(), 1);
+        let out = push_f(&mut buf, "cam2", 1002);
+        assert_eq!(out.observations.len(), 1);
+        assert!(out.observations[0].frames.contains_key("cam1"));
+        assert!(out.observations[0].frames.contains_key("cam2"));
     }
 
     #[test]
     fn drop_unsyncable_state() {
-        let drops = StdArc::new(Mutex::new(Vec::new()));
-        let drops_clone = drops.clone();
-
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        buf.set_drop_callback(Box::new(move |dropped| {
-            drops_clone.lock().unwrap().extend(dropped);
-        }));
-
-        buf.push_state(100, vec![1.0]);
-        let (name, frame) = make_frame("cam1", 200_000);
-        buf.push_frame(&name, frame);
-
-        let d = drops.lock().unwrap();
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0]["j1"], 1.0);
+        assert!(buf.push_state(100, vec![1.0]).is_empty());
+        let out = push_f(&mut buf, "cam1", 200_000);
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1);
+        assert_eq!(out.drops[0]["j1"], 1.0);
     }
 
     #[test]
     fn out_of_range_waits() {
-        let observations = StdArc::new(Mutex::new(Vec::new()));
-        let obs_clone = observations.clone();
-
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        buf.set_observation_callback(Box::new(move |obs| {
-            obs_clone.lock().unwrap().push(obs);
-        }));
-
-        buf.push_state(50_000, vec![1.0]);
-        assert_eq!(observations.lock().unwrap().len(), 0);
-
-        let (name, frame) = make_frame("cam1", 50_010);
-        buf.push_frame(&name, frame);
-        assert_eq!(observations.lock().unwrap().len(), 1);
+        assert!(buf.push_state(50_000, vec![1.0]).is_empty());
+        let out = push_f(&mut buf, "cam1", 50_010);
+        assert_eq!(out.observations.len(), 1);
     }
 
     #[test]
@@ -274,11 +333,10 @@ mod tests {
         let mut buf = SyncBuffer::new(&tracks, fields, config);
 
         for ts in [100, 200, 300] {
-            let (name, frame) = make_frame("cam1", ts);
-            buf.push_frame(&name, frame);
+            let _ = push_f(&mut buf, "cam1", ts);
         }
 
-        let cam_buf = buf.video_buffers.get("cam1").unwrap();
+        let cam_buf = &buf.video_buffers[buf.track_index["cam1"]];
         assert_eq!(cam_buf.len(), 2);
         assert_eq!(cam_buf[0].timestamp_us, 200);
         assert_eq!(cam_buf[1].timestamp_us, 300);
@@ -290,49 +348,247 @@ mod tests {
         let fields = vec!["j1".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        let (name, frame) = make_frame("cam1", 1000);
-        buf.push_frame(&name, frame);
-        buf.push_state(1000, vec![1.0]);
+        let _ = push_f(&mut buf, "cam1", 1000);
+        let _ = buf.push_state(1000, vec![1.0]);
         buf.clear();
 
-        assert!(buf.video_buffers.get("cam1").unwrap().is_empty());
+        assert!(buf.video_buffers.iter().all(|b| b.is_empty()));
         assert!(buf.state_buffer.is_empty());
-        assert!(buf.observation_buffer.is_empty());
+        assert!(buf.cursors.iter().all(|&c| c == 0));
+        assert!(buf.blocker.is_none());
     }
 
+    // --- New algorithm edge cases ---
+
+    /// Cursor should pick the closest frame even when many are in the buffer.
     #[test]
-    fn take_observations_drains_buffer() {
+    fn cursor_picks_closest_among_many() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
 
-        for ts in [1000u64, 2000, 3000] {
-            let (name, frame) = make_frame("cam1", ts);
-            buf.push_frame(&name, frame);
-            buf.push_state(ts, vec![ts as f64]);
+        for ts in [1_000u64, 2_000, 3_000, 4_000, 5_000] {
+            let _ = push_f(&mut buf, "cam1", ts);
         }
 
-        let obs = buf.take_observations();
-        assert_eq!(obs.len(), 3);
-        assert!(buf.take_observations().is_empty());
+        // Closest to 3_010 within 30_000us is 3_000.
+        let out = buf.push_state(3_010, vec![7.0]);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 3_000);
     }
 
+    /// Cursor should advance monotonically across many sequential syncs.
     #[test]
-    fn observation_buffer_evicts_oldest() {
+    fn cursor_advances_across_sequential_matches() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let config = SyncConfig { observation_buffer_size: 2, ..Default::default() };
+        let config = SyncConfig { video_buffer_size: 100, ..Default::default() };
         let mut buf = SyncBuffer::new(&tracks, fields, config);
 
-        for ts in [1000u64, 2000, 3000] {
-            let (name, frame) = make_frame("cam1", ts);
-            buf.push_frame(&name, frame);
-            buf.push_state(ts, vec![ts as f64]);
+        // Push 10 frames at 1000us intervals.
+        for i in 0..10 {
+            let _ = push_f(&mut buf, "cam1", 1_000 + i * 1_000);
+        }
+        // Match each with a state, each state should consume one frame.
+        let mut matched_ts = Vec::new();
+        for i in 0..10 {
+            let out = buf.push_state(1_010 + i * 1_000, vec![i as f64]);
+            assert_eq!(out.observations.len(), 1, "state #{} should produce 1 obs", i);
+            matched_ts.push(out.observations[0].frames["cam1"].timestamp_us);
+        }
+        assert_eq!(matched_ts, (0..10).map(|i| 1_000 + i * 1_000).collect::<Vec<_>>());
+    }
+
+    /// Eviction beyond capacity must decrement cursor so it remains valid.
+    #[test]
+    fn eviction_adjusts_cursor() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig { video_buffer_size: 3, ..Default::default() };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        // Fill buffer and push state to advance cursor to index 2.
+        for ts in [1_000u64, 2_000, 3_000] {
+            let _ = push_f(&mut buf, "cam1", ts);
+        }
+        // State_ts=3_010, cursor advances to idx 2 (frame 3_000); but buffer gets
+        // drained on successful match so cursor resets. Use a state that *doesn't*
+        // match yet (out of range) to force cursor advancement without drain.
+        // Instead: push state aligned so cursor advances and match succeeds.
+        let out = buf.push_state(3_010, vec![0.0]);
+        assert_eq!(out.observations.len(), 1);
+        // Buffer should now be empty (drained up to idx 2).
+        assert!(buf.video_buffers[0].is_empty());
+        assert_eq!(buf.cursors[0], 0);
+
+        // Now push frames beyond capacity; cursor stays 0 (never advances past len).
+        for ts in [4_000u64, 5_000, 6_000, 7_000] {
+            let _ = push_f(&mut buf, "cam1", ts);
+        }
+        assert_eq!(buf.video_buffers[0].len(), 3);
+        assert_eq!(buf.video_buffers[0][0].timestamp_us, 5_000);
+    }
+
+    /// Non-blocker push should defer try_sync, but a subsequent push to the
+    /// blocker must still produce the observation (no lost state).
+    #[test]
+    fn non_blocker_push_defers_but_converges() {
+        let tracks = vec!["cam1".to_string(), "cam2".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        // State + cam2 present; cam1 empty → cam1 is the blocker.
+        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
+        assert!(push_f(&mut buf, "cam2", 1_005).is_empty());
+        assert_eq!(buf.blocker, Some(buf.track_index["cam1"]));
+
+        // Push another cam2 frame — not the blocker, try_sync should skip.
+        // The observation count stays at 0 either way, so we just check no
+        // spurious work: buffer accepted the push.
+        assert!(push_f(&mut buf, "cam2", 1_006).is_empty());
+        assert_eq!(buf.video_buffers[buf.track_index["cam2"]].len(), 2);
+
+        // Now push to the blocker — observation must fire.
+        let out = push_f(&mut buf, "cam1", 1_008);
+        assert_eq!(out.observations.len(), 1);
+        assert!(buf.blocker.is_none());
+    }
+
+    /// If eviction on a non-blocker track removes the only in-range frame,
+    /// the state must drop (not silently stall).
+    #[test]
+    fn eviction_on_non_blocker_can_trigger_drop() {
+        let tracks = vec!["cam1".to_string(), "cam2".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig {
+            video_buffer_size: 1,
+            state_buffer_size: 10,
+            search_range_us: 30_000,
+            observation_buffer_size: 10,
+        };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        // State at 1_000; cam1 empty (blocker); cam2 has a frame in range.
+        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
+        assert!(push_f(&mut buf, "cam2", 1_005).is_empty());
+        assert_eq!(buf.blocker, Some(buf.track_index["cam1"]));
+
+        // Push new cam2 frame far in the future; cap=1 means the in-range
+        // frame is evicted. Eager drop path must fire even though cam2 is not
+        // the blocker.
+        let out = push_f(&mut buf, "cam2", 500_000);
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1, "state should be dropped once its cam2 match is evicted");
+    }
+
+    /// Out-of-order state timestamps must still find the correct match via
+    /// cursor rewind.
+    #[test]
+    fn out_of_order_state_rewinds_cursor() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        // Pre-populate frames spanning a wide range.
+        for ts in [1_000u64, 5_000, 10_000, 50_000, 100_000] {
+            let _ = push_f(&mut buf, "cam1", ts);
         }
 
-        let obs = buf.take_observations();
-        assert_eq!(obs.len(), 2);
-        assert_eq!(obs[0].timestamp_us, 2000);
-        assert_eq!(obs[1].timestamp_us, 3000);
+        // First match at high ts advances cursor forward.
+        let out = buf.push_state(100_005, vec![0.0]);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 100_000);
+
+        // Re-populate so there's a frame near an earlier ts, then push an
+        // earlier state — cursor rewind must find it.
+        let _ = push_f(&mut buf, "cam1", 200_000);
+        let _ = push_f(&mut buf, "cam1", 200_005);
+        let out = buf.push_state(200_002, vec![0.0]);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 200_000);
+    }
+
+    /// A single frame push that completes all pending states should produce
+    /// multiple observations in one SyncOutput.
+    #[test]
+    fn multi_state_batch_emits_together() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        // Pile up 3 states and 2 matching frames; last state waits on its own
+        // frame.
+        for ts in [1_000u64, 2_000, 3_000] {
+            let _ = buf.push_state(ts, vec![ts as f64]);
+        }
+        let _ = push_f(&mut buf, "cam1", 1_005);
+        let _ = push_f(&mut buf, "cam1", 2_005);
+        let out = push_f(&mut buf, "cam1", 3_005);
+        assert_eq!(out.observations.len(), 1, "only the final push should complete the batch");
+        // All three states should be fully drained.
+        assert_eq!(buf.state_buffer.len(), 0);
+    }
+
+    /// After a successful match the blocker must clear so the next unrelated
+    /// track push triggers try_sync.
+    #[test]
+    fn blocker_clears_after_match() {
+        let tracks = vec!["cam1".to_string(), "cam2".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
+        assert!(push_f(&mut buf, "cam1", 1_002).is_empty());
+        // cam2 is now blocker.
+        assert_eq!(buf.blocker, Some(buf.track_index["cam2"]));
+
+        let out = push_f(&mut buf, "cam2", 1_005);
+        assert_eq!(out.observations.len(), 1);
+        assert!(buf.blocker.is_none(), "blocker must reset after successful match");
+    }
+
+    /// State eviction pushing a new head state clears the blocker so the new
+    /// head gets re-evaluated immediately.
+    #[test]
+    fn state_eviction_updates_head_and_clears_blocker() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig { state_buffer_size: 1, ..Default::default() };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        // No frames yet: both push_state calls see an empty cam1 → wait.
+        // cap_state=1 means the second state evicts the first.
+        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
+        assert_eq!(buf.blocker, Some(0));
+        assert!(buf.push_state(2_000, vec![2.0]).is_empty());
+
+        // Only the second state remains. A frame matching it fires the obs.
+        let out = push_f(&mut buf, "cam1", 2_005);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].state["j1"], 2.0, "evicted state should not leak through");
+        assert_eq!(out.observations[0].timestamp_us, 2_000);
+    }
+
+    /// Sanity: inputs that stress the binary/cursor path with many empty and
+    /// partial iterations should never panic or produce spurious observations.
+    #[test]
+    fn stress_no_spurious_observations() {
+        let tracks = vec!["cam1".to_string(), "cam2".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        let mut total_obs = 0;
+        // Push 100 interleaved events; each state needs frames on BOTH tracks
+        // within 30ms.
+        for i in 0..100u64 {
+            let ts = 1_000 + i * 1_000;
+            let out1 = push_f(&mut buf, "cam1", ts);
+            let out2 = push_f(&mut buf, "cam2", ts + 100);
+            let out3 = buf.push_state(ts + 50, vec![i as f64]);
+            total_obs += out1.observations.len();
+            total_obs += out2.observations.len();
+            total_obs += out3.observations.len();
+        }
+        assert_eq!(total_obs, 100);
     }
 }

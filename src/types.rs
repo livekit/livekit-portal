@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -14,12 +15,12 @@ pub struct Observation {
     pub timestamp_us: u64,
 }
 
-/// Decoded video frame data, owned.
+/// Decoded video frame data. The pixel buffer is shared via `Arc<[u8]>` so cloning is cheap.
 #[derive(Debug, Clone)]
 pub struct VideoFrameData {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
     pub timestamp_us: u64,
 }
 
@@ -44,6 +45,6 @@ impl Default for SyncConfig {
 }
 
 /// Build a field-name → value HashMap from ordered fields and values.
-pub(crate) fn to_field_map(fields: &[String], values: Vec<f64>) -> HashMap<String, f64> {
-    fields.iter().zip(values).map(|(k, v)| (k.clone(), v)).collect()
+pub(crate) fn to_field_map(fields: &[String], values: &[f64]) -> HashMap<String, f64> {
+    fields.iter().zip(values).map(|(k, v)| (k.clone(), *v)).collect()
 }
