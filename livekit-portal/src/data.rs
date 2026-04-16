@@ -72,8 +72,9 @@ impl DataPublisher {
             reliable: self.reliable,
             destination_identities: Vec::new(),
         };
-        let _ = self.tx.send(packet);
-        self.metrics.bump_sent(self.stream);
+        if self.tx.send(packet).is_ok() {
+            self.metrics.bump_sent(self.stream);
+        }
         Ok(())
     }
 

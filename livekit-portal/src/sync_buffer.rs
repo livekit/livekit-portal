@@ -118,14 +118,15 @@ impl SyncBuffer {
     pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) -> SyncOutput {
         let old_head_ts = self.state_buffer.front().map(|(ts, _)| *ts);
         self.state_buffer.push_back((timestamp_us, values));
-        let mut overflow_drops = 0u64;
+
+        let mut overflow_drops: Vec<HashMap<String, f64>> = Vec::new();
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
-            self.state_buffer.pop_front();
-            overflow_drops += 1;
+            let (_, vals) = self.state_buffer.pop_front().unwrap();
+            overflow_drops.push(to_field_map(&self.state_fields, &vals));
         }
-        if overflow_drops > 0 {
-            self.metrics.record_state_dropped(overflow_drops);
-            log::warn!("state buffer overflow: dropped {overflow_drops} state(s)");
+        if !overflow_drops.is_empty() {
+            self.metrics.record_state_dropped(overflow_drops.len() as u64);
+            log::warn!("state buffer overflow: dropped {} state(s)", overflow_drops.len());
         }
         // If eviction (or first-ever push) changed the head state, the old blocker
         // hint no longer applies.
@@ -133,7 +134,14 @@ impl SyncBuffer {
         if new_head_ts != old_head_ts {
             self.blocker = None;
         }
-        self.try_sync()
+
+        let mut output = self.try_sync();
+        if !overflow_drops.is_empty() {
+            // Overflow drops precede any sync-fail drops temporally.
+            overflow_drops.append(&mut output.drops);
+            output.drops = overflow_drops;
+        }
+        output
     }
 
     pub fn clear(&mut self) {
@@ -609,7 +617,11 @@ mod tests {
         // cap_state=1 means the second state evicts the first.
         assert!(buf.push_state(1_000, vec![1.0]).is_empty());
         assert_eq!(buf.blocker, Some(0));
-        assert!(buf.push_state(2_000, vec![2.0]).is_empty());
+        // Second push evicts state@1000; overflow surfaces as a drop.
+        let out = buf.push_state(2_000, vec![2.0]);
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1);
+        assert_eq!(out.drops[0]["j1"], 1.0);
 
         // Only the second state remains. A frame matching it fires the obs.
         let out = push_f(&mut buf, "cam1", 2_005);
@@ -663,6 +675,24 @@ mod tests {
         let out = push_f(&mut buf, "cam1", 1_500); // delta == range, not a match
         assert!(out.observations.is_empty());
         assert_eq!(out.drops.len(), 1);
+    }
+
+    /// State-buffer overflow must surface evicted states via `output.drops`
+    /// so the `on_drop` callback can fire, matching spec behavior.
+    #[test]
+    fn state_overflow_with_tracks_reports_drops() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig { state_buffer_size: 2, ..Default::default() };
+        let mut buf = mk(&tracks, fields, config);
+
+        // No frames: each push_state blocks (no sync), fills the state buffer.
+        assert!(buf.push_state(100, vec![1.0]).drops.is_empty());
+        assert!(buf.push_state(200, vec![2.0]).drops.is_empty());
+        // Third push triggers overflow; state@100 must appear in drops.
+        let out = buf.push_state(300, vec![3.0]);
+        assert_eq!(out.drops.len(), 1);
+        assert_eq!(out.drops[0]["j1"], 1.0);
     }
 
     /// Sanity: inputs that stress the binary/cursor path with many empty and

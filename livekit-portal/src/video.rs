@@ -100,7 +100,13 @@ impl VideoReceiver {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
             while let Some(frame) = stream.next().await {
-                let timestamp_us = frame.frame_metadata.and_then(|m| m.user_timestamp).unwrap_or(0);
+                let timestamp_us = frame
+                    .frame_metadata
+                    .and_then(|m| m.user_timestamp)
+                    .expect(
+                        "video frame missing user_timestamp — \
+                         sender must enable PacketTrailerFeatures.user_timestamp",
+                    );
                 let frame_data = convert_frame(&frame, timestamp_us);
                 let frame_arc = Arc::new(frame_data);
 
