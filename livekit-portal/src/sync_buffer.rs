@@ -201,10 +201,16 @@ impl SyncBuffer {
                     continue;
                 }
 
-                // Unmatched. O(1) drop check: deque is sorted, so "all frames newer
-                // than state_ts + range" ≡ "front ts > state_ts + range".
-                let oldest_ts = frame_buf.front().unwrap().timestamp_us;
-                if oldest_ts > state_ts.saturating_add(range) {
+                // Unmatched. The real question is whether any *future* frame could
+                // match; since frame timestamps are monotonic, future ts ≥ back_ts,
+                // so the state is permanently unmatchable iff back_ts >= state_ts +
+                // range. (Checking the front would only detect the drop after
+                // eviction has dragged the old tail past the horizon — a latency
+                // bug of up to video_buffer_size frames.) `>=` matches the strict
+                // `d < range` match rule: a frame at exactly state_ts + range is
+                // not a match, so the state can't match it either.
+                let newest_ts = frame_buf.back().unwrap().timestamp_us;
+                if newest_ts >= state_ts.saturating_add(range) {
                     should_drop = true;
                     break;
                 } else if iter_blocker.is_none() {
@@ -567,6 +573,53 @@ mod tests {
         assert_eq!(out.observations.len(), 1);
         assert_eq!(out.observations[0].state["j1"], 2.0, "evicted state should not leak through");
         assert_eq!(out.observations[0].timestamp_us, 2_000);
+    }
+
+    /// Drop must fire when the *newest* frame is past the horizon, even if an
+    /// older frame is still buffered below the match window. Under the old
+    /// front-based check, the state would stall until eviction dragged the old
+    /// frame through the horizon.
+    #[test]
+    fn drop_triggers_on_back_past_horizon() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig {
+            video_buffer_size: 10,
+            state_buffer_size: 10,
+            search_range_us: 500,
+            observation_buffer_size: 10,
+        };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        let _ = push_f(&mut buf, "cam1", 1_000); // far below state - range (2_500)
+        assert!(buf.push_state(3_000, vec![1.0]).is_empty());
+
+        // Newest frame lands past state + range (3_500). Even though the old
+        // 1_000 frame is still in the buffer, no future frame can be < 5_000,
+        // so the state is permanently unmatchable.
+        let out = push_f(&mut buf, "cam1", 5_000);
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1, "state should drop as soon as back passes horizon");
+    }
+
+    /// Boundary: a frame landing exactly at `state_ts + range` is not a match
+    /// (strict `<`), and all future frames are ≥ that ts, so the state drops.
+    #[test]
+    fn drop_fires_at_exact_range_boundary() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig {
+            video_buffer_size: 10,
+            state_buffer_size: 10,
+            search_range_us: 500,
+            observation_buffer_size: 10,
+        };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
+        let out = push_f(&mut buf, "cam1", 1_500); // delta == range, not a match
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1);
     }
 
     /// Sanity: inputs that stress the binary/cursor path with many empty and
