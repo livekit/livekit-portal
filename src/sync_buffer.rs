@@ -109,6 +109,7 @@ impl SyncBuffer {
             }
 
             if should_drop {
+                log::warn!("dropping unsyncable state (no matching video frames within range)");
                 let (_, values) = self.state_buffer.pop_front().unwrap();
                 let dropped = vec![to_field_map(&self.state_fields, values)];
                 if let Some(ref cb) = self.drop_cb {

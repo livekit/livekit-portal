@@ -95,6 +95,8 @@ impl Portal {
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
 
+        log::info!("connecting as {:?} to {}", config.role, url);
+
         let (room, events) = Room::connect(&url, &token, options)
             .await
             .map_err(|e| PortalError::Room(e.to_string()))?;
@@ -103,6 +105,8 @@ impl Portal {
             Role::Robot => self.setup_robot(&room, &config).await?,
             Role::Operator => self.setup_operator(&room, &config).await?,
         }
+
+        log::info!("connected as {:?}", config.role);
 
         let inner_ref = self.inner.clone();
         let config_clone = config.clone();
@@ -161,6 +165,7 @@ impl Portal {
     }
 
     pub async fn disconnect(&self) -> Result<(), PortalError> {
+        log::info!("disconnecting");
         let room = self.inner.lock().room.take();
         if let Some(room) = room {
             room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
@@ -231,6 +236,7 @@ impl Portal {
         for track_name in &config.video_tracks {
             let publisher = VideoPublisher::new(track_name);
             publisher.publish(&lp).await?;
+            log::info!("published video track '{track_name}'");
             self.inner.lock().video_publishers.insert(track_name.clone(), publisher);
         }
 
@@ -239,6 +245,7 @@ impl Portal {
                 .publish_data_track("portal_state")
                 .await
                 .map_err(|e| PortalError::DataTrack(e.to_string()))?;
+            log::info!("published state data track ({} fields)", config.state_fields.len());
             self.inner.lock().state_publisher =
                 Some(DataPublisher::new(config.state_fields.clone(), track));
         }
@@ -278,6 +285,7 @@ impl Portal {
                 .publish_data_track("portal_action")
                 .await
                 .map_err(|e| PortalError::DataTrack(e.to_string()))?;
+            log::info!("published action data track ({} fields)", config.action_fields.len());
             self.inner.lock().action_publisher =
                 Some(DataPublisher::new(config.action_fields.clone(), track));
         }
@@ -300,6 +308,7 @@ async fn handle_room_event(
             if let RemoteTrack::Video(video_track) = track {
                 let track_name = publication.name();
                 if config.video_tracks.contains(&track_name.to_string()) {
+                    log::info!("subscribed to video track '{track_name}'");
                     let inner = inner_ref.lock();
                     if let Some(sync_buffer) = &inner.sync_buffer {
                         let raw_cb = inner
@@ -335,6 +344,7 @@ async fn handle_room_event(
             }
         }
         RoomEvent::Reconnected => {
+            log::info!("reconnected, clearing sync buffers");
             let inner = inner_ref.lock();
             if let Some(sb) = &inner.sync_buffer {
                 sb.lock().clear();
@@ -357,6 +367,7 @@ async fn subscribe_action_track(
         }
     };
 
+    log::info!("subscribed to action data track");
     let action_cb = inner_ref.lock().action_cb.clone();
     let receiver = DataReceiver::spawn_action(config.action_fields.clone(), stream, action_cb);
     inner_ref.lock().action_receiver = Some(receiver);
@@ -383,6 +394,7 @@ async fn subscribe_state_track(
     let state_cb = inner.state_cb.clone();
     drop(inner);
 
+    log::info!("subscribed to state data track");
     let receiver =
         DataReceiver::spawn_state(config.state_fields.clone(), stream, sync_buffer, state_cb);
     inner_ref.lock().state_receiver = Some(receiver);
