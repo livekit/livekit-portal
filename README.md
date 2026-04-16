@@ -1,14 +1,8 @@
-<!--BEGIN_BANNER_IMAGE-->
+<a href="https://livekit.io/">
+  <img src=".github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
+</a>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="/.github/banner_dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="/.github/banner_light.png">
-  <img style="width:100%;" alt="The LiveKit icon, the name of the repository and some sample code in the background." src="https://raw.githubusercontent.com/livekit/livekit-portal/main/.github/banner_light.png">
-</picture>
-
-<!--END_BANNER_IMAGE-->
-
-# LiveKit Portal
+# livekit-portal
 
 <!--BEGIN_DESCRIPTION-->
 A simple link for robots to their teleoperator or agents. Handles sending video streams, data streams, and observation syncing over LiveKit. Built to work well with LeRobot or any modern robot model stack.
