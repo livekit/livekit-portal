@@ -7,7 +7,6 @@ use crate::types::{Role, SyncConfig};
 /// Internal config data, cloneable for passing to Portal.
 #[derive(Debug, Clone)]
 pub(crate) struct PortalConfigData {
-    pub session: String,
     pub role: Role,
     pub video_tracks: Vec<String>,
     pub state_fields: Vec<String>,
@@ -24,10 +23,9 @@ pub struct PortalConfig {
 #[uniffi::export]
 impl PortalConfig {
     #[uniffi::constructor]
-    pub fn new(session: String, role: Role) -> Arc<Self> {
+    pub fn new(role: Role) -> Arc<Self> {
         Arc::new(Self {
             data: Mutex::new(PortalConfigData {
-                session,
                 role,
                 video_tracks: Vec::new(),
                 state_fields: Vec::new(),
