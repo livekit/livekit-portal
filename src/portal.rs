@@ -297,50 +297,46 @@ async fn handle_room_event(
     event: RoomEvent,
 ) {
     match event {
+        // Video tracks arrive via TrackSubscribed (operator subscribes to robot's video)
         RoomEvent::TrackSubscribed { track, publication, .. } => {
-            let track_name = publication.name();
-            match config.role {
-                Role::Robot => {
-                    if track_name == "portal_action" {
-                        if let RemoteTrack::Audio(_) = track {
-                        } else {
-                            subscribe_action_track(inner_ref, config).await;
-                        }
-                    }
-                }
-                Role::Operator => {
-                    match track {
-                        RemoteTrack::Video(video_track) => {
-                            if config.video_tracks.contains(&track_name.to_string()) {
-                                let inner = inner_ref.lock();
-                                if let Some(sync_buffer) = &inner.sync_buffer {
-                                    let raw_cb = inner
-                                        .video_cbs
-                                        .get(track_name.as_str())
-                                        .cloned()
-                                        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+            if config.role != Role::Operator {
+                return;
+            }
+            if let RemoteTrack::Video(video_track) = track {
+                let track_name = publication.name();
+                if config.video_tracks.contains(&track_name.to_string()) {
+                    let inner = inner_ref.lock();
+                    if let Some(sync_buffer) = &inner.sync_buffer {
+                        let raw_cb = inner
+                            .video_cbs
+                            .get(track_name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-                                    let stream = NativeVideoStream::new(video_track.rtc_track());
-                                    let receiver = VideoReceiver::spawn(
-                                        track_name.to_string(),
-                                        stream,
-                                        sync_buffer.clone(),
-                                        raw_cb,
-                                    );
-                                    drop(inner);
-                                    inner_ref
-                                        .lock()
-                                        .video_receivers
-                                        .insert(track_name.to_string(), receiver);
-                                }
-                            }
-                        }
-                        RemoteTrack::Audio(_) => {}
-                    }
-                    if track_name == "portal_state" {
-                        subscribe_state_track(inner_ref, config).await;
+                        let stream = NativeVideoStream::new(video_track.rtc_track());
+                        let receiver = VideoReceiver::spawn(
+                            track_name.to_string(),
+                            stream,
+                            sync_buffer.clone(),
+                            raw_cb,
+                        );
+                        drop(inner);
+                        inner_ref.lock().video_receivers.insert(track_name.to_string(), receiver);
                     }
                 }
+            }
+        }
+        // Data tracks arrive via DataTrackPublished (state and action)
+        RoomEvent::DataTrackPublished(remote_data_track) => {
+            let track_name = remote_data_track.info().name().to_string();
+            match (config.role, track_name.as_str()) {
+                (Role::Robot, "portal_action") => {
+                    subscribe_action_track(inner_ref, config, remote_data_track).await;
+                }
+                (Role::Operator, "portal_state") => {
+                    subscribe_state_track(inner_ref, config, remote_data_track).await;
+                }
+                _ => {}
             }
         }
         RoomEvent::Reconnected => {
@@ -353,10 +349,46 @@ async fn handle_room_event(
     }
 }
 
-async fn subscribe_action_track(_inner_ref: &Arc<Mutex<PortalInner>>, _config: &PortalConfigData) {
-    // TODO: Wire data track subscription once the API is clarified
+async fn subscribe_action_track(
+    inner_ref: &Arc<Mutex<PortalInner>>,
+    config: &PortalConfigData,
+    track: RemoteDataTrack,
+) {
+    let stream = match track.subscribe().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to subscribe to action data track: {e}");
+            return;
+        }
+    };
+
+    let action_cb = inner_ref.lock().action_cb.clone();
+    let receiver = DataReceiver::spawn_action(config.action_fields.clone(), stream, action_cb);
+    inner_ref.lock().action_receiver = Some(receiver);
 }
 
-async fn subscribe_state_track(_inner_ref: &Arc<Mutex<PortalInner>>, _config: &PortalConfigData) {
-    // TODO: Wire data track subscription once the API is clarified
+async fn subscribe_state_track(
+    inner_ref: &Arc<Mutex<PortalInner>>,
+    config: &PortalConfigData,
+    track: RemoteDataTrack,
+) {
+    let stream = match track.subscribe().await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("failed to subscribe to state data track: {e}");
+            return;
+        }
+    };
+
+    let inner = inner_ref.lock();
+    let sync_buffer = match &inner.sync_buffer {
+        Some(sb) => sb.clone(),
+        None => return,
+    };
+    let state_cb = inner.state_cb.clone();
+    drop(inner);
+
+    let receiver =
+        DataReceiver::spawn_state(config.state_fields.clone(), stream, sync_buffer, state_cb);
+    inner_ref.lock().state_receiver = Some(receiver);
 }
