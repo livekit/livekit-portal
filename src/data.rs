@@ -54,7 +54,8 @@ impl DataPublisher {
         Ok(())
     }
 
-    /// Send from a HashMap, reordering to declared field order. Missing fields default to 0.0.
+    /// Send from a HashMap, reordering to declared field order.
+    /// Missing keys default to 0.0 — callers should supply every declared field.
     pub fn send_map(
         &self,
         map: &HashMap<String, f64>,
@@ -81,16 +82,17 @@ pub(crate) fn handle_data_received(
     sync_buffer: &Option<Arc<Mutex<SyncBuffer>>>,
 ) {
     match (config_role, topic) {
-        (Role::Robot, "portal_action") => {
-            if let Ok((_, values)) = deserialize_values(payload, action_fields.len()) {
+        (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
+            Ok((_, values)) => {
                 let map = to_field_map(action_fields, values);
                 if let Some(cb) = action_cb.lock().as_ref() {
                     cb(map);
                 }
             }
-        }
-        (Role::Operator, "portal_state") => {
-            if let Ok((timestamp_us, values)) = deserialize_values(payload, state_fields.len()) {
+            Err(e) => log::warn!("failed to deserialize action payload: {e}"),
+        },
+        (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
+            Ok((timestamp_us, values)) => {
                 if let Some(cb) = state_cb.lock().as_ref() {
                     cb(to_field_map(state_fields, values.clone()));
                 }
@@ -98,7 +100,8 @@ pub(crate) fn handle_data_received(
                     sb.lock().push_state(timestamp_us, values);
                 }
             }
-        }
+            Err(e) => log::warn!("failed to deserialize state payload: {e}"),
+        },
         _ => {}
     }
 }

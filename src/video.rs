@@ -61,7 +61,7 @@ impl VideoPublisher {
     ) -> PortalResult<()> {
         let expected_size = (width * height * 3 / 2) as usize;
         if i420_data.len() != expected_size {
-            return Err(PortalError::WrongValueCount {
+            return Err(PortalError::WrongFrameSize {
                 expected: expected_size,
                 got: i420_data.len(),
             });

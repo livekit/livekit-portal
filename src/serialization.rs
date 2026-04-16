@@ -3,7 +3,7 @@ use crate::error::{PortalError, PortalResult};
 /// Serialize state/action values with a timestamp.
 ///
 /// Wire format: `[u64 timestamp_us][f64 val0][f64 val1]...[f64 valN]`, all little-endian.
-pub fn serialize_values(timestamp_us: u64, values: &[f64]) -> Vec<u8> {
+pub(crate) fn serialize_values(timestamp_us: u64, values: &[f64]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + values.len() * 8);
     buf.extend_from_slice(&timestamp_us.to_le_bytes());
     for v in values {
@@ -13,7 +13,10 @@ pub fn serialize_values(timestamp_us: u64, values: &[f64]) -> Vec<u8> {
 }
 
 /// Deserialize bytes back to a timestamp and ordered values.
-pub fn deserialize_values(data: &[u8], expected_fields: usize) -> PortalResult<(u64, Vec<f64>)> {
+pub(crate) fn deserialize_values(
+    data: &[u8],
+    expected_fields: usize,
+) -> PortalResult<(u64, Vec<f64>)> {
     let expected_len = 8 + expected_fields * 8;
     if data.len() != expected_len {
         return Err(PortalError::Deserialization(format!(

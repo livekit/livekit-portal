@@ -1,21 +1,21 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Robot,
     Operator,
 }
 
 /// A synchronized observation: one state matched with one frame from every registered video track.
-#[derive(Debug, uniffi::Record)]
+#[derive(Debug, Clone)]
 pub struct Observation {
     pub state: HashMap<String, f64>,
     pub frames: HashMap<String, VideoFrameData>,
     pub timestamp_us: u64,
 }
 
-/// Decoded video frame data, owned and FFI-safe.
-#[derive(Debug, Clone, uniffi::Record)]
+/// Decoded video frame data, owned.
+#[derive(Debug, Clone)]
 pub struct VideoFrameData {
     pub width: u32,
     pub height: u32,
@@ -24,7 +24,7 @@ pub struct VideoFrameData {
 }
 
 /// Sync configuration with sensible defaults for robotics.
-#[derive(Debug, Clone, Copy, uniffi::Record)]
+#[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub video_buffer_size: u32,
     pub state_buffer_size: u32,

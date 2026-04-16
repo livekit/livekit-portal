@@ -4,11 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-[lib]
-crate-type = ["cdylib", "lib"]
-
 [dependencies]
-uniffi = { version = "0.29" }
 livekit = { git = "https://github.com/livekit/rust-sdks.git", branch = "dc/feature/user_timestamp" }
 thiserror = "2"
 parking_lot = "0.12"

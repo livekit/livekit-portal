@@ -6,7 +6,7 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::{PortalConfig, PortalConfigData};
+use crate::config::PortalConfig;
 use crate::data::{handle_data_received, DataCb, DataPublisher};
 use crate::error::{PortalError, PortalResult};
 use crate::sync_buffer::SyncBuffer;
@@ -18,7 +18,7 @@ type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 
 struct PortalInner {
-    config: PortalConfigData,
+    config: PortalConfig,
     room: Option<Room>,
 
     // Robot side
@@ -40,27 +40,21 @@ struct PortalInner {
     event_task: Option<JoinHandle<()>>,
 }
 
-#[derive(uniffi::Object)]
 pub struct Portal {
     inner: Arc<Mutex<PortalInner>>,
 }
 
-// --- UniFFI-exported methods ---
-
-#[uniffi::export]
 impl Portal {
-    #[uniffi::constructor]
-    pub fn new(config: Arc<PortalConfig>) -> Arc<Self> {
-        let data = config.snapshot();
-        let video_cbs: HashMap<_, _> = data
+    pub fn new(config: PortalConfig) -> Self {
+        let video_cbs: HashMap<_, _> = config
             .video_tracks
             .iter()
             .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
             .collect();
 
-        Arc::new(Self {
+        Self {
             inner: Arc::new(Mutex::new(PortalInner {
-                config: data,
+                config,
                 room: None,
                 video_publishers: HashMap::new(),
                 state_publisher: None,
@@ -74,10 +68,10 @@ impl Portal {
                 drop_cb: Arc::new(Mutex::new(None)),
                 event_task: None,
             })),
-        })
+        }
     }
 
-    pub async fn connect(&self, url: String, token: String) -> Result<(), PortalError> {
+    pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
         let config = {
             let inner = self.inner.lock();
             if inner.room.is_some() {
@@ -89,18 +83,18 @@ impl Portal {
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
 
-        log::info!("connecting as {:?} to {}", config.role, url);
+        log::info!("[{}] connecting as {:?} to {}", config.session, config.role, url);
 
-        let (room, events) = Room::connect(&url, &token, options)
+        let (room, events) = Room::connect(url, token, options)
             .await
             .map_err(|e| PortalError::Room(e.to_string()))?;
 
         match config.role {
             Role::Robot => self.setup_robot(&room, &config).await?,
-            Role::Operator => self.setup_operator(&room, &config)?,
+            Role::Operator => self.setup_operator(&room, &config),
         }
 
-        log::info!("connected as {:?}", config.role);
+        log::info!("[{}] connected as {:?}", config.session, config.role);
 
         let inner_ref = self.inner.clone();
         let config_clone = config.clone();
@@ -111,56 +105,53 @@ impl Portal {
             }
         });
 
-        {
-            let mut inner = self.inner.lock();
-            inner.room = Some(room);
-            inner.event_task = Some(event_handle);
-        }
-
+        let mut inner = self.inner.lock();
+        inner.room = Some(room);
+        inner.event_task = Some(event_handle);
         Ok(())
     }
 
     pub fn send_video_frame(
         &self,
-        track_name: String,
-        i420_data: Vec<u8>,
+        track_name: &str,
+        i420_data: &[u8],
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
-    ) -> Result<(), PortalError> {
+    ) -> PortalResult<()> {
         let inner = self.inner.lock();
         let publisher = inner
             .video_publishers
-            .get(&track_name)
-            .ok_or_else(|| PortalError::UnknownVideoTrack { name: track_name.clone() })?;
-        publisher.send_frame(&i420_data, width, height, timestamp_us)
+            .get(track_name)
+            .ok_or_else(|| PortalError::UnknownVideoTrack { name: track_name.to_string() })?;
+        publisher.send_frame(i420_data, width, height, timestamp_us)
     }
 
     pub fn send_state(
         &self,
-        values: HashMap<String, f64>,
+        values: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
-    ) -> Result<(), PortalError> {
+    ) -> PortalResult<()> {
         let inner = self.inner.lock();
         let publisher =
             inner.state_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Operator))?;
-        publisher.send_map(&values, timestamp_us)
+        publisher.send_map(values, timestamp_us)
     }
 
     pub fn send_action(
         &self,
-        values: HashMap<String, f64>,
+        values: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
-    ) -> Result<(), PortalError> {
+    ) -> PortalResult<()> {
         let inner = self.inner.lock();
         let publisher =
             inner.action_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Robot))?;
-        publisher.send_map(&values, timestamp_us)
+        publisher.send_map(values, timestamp_us)
     }
 
-    pub async fn disconnect(&self) -> Result<(), PortalError> {
-        log::info!("disconnecting");
+    pub async fn disconnect(&self) -> PortalResult<()> {
         let room = self.inner.lock().room.take();
+        log::info!("disconnecting");
         if let Some(room) = room {
             room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
         }
@@ -181,11 +172,17 @@ impl Portal {
         inner.action_publisher = None;
         Ok(())
     }
-}
 
-// --- Rust-only callback registration (closures) ---
+    pub fn take_observations(&self) -> Vec<Observation> {
+        let sb = self.inner.lock().sync_buffer.clone();
+        match sb {
+            Some(sb) => sb.lock().take_observations(),
+            None => Vec::new(),
+        }
+    }
 
-impl Portal {
+    // --- Callback registration ---
+
     pub fn on_action(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
         *self.inner.lock().action_cb.lock() = Some(Box::new(callback));
     }
@@ -203,26 +200,28 @@ impl Portal {
         track_name: &str,
         callback: impl Fn(&str, &VideoFrameData) + Send + Sync + 'static,
     ) {
-        if let Some(cb_slot) = self.inner.lock().video_cbs.get(track_name) {
-            *cb_slot.lock() = Some(Box::new(callback));
+        let inner = self.inner.lock();
+        match inner.video_cbs.get(track_name) {
+            Some(cb_slot) => *cb_slot.lock() = Some(Box::new(callback)),
+            None => {
+                log::warn!("on_video: track '{track_name}' is not registered — callback ignored")
+            }
         }
     }
 
     pub fn on_drop(&self, callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static) {
         *self.inner.lock().drop_cb.lock() = Some(Box::new(callback));
     }
-}
 
-// --- Internal helpers ---
+    // --- Internal ---
 
-impl Portal {
-    async fn setup_robot(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
+    async fn setup_robot(&self, room: &Room, config: &PortalConfig) -> PortalResult<()> {
         let lp = room.local_participant();
 
         for track_name in &config.video_tracks {
             let publisher = VideoPublisher::new(track_name);
             publisher.publish(&lp).await?;
-            log::info!("published video track '{track_name}'");
+            log::info!("[{}] published video track '{track_name}'", config.session);
             self.inner.lock().video_publishers.insert(track_name.clone(), publisher);
         }
 
@@ -235,7 +234,8 @@ impl Portal {
             );
             let mode = if config.state_reliable { "reliable" } else { "unreliable" };
             log::info!(
-                "ready to publish state via {mode} data ({} fields)",
+                "[{}] ready to publish state via {mode} data ({} fields)",
+                config.session,
                 config.state_fields.len()
             );
             self.inner.lock().state_publisher = Some(publisher);
@@ -244,7 +244,7 @@ impl Portal {
         Ok(())
     }
 
-    fn setup_operator(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
+    fn setup_operator(&self, room: &Room, config: &PortalConfig) {
         let lp = room.local_participant();
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
@@ -253,9 +253,11 @@ impl Portal {
             config.sync_config,
         )));
 
+        let (obs_cb, drop_cb) = {
+            let inner = self.inner.lock();
+            (inner.observation_cb.clone(), inner.drop_cb.clone())
+        };
         {
-            let obs_cb = self.inner.lock().observation_cb.clone();
-            let drop_cb = self.inner.lock().drop_cb.clone();
             let mut sb = sync_buffer.lock();
             sb.set_observation_callback(Box::new(move |obs| {
                 if let Some(cb) = obs_cb.lock().as_ref() {
@@ -269,32 +271,28 @@ impl Portal {
             }));
         }
 
-        self.inner.lock().sync_buffer = Some(sync_buffer);
-
-        if !config.action_fields.is_empty() {
-            let publisher = DataPublisher::new(
+        let action_publisher = (!config.action_fields.is_empty()).then(|| {
+            let mode = if config.action_reliable { "reliable" } else { "unreliable" };
+            log::info!(
+                "[{}] ready to publish action via {mode} data ({} fields)",
+                config.session,
+                config.action_fields.len()
+            );
+            DataPublisher::new(
                 config.action_fields.clone(),
                 "portal_action",
                 config.action_reliable,
-                lp.clone(),
-            );
-            let mode = if config.action_reliable { "reliable" } else { "unreliable" };
-            log::info!(
-                "ready to publish action via {mode} data ({} fields)",
-                config.action_fields.len()
-            );
-            self.inner.lock().action_publisher = Some(publisher);
-        }
+                lp,
+            )
+        });
 
-        Ok(())
+        let mut inner = self.inner.lock();
+        inner.sync_buffer = Some(sync_buffer);
+        inner.action_publisher = action_publisher;
     }
 }
 
-fn handle_room_event(
-    inner_ref: &Arc<Mutex<PortalInner>>,
-    config: &PortalConfigData,
-    event: RoomEvent,
-) {
+fn handle_room_event(inner_ref: &Arc<Mutex<PortalInner>>, config: &PortalConfig, event: RoomEvent) {
     match event {
         RoomEvent::TrackSubscribed { track, publication, .. } => {
             if config.role != Role::Operator {
@@ -303,7 +301,7 @@ fn handle_room_event(
             if let RemoteTrack::Video(video_track) = track {
                 let track_name = publication.name();
                 if config.video_tracks.contains(&track_name.to_string()) {
-                    log::info!("subscribed to video track '{track_name}'");
+                    log::info!("[{}] subscribed to video track '{track_name}'", config.session);
                     let inner = inner_ref.lock();
                     if let Some(sync_buffer) = &inner.sync_buffer {
                         let raw_cb = inner
@@ -341,7 +339,7 @@ fn handle_room_event(
             }
         }
         RoomEvent::Reconnected => {
-            log::info!("reconnected, clearing sync buffers");
+            log::info!("[{}] reconnected, clearing sync buffers", config.session);
             let inner = inner_ref.lock();
             if let Some(sb) = &inner.sync_buffer {
                 sb.lock().clear();

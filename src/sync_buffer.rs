@@ -9,6 +9,7 @@ type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 pub(crate) struct SyncBuffer {
     video_buffers: HashMap<String, VecDeque<Arc<VideoFrameData>>>,
     state_buffer: VecDeque<(u64, Vec<f64>)>, // (timestamp_us, values)
+    observation_buffer: VecDeque<Observation>,
     state_fields: Vec<String>,
     config: SyncConfig,
     observation_cb: Option<ObservationCb>,
@@ -26,6 +27,7 @@ impl SyncBuffer {
         Self {
             video_buffers,
             state_buffer: VecDeque::new(),
+            observation_buffer: VecDeque::new(),
             state_fields,
             config,
             observation_cb: None,
@@ -64,6 +66,13 @@ impl SyncBuffer {
             buf.clear();
         }
         self.state_buffer.clear();
+        self.observation_buffer.clear();
+    }
+
+    /// Drain all buffered observations. Intended for pull-based consumers
+    /// that want to batch-retrieve observations instead of reacting via callback.
+    pub fn take_observations(&mut self) -> Vec<Observation> {
+        self.observation_buffer.drain(..).collect()
     }
 
     fn try_sync(&mut self) {
@@ -96,6 +105,9 @@ impl SyncBuffer {
                         .iter()
                         .all(|f| f.timestamp_us > state_ts + self.config.search_range_us)
                 {
+                    // All buffered frames are newer than the state's match window.
+                    // Future frames will be even newer, so this state can never match — drop it.
+                    // (The mirror case — all frames older — is a "wait": newer frames may still arrive.)
                     should_drop = true;
                     break;
                 } else {
@@ -137,7 +149,12 @@ impl SyncBuffer {
                 };
 
                 if let Some(ref cb) = self.observation_cb {
-                    cb(observation);
+                    cb(observation.clone());
+                }
+
+                self.observation_buffer.push_back(observation);
+                while self.observation_buffer.len() > self.config.observation_buffer_size as usize {
+                    self.observation_buffer.pop_front();
                 }
             } else {
                 break;
@@ -280,5 +297,42 @@ mod tests {
 
         assert!(buf.video_buffers.get("cam1").unwrap().is_empty());
         assert!(buf.state_buffer.is_empty());
+        assert!(buf.observation_buffer.is_empty());
+    }
+
+    #[test]
+    fn take_observations_drains_buffer() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+
+        for ts in [1000u64, 2000, 3000] {
+            let (name, frame) = make_frame("cam1", ts);
+            buf.push_frame(&name, frame);
+            buf.push_state(ts, vec![ts as f64]);
+        }
+
+        let obs = buf.take_observations();
+        assert_eq!(obs.len(), 3);
+        assert!(buf.take_observations().is_empty());
+    }
+
+    #[test]
+    fn observation_buffer_evicts_oldest() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig { observation_buffer_size: 2, ..Default::default() };
+        let mut buf = SyncBuffer::new(&tracks, fields, config);
+
+        for ts in [1000u64, 2000, 3000] {
+            let (name, frame) = make_frame("cam1", ts);
+            buf.push_frame(&name, frame);
+            buf.push_state(ts, vec![ts as f64]);
+        }
+
+        let obs = buf.take_observations();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].timestamp_us, 2000);
+        assert_eq!(obs[1].timestamp_us, 3000);
     }
 }
