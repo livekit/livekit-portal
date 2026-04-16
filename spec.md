@@ -114,9 +114,9 @@ inference_portal.on_video("camera1", callback)  # called when a new frame is rec
 
 An observation is a complete synced bundle: one state matched with one frame from every registered video track. There are no partial observations. If any registered video track is missing a matching frame within the sync window, the observation is not formed and the state is dropped.
 
-### Configuration
+### Tuning
 
-All configuration is set on the config object before connecting.
+All tuning is set on the config object before connecting.
 
 ```python
 config.set_video_buffer(30)       # (unit: samples) how many frames to buffer per video track for sync
