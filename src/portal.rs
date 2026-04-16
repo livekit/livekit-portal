@@ -1,20 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use livekit::data_track::{DataTrack, Local};
 use livekit::prelude::*;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::{PortalConfig, PortalConfigData};
-use crate::data::{DataPublisher, DataReceiver};
+use crate::data::{handle_data_received, DataCb, DataPublisher};
 use crate::error::{PortalError, PortalResult};
 use crate::sync_buffer::SyncBuffer;
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver};
 
-type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 type ObservationCb = Box<dyn Fn(Observation) + Send + Sync>;
 type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
@@ -26,11 +24,9 @@ struct PortalInner {
     // Robot side
     video_publishers: HashMap<String, VideoPublisher>,
     state_publisher: Option<DataPublisher>,
-    action_receiver: Option<DataReceiver>,
 
     // Operator side
     video_receivers: HashMap<String, VideoReceiver>,
-    state_receiver: Option<DataReceiver>,
     action_publisher: Option<DataPublisher>,
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
 
@@ -68,9 +64,7 @@ impl Portal {
                 room: None,
                 video_publishers: HashMap::new(),
                 state_publisher: None,
-                action_receiver: None,
                 video_receivers: HashMap::new(),
-                state_receiver: None,
                 action_publisher: None,
                 sync_buffer: None,
                 action_cb: Arc::new(Mutex::new(None)),
@@ -103,7 +97,7 @@ impl Portal {
 
         match config.role {
             Role::Robot => self.setup_robot(&room, &config).await?,
-            Role::Operator => self.setup_operator(&room, &config).await?,
+            Role::Operator => self.setup_operator(&room, &config)?,
         }
 
         log::info!("connected as {:?}", config.role);
@@ -113,7 +107,7 @@ impl Portal {
         let event_handle = tokio::spawn(async move {
             let mut events = events;
             while let Some(event) = events.recv().await {
-                handle_room_event(&inner_ref, &config_clone, event).await;
+                handle_room_event(&inner_ref, &config_clone, event);
             }
         });
 
@@ -178,21 +172,13 @@ impl Portal {
         for receiver in inner.video_receivers.values() {
             receiver.abort();
         }
-        if let Some(receiver) = &inner.action_receiver {
-            receiver.abort();
-        }
-        if let Some(receiver) = &inner.state_receiver {
-            receiver.abort();
-        }
         if let Some(sb) = &inner.sync_buffer {
             sb.lock().clear();
         }
         inner.video_publishers.clear();
         inner.video_receivers.clear();
         inner.state_publisher = None;
-        inner.state_receiver = None;
         inner.action_publisher = None;
-        inner.action_receiver = None;
         Ok(())
     }
 }
@@ -241,25 +227,25 @@ impl Portal {
         }
 
         if !config.state_fields.is_empty() {
-            let track: DataTrack<Local> = lp
-                .publish_data_track("portal_state")
-                .await
-                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
-            log::info!("published state data track ({} fields)", config.state_fields.len());
-            self.inner.lock().state_publisher =
-                Some(DataPublisher::new(config.state_fields.clone(), track));
+            let publisher =
+                DataPublisher::new(config.state_fields.clone(), "portal_state", lp.clone());
+            log::info!(
+                "ready to publish state via reliable data ({} fields)",
+                config.state_fields.len()
+            );
+            self.inner.lock().state_publisher = Some(publisher);
         }
 
         Ok(())
     }
 
-    async fn setup_operator(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
+    fn setup_operator(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
         let lp = room.local_participant();
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &config.video_tracks,
             config.state_fields.clone(),
-            config.sync_config.clone(),
+            config.sync_config,
         )));
 
         {
@@ -281,26 +267,25 @@ impl Portal {
         self.inner.lock().sync_buffer = Some(sync_buffer);
 
         if !config.action_fields.is_empty() {
-            let track: DataTrack<Local> = lp
-                .publish_data_track("portal_action")
-                .await
-                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
-            log::info!("published action data track ({} fields)", config.action_fields.len());
-            self.inner.lock().action_publisher =
-                Some(DataPublisher::new(config.action_fields.clone(), track));
+            let publisher =
+                DataPublisher::new(config.action_fields.clone(), "portal_action", lp.clone());
+            log::info!(
+                "ready to publish action via reliable data ({} fields)",
+                config.action_fields.len()
+            );
+            self.inner.lock().action_publisher = Some(publisher);
         }
 
         Ok(())
     }
 }
 
-async fn handle_room_event(
+fn handle_room_event(
     inner_ref: &Arc<Mutex<PortalInner>>,
     config: &PortalConfigData,
     event: RoomEvent,
 ) {
     match event {
-        // Video tracks arrive via TrackSubscribed (operator subscribes to robot's video)
         RoomEvent::TrackSubscribed { track, publication, .. } => {
             if config.role != Role::Operator {
                 return;
@@ -330,17 +315,19 @@ async fn handle_room_event(
                 }
             }
         }
-        // Data tracks arrive via DataTrackPublished (state and action)
-        RoomEvent::DataTrackPublished(remote_data_track) => {
-            let track_name = remote_data_track.info().name().to_string();
-            match (config.role, track_name.as_str()) {
-                (Role::Robot, "portal_action") => {
-                    subscribe_action_track(inner_ref, config, remote_data_track).await;
-                }
-                (Role::Operator, "portal_state") => {
-                    subscribe_state_track(inner_ref, config, remote_data_track).await;
-                }
-                _ => {}
+        RoomEvent::DataReceived { payload, topic, .. } => {
+            if let Some(topic) = &topic {
+                let inner = inner_ref.lock();
+                handle_data_received(
+                    &payload,
+                    topic,
+                    config.role,
+                    &config.action_fields,
+                    &config.state_fields,
+                    &inner.action_cb,
+                    &inner.state_cb,
+                    &inner.sync_buffer,
+                );
             }
         }
         RoomEvent::Reconnected => {
@@ -352,50 +339,4 @@ async fn handle_room_event(
         }
         _ => {}
     }
-}
-
-async fn subscribe_action_track(
-    inner_ref: &Arc<Mutex<PortalInner>>,
-    config: &PortalConfigData,
-    track: RemoteDataTrack,
-) {
-    let stream = match track.subscribe().await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("failed to subscribe to action data track: {e}");
-            return;
-        }
-    };
-
-    log::info!("subscribed to action data track");
-    let action_cb = inner_ref.lock().action_cb.clone();
-    let receiver = DataReceiver::spawn_action(config.action_fields.clone(), stream, action_cb);
-    inner_ref.lock().action_receiver = Some(receiver);
-}
-
-async fn subscribe_state_track(
-    inner_ref: &Arc<Mutex<PortalInner>>,
-    config: &PortalConfigData,
-    track: RemoteDataTrack,
-) {
-    let stream = match track.subscribe().await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("failed to subscribe to state data track: {e}");
-            return;
-        }
-    };
-
-    let inner = inner_ref.lock();
-    let sync_buffer = match &inner.sync_buffer {
-        Some(sb) => sb.clone(),
-        None => return,
-    };
-    let state_cb = inner.state_cb.clone();
-    drop(inner);
-
-    log::info!("subscribed to state data track");
-    let receiver =
-        DataReceiver::spawn_state(config.state_fields.clone(), stream, sync_buffer, state_cb);
-    inner_ref.lock().state_receiver = Some(receiver);
 }

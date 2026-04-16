@@ -1,28 +1,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures_util::StreamExt;
-use livekit::data_track::{DataTrack, DataTrackFrame, DataTrackStream, Local, PushFrameError};
+use livekit::prelude::*;
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
 
 use crate::error::{PortalError, PortalResult};
 use crate::serialization::{deserialize_values, serialize_values};
 use crate::sync_buffer::SyncBuffer;
-use crate::types::to_field_map;
+use crate::types::{to_field_map, Role};
 use crate::video::now_us;
 
 // --- Publisher ---
 
 pub(crate) struct DataPublisher {
     fields: Vec<String>,
-    track: DataTrack<Local>,
+    topic: String,
+    local_participant: LocalParticipant,
 }
 
 impl DataPublisher {
-    pub fn new(fields: Vec<String>, track: DataTrack<Local>) -> Self {
-        Self { fields, track }
+    pub fn new(fields: Vec<String>, topic: &str, local_participant: LocalParticipant) -> Self {
+        Self { fields, topic: topic.to_string(), local_participant }
     }
 
     pub fn send(&self, values: &[f64], timestamp_us: Option<u64>) -> PortalResult<()> {
@@ -34,10 +32,20 @@ impl DataPublisher {
         }
         let ts = timestamp_us.unwrap_or_else(now_us);
         let payload = serialize_values(ts, values);
-        let frame = DataTrackFrame::new(Bytes::from(payload));
-        self.track
-            .try_push(frame)
-            .map_err(|e: PushFrameError| PortalError::DataTrack(e.to_string()))
+        let packet = DataPacket {
+            payload,
+            topic: Some(self.topic.clone()),
+            reliable: true,
+            destination_identities: Vec::new(),
+        };
+        // publish_data is async but we fire-and-forget via spawn
+        let lp = self.local_participant.clone();
+        tokio::spawn(async move {
+            if let Err(e) = lp.publish_data(packet).await {
+                log::warn!("failed to publish data: {e}");
+            }
+        });
+        Ok(())
     }
 
     /// Send from a HashMap, reordering to declared field order. Missing fields default to 0.0.
@@ -52,59 +60,39 @@ impl DataPublisher {
     }
 }
 
-// --- Receiver ---
+// --- Receiver (dispatches DataReceived events) ---
 
-type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
+pub(crate) type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 
-pub(crate) struct DataReceiver {
-    task_handle: JoinHandle<()>,
-}
-
-impl DataReceiver {
-    /// Spawn a receiver for action (robot side) — fires callback directly, no sync.
-    pub fn spawn_action(
-        fields: Vec<String>,
-        stream: DataTrackStream,
-        callback: Arc<Mutex<Option<DataCb>>>,
-    ) -> Self {
-        let handle = tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(frame) = stream.next().await {
-                if let Ok((_, values)) = deserialize_values(&frame.payload(), fields.len()) {
-                    let map = to_field_map(&fields, values);
-                    if let Some(cb) = callback.lock().as_ref() {
-                        cb(map);
-                    }
+pub(crate) fn handle_data_received(
+    payload: &[u8],
+    topic: &str,
+    config_role: Role,
+    action_fields: &[String],
+    state_fields: &[String],
+    action_cb: &Arc<Mutex<Option<DataCb>>>,
+    state_cb: &Arc<Mutex<Option<DataCb>>>,
+    sync_buffer: &Option<Arc<Mutex<SyncBuffer>>>,
+) {
+    match (config_role, topic) {
+        (Role::Robot, "portal_action") => {
+            if let Ok((_, values)) = deserialize_values(payload, action_fields.len()) {
+                let map = to_field_map(action_fields, values);
+                if let Some(cb) = action_cb.lock().as_ref() {
+                    cb(map);
                 }
             }
-        });
-        Self { task_handle: handle }
-    }
-
-    /// Spawn a receiver for state (operator side) — feeds SyncBuffer.
-    pub fn spawn_state(
-        fields: Vec<String>,
-        stream: DataTrackStream,
-        sync_buffer: Arc<Mutex<SyncBuffer>>,
-        raw_callback: Arc<Mutex<Option<DataCb>>>,
-    ) -> Self {
-        let handle = tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(frame) = stream.next().await {
-                if let Ok((timestamp_us, values)) =
-                    deserialize_values(&frame.payload(), fields.len())
-                {
-                    if let Some(cb) = raw_callback.lock().as_ref() {
-                        cb(to_field_map(&fields, values.clone()));
-                    }
-                    sync_buffer.lock().push_state(timestamp_us, values);
+        }
+        (Role::Operator, "portal_state") => {
+            if let Ok((timestamp_us, values)) = deserialize_values(payload, state_fields.len()) {
+                if let Some(cb) = state_cb.lock().as_ref() {
+                    cb(to_field_map(state_fields, values.clone()));
+                }
+                if let Some(sb) = sync_buffer {
+                    sb.lock().push_state(timestamp_us, values);
                 }
             }
-        });
-        Self { task_handle: handle }
-    }
-
-    pub fn abort(&self) {
-        self.task_handle.abort();
+        }
+        _ => {}
     }
 }
