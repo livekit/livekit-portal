@@ -45,7 +45,7 @@ impl SyncBuffer {
                 timestamp_us: frame.timestamp_us,
                 frame,
             });
-            while buf.len() > self.config.video_buffer_size {
+            while buf.len() > self.config.video_buffer_size as usize {
                 buf.pop_front();
             }
         }
@@ -55,7 +55,7 @@ impl SyncBuffer {
     pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) {
         self.state_buffer
             .push_back(TimestampedState { timestamp_us, values });
-        while self.state_buffer.len() > self.config.state_buffer_size {
+        while self.state_buffer.len() > self.config.state_buffer_size as usize {
             self.state_buffer.pop_front();
         }
         self.try_sync();
@@ -136,9 +136,9 @@ impl SyncBuffer {
                     .map(|(k, v)| (k.clone(), v))
                     .collect();
 
-                let frame_map: HashMap<String, Arc<VideoFrameData>> = matched_frames
+                let frame_map: HashMap<String, VideoFrameData> = matched_frames
                     .into_iter()
-                    .map(|(name, (_, frame))| (name, frame))
+                    .map(|(name, (_, frame))| (name, (*frame).clone()))
                     .collect();
 
                 let observation = Observation {

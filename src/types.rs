@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum Role {
     Robot,
     Operator,
@@ -17,15 +17,15 @@ impl Role {
 }
 
 /// A synchronized observation: one state matched with one frame from every registered video track.
-#[derive(Debug)]
+#[derive(Debug, uniffi::Record)]
 pub struct Observation {
     pub state: HashMap<String, f64>,
-    pub frames: HashMap<String, Arc<VideoFrameData>>,
+    pub frames: HashMap<String, VideoFrameData>,
     pub timestamp_us: u64,
 }
 
 /// Decoded video frame data, owned and FFI-safe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct VideoFrameData {
     pub width: u32,
     pub height: u32,
@@ -48,12 +48,12 @@ pub(crate) struct TimestampedState {
 }
 
 /// Sync configuration with sensible defaults for robotics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct SyncConfig {
-    pub video_buffer_size: usize,
-    pub state_buffer_size: usize,
+    pub video_buffer_size: u32,
+    pub state_buffer_size: u32,
     pub search_range_us: u64,
-    pub observation_buffer_size: usize,
+    pub observation_buffer_size: u32,
 }
 
 impl Default for SyncConfig {

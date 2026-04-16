@@ -12,5 +12,7 @@ mod video_receiver;
 
 pub use config::PortalConfig;
 pub use error::{PortalError, PortalResult};
-pub use portal::Portal;
+pub use portal::*;
 pub use types::{Observation, Role, SyncConfig, VideoFrameData};
+
+uniffi::setup_scaffolding!();

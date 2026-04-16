@@ -3,7 +3,8 @@ use thiserror::Error;
 
 pub type PortalResult<T> = Result<T, PortalError>;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum PortalError {
     #[error("room error: {0}")]
     Room(String),

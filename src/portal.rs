@@ -7,7 +7,7 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::PortalConfig;
+use crate::config::{PortalConfig, PortalConfigData};
 use crate::data_publisher::DataPublisher;
 use crate::data_receiver::DataReceiver;
 use crate::error::{PortalError, PortalResult};
@@ -16,6 +16,8 @@ use crate::types::*;
 use crate::video_publisher::VideoPublisher;
 use crate::video_receiver::VideoReceiver;
 
+// --- Internal callback types ---
+
 type ActionCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 type ObservationCb = Box<dyn Fn(Observation) + Send + Sync>;
 type StateCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
@@ -23,7 +25,7 @@ type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 
 struct PortalInner {
-    config: PortalConfig,
+    config: PortalConfigData,
     room: Option<Room>,
 
     // Robot side
@@ -47,21 +49,27 @@ struct PortalInner {
     event_task: Option<JoinHandle<()>>,
 }
 
+#[derive(uniffi::Object)]
 pub struct Portal {
     inner: Arc<Mutex<PortalInner>>,
 }
 
+// --- UniFFI-exported methods ---
+
+#[uniffi::export]
 impl Portal {
-    pub fn new(config: PortalConfig) -> Self {
-        let video_cbs: HashMap<_, _> = config
+    #[uniffi::constructor]
+    pub fn new(config: Arc<PortalConfig>) -> Arc<Self> {
+        let data = config.snapshot();
+        let video_cbs: HashMap<_, _> = data
             .video_tracks
             .iter()
             .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
             .collect();
 
-        Self {
+        Arc::new(Self {
             inner: Arc::new(Mutex::new(PortalInner {
-                config,
+                config: data,
                 room: None,
                 video_publishers: HashMap::new(),
                 state_publisher: None,
@@ -77,10 +85,10 @@ impl Portal {
                 drop_cb: Arc::new(Mutex::new(None)),
                 event_task: None,
             })),
-        }
+        })
     }
 
-    pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
+    pub async fn connect(&self, url: String, token: String) -> Result<(), PortalError> {
         let config = {
             let inner = self.inner.lock();
             if inner.room.is_some() {
@@ -92,20 +100,19 @@ impl Portal {
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
 
-        let (room, mut events) =
-            Room::connect(url, token, options)
-                .await
-                .map_err(|e| PortalError::Room(e.to_string()))?;
+        let (room, events) = Room::connect(&url, &token, options)
+            .await
+            .map_err(|e| PortalError::Room(e.to_string()))?;
 
         match config.role {
             Role::Robot => self.setup_robot(&room, &config).await?,
             Role::Operator => self.setup_operator(&room, &config).await?,
         }
 
-        // Spawn event handler for dynamic track subscription
         let inner_ref = self.inner.clone();
         let config_clone = config.clone();
         let event_handle = tokio::spawn(async move {
+            let mut events = events;
             while let Some(event) = events.recv().await {
                 handle_room_event(&inner_ref, &config_clone, event).await;
             }
@@ -120,123 +127,88 @@ impl Portal {
         Ok(())
     }
 
-    async fn setup_robot(&self, room: &Room, config: &PortalConfig) -> PortalResult<()> {
-        let lp = room.local_participant();
-
-        // Publish video tracks
-        for track_name in &config.video_tracks {
-            let publisher = VideoPublisher::new(track_name);
-            publisher.publish(&lp).await?;
-            self.inner
-                .lock()
-                .video_publishers
-                .insert(track_name.clone(), publisher);
-        }
-
-        // Publish state data track
-        if !config.state_fields.is_empty() {
-            let track: DataTrack<Local> = lp
-                .publish_data_track("portal_state")
-                .await
-                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
-            self.inner.lock().state_publisher =
-                Some(DataPublisher::new(config.state_fields.clone(), track));
-        }
-
-        // Action subscription handled via room events (TrackSubscribed)
-        Ok(())
-    }
-
-    async fn setup_operator(&self, room: &Room, config: &PortalConfig) -> PortalResult<()> {
-        let lp = room.local_participant();
-
-        // Create sync buffer
-        let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
-            &config.video_tracks,
-            config.state_fields.clone(),
-            config.sync_config.clone(),
-        )));
-
-        // Wire callbacks into sync buffer
-        {
-            let obs_cb = self.inner.lock().observation_cb.clone();
-            let drop_cb = self.inner.lock().drop_cb.clone();
-            let mut sb = sync_buffer.lock();
-            sb.set_observation_callback(Box::new(move |obs| {
-                if let Some(cb) = obs_cb.lock().as_ref() {
-                    cb(obs);
-                }
-            }));
-            sb.set_drop_callback(Box::new(move |dropped| {
-                if let Some(cb) = drop_cb.lock().as_ref() {
-                    cb(dropped);
-                }
-            }));
-        }
-
-        self.inner.lock().sync_buffer = Some(sync_buffer);
-
-        // Publish action data track
-        if !config.action_fields.is_empty() {
-            let track: DataTrack<Local> = lp
-                .publish_data_track("portal_action")
-                .await
-                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
-            self.inner.lock().action_publisher =
-                Some(DataPublisher::new(config.action_fields.clone(), track));
-        }
-
-        // Video and state subscription handled via room events (TrackSubscribed)
-        Ok(())
-    }
-
-    // --- Public API: Send ---
-
     pub fn send_video_frame(
         &self,
-        track_name: &str,
-        i420_data: &[u8],
+        track_name: String,
+        i420_data: Vec<u8>,
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
-    ) -> PortalResult<()> {
+    ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
-        let publisher = inner.video_publishers.get(track_name).ok_or_else(|| {
-            PortalError::UnknownVideoTrack {
-                name: track_name.to_string(),
-            }
-        })?;
-        publisher.send_frame(i420_data, width, height, timestamp_us)
+        let publisher =
+            inner
+                .video_publishers
+                .get(&track_name)
+                .ok_or_else(|| PortalError::UnknownVideoTrack {
+                    name: track_name.clone(),
+                })?;
+        publisher.send_frame(&i420_data, width, height, timestamp_us)
     }
 
     pub fn send_state(
         &self,
-        values: &HashMap<String, f64>,
+        values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
-    ) -> PortalResult<()> {
+    ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
         let publisher = inner
             .state_publisher
             .as_ref()
             .ok_or(PortalError::WrongRole(Role::Operator))?;
-        publisher.send_map(values, timestamp_us)
+        publisher.send_map(&values, timestamp_us)
     }
 
     pub fn send_action(
         &self,
-        values: &HashMap<String, f64>,
+        values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
-    ) -> PortalResult<()> {
+    ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
         let publisher = inner
             .action_publisher
             .as_ref()
             .ok_or(PortalError::WrongRole(Role::Robot))?;
-        publisher.send_map(values, timestamp_us)
+        publisher.send_map(&values, timestamp_us)
     }
 
-    // --- Public API: Callbacks ---
+    pub async fn disconnect(&self) -> Result<(), PortalError> {
+        let room = self.inner.lock().room.take();
+        if let Some(room) = room {
+            room.close()
+                .await
+                .map_err(|e| PortalError::Room(e.to_string()))?;
+        }
 
+        let mut inner = self.inner.lock();
+        if let Some(task) = inner.event_task.take() {
+            task.abort();
+        }
+        for receiver in inner.video_receivers.values() {
+            receiver.abort();
+        }
+        if let Some(receiver) = &inner.action_receiver {
+            receiver.abort();
+        }
+        if let Some(receiver) = &inner.state_receiver {
+            receiver.abort();
+        }
+        if let Some(sb) = &inner.sync_buffer {
+            sb.lock().clear();
+        }
+        inner.video_publishers.clear();
+        inner.video_receivers.clear();
+        inner.state_publisher = None;
+        inner.state_receiver = None;
+        inner.action_publisher = None;
+        inner.action_receiver = None;
+        Ok(())
+    }
+}
+
+// --- Rust-only callback registration (closures) ---
+
+impl Portal {
     pub fn on_action(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
         *self.inner.lock().action_cb.lock() = Some(Box::new(callback));
     }
@@ -265,42 +237,78 @@ impl Portal {
     ) {
         *self.inner.lock().drop_cb.lock() = Some(Box::new(callback));
     }
+}
 
-    pub async fn disconnect(&self) -> PortalResult<()> {
-        let mut inner = self.inner.lock();
-        if let Some(room) = inner.room.take() {
-            room.close()
+// --- Internal helpers ---
+
+impl Portal {
+    async fn setup_robot(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
+        let lp = room.local_participant();
+
+        for track_name in &config.video_tracks {
+            let publisher = VideoPublisher::new(track_name);
+            publisher.publish(&lp).await?;
+            self.inner
+                .lock()
+                .video_publishers
+                .insert(track_name.clone(), publisher);
+        }
+
+        if !config.state_fields.is_empty() {
+            let track: DataTrack<Local> = lp
+                .publish_data_track("portal_state")
                 .await
-                .map_err(|e| PortalError::Room(e.to_string()))?;
+                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
+            self.inner.lock().state_publisher =
+                Some(DataPublisher::new(config.state_fields.clone(), track));
         }
-        if let Some(task) = inner.event_task.take() {
-            task.abort();
+
+        Ok(())
+    }
+
+    async fn setup_operator(&self, room: &Room, config: &PortalConfigData) -> PortalResult<()> {
+        let lp = room.local_participant();
+
+        let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
+            &config.video_tracks,
+            config.state_fields.clone(),
+            config.sync_config.clone(),
+        )));
+
+        {
+            let obs_cb = self.inner.lock().observation_cb.clone();
+            let drop_cb = self.inner.lock().drop_cb.clone();
+            let mut sb = sync_buffer.lock();
+            sb.set_observation_callback(Box::new(move |obs| {
+                if let Some(cb) = obs_cb.lock().as_ref() {
+                    cb(obs);
+                }
+            }));
+            sb.set_drop_callback(Box::new(move |dropped| {
+                if let Some(cb) = drop_cb.lock().as_ref() {
+                    cb(dropped);
+                }
+            }));
         }
-        for receiver in inner.video_receivers.values() {
-            receiver.abort();
+
+        self.inner.lock().sync_buffer = Some(sync_buffer);
+
+        if !config.action_fields.is_empty() {
+            let track: DataTrack<Local> = lp
+                .publish_data_track("portal_action")
+                .await
+                .map_err(|e| PortalError::DataTrack(e.to_string()))?;
+            self.inner.lock().action_publisher =
+                Some(DataPublisher::new(config.action_fields.clone(), track));
         }
-        if let Some(receiver) = &inner.action_receiver {
-            receiver.abort();
-        }
-        if let Some(receiver) = &inner.state_receiver {
-            receiver.abort();
-        }
-        if let Some(sb) = &inner.sync_buffer {
-            sb.lock().clear();
-        }
-        inner.video_publishers.clear();
-        inner.video_receivers.clear();
-        inner.state_publisher = None;
-        inner.state_receiver = None;
-        inner.action_publisher = None;
-        inner.action_receiver = None;
+
         Ok(())
     }
 }
 
 async fn handle_room_event(
     inner_ref: &Arc<Mutex<PortalInner>>,
-    config: &PortalConfig,
+    config: &PortalConfigData,
     event: RoomEvent,
 ) {
     match event {
@@ -310,10 +318,8 @@ async fn handle_room_event(
             let track_name = publication.name();
             match config.role {
                 Role::Robot => {
-                    // Robot subscribes to action data track
                     if track_name == "portal_action" {
                         if let RemoteTrack::Audio(_) = track {
-                            // ignore audio
                         } else {
                             subscribe_action_track(inner_ref, config).await;
                         }
@@ -322,7 +328,6 @@ async fn handle_room_event(
                 Role::Operator => {
                     match track {
                         RemoteTrack::Video(video_track) => {
-                            // Match against registered video track names
                             if config.video_tracks.contains(&track_name.to_string()) {
                                 let inner = inner_ref.lock();
                                 if let Some(sync_buffer) = &inner.sync_buffer {
@@ -350,7 +355,6 @@ async fn handle_room_event(
                         }
                         RemoteTrack::Audio(_) => {}
                     }
-                    // Operator subscribes to state data track
                     if track_name == "portal_state" {
                         subscribe_state_track(inner_ref, config).await;
                     }
@@ -367,37 +371,16 @@ async fn handle_room_event(
     }
 }
 
-async fn subscribe_action_track(inner_ref: &Arc<Mutex<PortalInner>>, config: &PortalConfig) {
-    let inner = inner_ref.lock();
-    let room = match &inner.room {
-        Some(r) => r,
-        None => return,
-    };
-
-    // Find the remote data track named "portal_action" and subscribe
-    for (_, participant) in room.remote_participants() {
-        for (_, publication) in participant.track_publications() {
-            if publication.name() == "portal_action" {
-                if let Some(track) = publication.track() {
-                    if let RemoteTrack::Audio(_) = track {
-                        continue;
-                    }
-                    // Subscribe to the data track to get a stream
-                    // The data track subscription is handled through the data track API
-                    // For now, we need to get the DataTrack<Remote> and subscribe
-                    // This will be wired when we can access the data track from the publication
-                }
-            }
-        }
-    }
-
+async fn subscribe_action_track(
+    _inner_ref: &Arc<Mutex<PortalInner>>,
+    _config: &PortalConfigData,
+) {
     // TODO: Wire data track subscription once the API is clarified
-    // For now, action data track subscription needs the DataTrack<Remote>::subscribe() API
-    let _ = (inner_ref, config);
 }
 
-async fn subscribe_state_track(inner_ref: &Arc<Mutex<PortalInner>>, config: &PortalConfig) {
+async fn subscribe_state_track(
+    _inner_ref: &Arc<Mutex<PortalInner>>,
+    _config: &PortalConfigData,
+) {
     // TODO: Wire data track subscription once the API is clarified
-    // Similar to subscribe_action_track but feeds into SyncBuffer
-    let _ = (inner_ref, config);
 }
