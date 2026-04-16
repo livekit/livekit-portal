@@ -114,16 +114,18 @@ inference_portal.on_video("camera1", callback)  # called when a new frame is rec
 
 An observation is a complete synced bundle: one state matched with one frame from every registered video track. There are no partial observations. If any registered video track is missing a matching frame within the sync window, the observation is not formed and the state is dropped.
 
-### Sync Configuration
+### Configuration
+
+All configuration is set on the config object before connecting.
 
 ```python
-inference_portal.set_video_buffer(30)       # (unit: samples) how many frames to buffer per video track for sync
-inference_portal.set_state_buffer(30)       # (unit: samples) how many states to buffer for sync
-inference_portal.set_search_range(30)       # (unit: ms) match if |timestamp_state - timestamp_frame| < range, pick minimum delta
-inference_portal.set_observation_buffer(10) # how many synced observations to buffer
+config.set_video_buffer(30)       # (unit: samples) how many frames to buffer per video track for sync
+config.set_state_buffer(30)       # (unit: samples) how many states to buffer for sync
+config.set_search_range(30)       # (unit: ms) match if |timestamp_state - timestamp_frame| < range, pick minimum delta
+config.set_observation_buffer(10) # how many synced observations to buffer
 
-inference_portal.set_state_reliable(True)   # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
-inference_portal.set_action_reliable(True)  # default: True. use False for high-frequency inference where latest value matters most
+config.set_state_reliable(True)   # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
+config.set_action_reliable(True)  # default: True. use False for high-frequency inference where latest value matters most
 ```
 
 ### Drop Policy
