@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use crate::metrics::MetricsRegistry;
 use crate::types::*;
 
 /// Result of a `push_frame` / `push_state` call. Callers dispatch these
@@ -42,6 +43,8 @@ pub(crate) struct SyncBuffer {
 
     // Reused across try_sync calls to avoid allocating a match map per iteration.
     matched_scratch: Vec<Option<(usize, Arc<VideoFrameData>)>>,
+
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl SyncBuffer {
@@ -49,6 +52,7 @@ impl SyncBuffer {
         video_track_names: &[String],
         state_fields: Vec<String>,
         config: SyncConfig,
+        metrics: Arc<MetricsRegistry>,
     ) -> Self {
         let track_names: Vec<String> = video_track_names.to_vec();
         let track_index: HashMap<String, usize> =
@@ -66,6 +70,7 @@ impl SyncBuffer {
             cursors,
             blocker: None,
             matched_scratch,
+            metrics,
         }
     }
 
@@ -87,6 +92,9 @@ impl SyncBuffer {
         if evicted > 0 {
             let cursor = &mut self.cursors[idx];
             *cursor = cursor.saturating_sub(evicted);
+            if let Some(tm) = self.metrics.track(track_name) {
+                tm.record_evictions(evicted as u64);
+            }
         }
 
         // Skip try_sync when this push cannot have changed head-state matchability:
@@ -109,8 +117,13 @@ impl SyncBuffer {
     pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) -> SyncOutput {
         let old_head_ts = self.state_buffer.front().map(|(ts, _)| *ts);
         self.state_buffer.push_back((timestamp_us, values));
+        let mut overflow_drops = 0u64;
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
             self.state_buffer.pop_front();
+            overflow_drops += 1;
+        }
+        if overflow_drops > 0 {
+            self.metrics.record_state_dropped(overflow_drops);
         }
         // If eviction (or first-ever push) changed the head state, the old blocker
         // hint no longer applies.
@@ -222,14 +235,25 @@ impl SyncBuffer {
                 log::warn!("dropping unsyncable state (no matching video frames within range)");
                 let (_, values) = self.state_buffer.pop_front().unwrap();
                 output.drops.push(to_field_map(&self.state_fields, &values));
+                self.metrics.record_state_dropped(1);
                 // Retry next state with fresh iteration.
                 continue;
             }
 
-            if iter_blocker.is_some() {
-                self.blocker = iter_blocker;
+            if let Some(b) = iter_blocker {
+                self.blocker = Some(b);
+                self.metrics.record_blocker(&self.track_names[b]);
                 return output;
             }
+
+            // Record worst-case per-track alignment before we drain the matches.
+            let mut worst_delta = 0u64;
+            for slot in &self.matched_scratch {
+                if let Some((_, frame)) = slot.as_ref() {
+                    worst_delta = worst_delta.max(state_ts.abs_diff(frame.timestamp_us));
+                }
+            }
+            self.metrics.record_observation(worst_delta);
 
             let (ts, values) = self.state_buffer.pop_front().unwrap();
 
@@ -251,6 +275,18 @@ impl SyncBuffer {
                 timestamp_us: ts,
             });
         }
+    }
+
+    pub fn video_fill_snapshot(&self) -> HashMap<String, usize> {
+        self.track_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), self.video_buffers[i].len()))
+            .collect()
+    }
+
+    pub fn state_fill(&self) -> usize {
+        self.state_buffer.len()
     }
 }
 
@@ -275,11 +311,16 @@ mod tests {
         buf.push_frame(&name, frame)
     }
 
+    fn mk(names: &[String], fields: Vec<String>, config: SyncConfig) -> SyncBuffer {
+        let metrics = Arc::new(MetricsRegistry::new(names));
+        SyncBuffer::new(names, fields, config, metrics)
+    }
+
     #[test]
     fn sync_single_track() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string(), "j2".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         assert!(push_f(&mut buf, "cam1", 1000).observations.is_empty());
 
@@ -295,7 +336,7 @@ mod tests {
     fn sync_multi_track() {
         let tracks = vec!["cam1".to_string(), "cam2".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         assert!(push_f(&mut buf, "cam1", 1000).observations.is_empty());
         assert!(buf.push_state(1005, vec![5.0]).observations.is_empty());
@@ -310,7 +351,7 @@ mod tests {
     fn drop_unsyncable_state() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         assert!(buf.push_state(100, vec![1.0]).is_empty());
         let out = push_f(&mut buf, "cam1", 200_000);
@@ -323,7 +364,7 @@ mod tests {
     fn out_of_range_waits() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         assert!(buf.push_state(50_000, vec![1.0]).is_empty());
         let out = push_f(&mut buf, "cam1", 50_010);
@@ -336,7 +377,7 @@ mod tests {
         let fields = vec!["j1".to_string()];
         let config =
             SyncConfig { video_buffer_size: 2, state_buffer_size: 2, ..Default::default() };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         for ts in [100, 200, 300] {
             let _ = push_f(&mut buf, "cam1", ts);
@@ -352,7 +393,7 @@ mod tests {
     fn clear_flushes_all() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         let _ = push_f(&mut buf, "cam1", 1000);
         let _ = buf.push_state(1000, vec![1.0]);
@@ -371,7 +412,7 @@ mod tests {
     fn cursor_picks_closest_among_many() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         for ts in [1_000u64, 2_000, 3_000, 4_000, 5_000] {
             let _ = push_f(&mut buf, "cam1", ts);
@@ -389,7 +430,7 @@ mod tests {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let config = SyncConfig { video_buffer_size: 100, ..Default::default() };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         // Push 10 frames at 1000us intervals.
         for i in 0..10 {
@@ -411,7 +452,7 @@ mod tests {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let config = SyncConfig { video_buffer_size: 3, ..Default::default() };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         // Fill buffer and push state to advance cursor to index 2.
         for ts in [1_000u64, 2_000, 3_000] {
@@ -441,7 +482,7 @@ mod tests {
     fn non_blocker_push_defers_but_converges() {
         let tracks = vec!["cam1".to_string(), "cam2".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         // State + cam2 present; cam1 empty → cam1 is the blocker.
         assert!(buf.push_state(1_000, vec![1.0]).is_empty());
@@ -472,7 +513,7 @@ mod tests {
             search_range_us: 30_000,
             observation_buffer_size: 10,
         };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         // State at 1_000; cam1 empty (blocker); cam2 has a frame in range.
         assert!(buf.push_state(1_000, vec![1.0]).is_empty());
@@ -493,7 +534,7 @@ mod tests {
     fn out_of_order_state_rewinds_cursor() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         // Pre-populate frames spanning a wide range.
         for ts in [1_000u64, 5_000, 10_000, 50_000, 100_000] {
@@ -520,7 +561,7 @@ mod tests {
     fn multi_state_batch_emits_together() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         // Pile up 3 states and 2 matching frames; last state waits on its own
         // frame.
@@ -541,7 +582,7 @@ mod tests {
     fn blocker_clears_after_match() {
         let tracks = vec!["cam1".to_string(), "cam2".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         assert!(buf.push_state(1_000, vec![1.0]).is_empty());
         assert!(push_f(&mut buf, "cam1", 1_002).is_empty());
@@ -560,7 +601,7 @@ mod tests {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let config = SyncConfig { state_buffer_size: 1, ..Default::default() };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         // No frames yet: both push_state calls see an empty cam1 → wait.
         // cap_state=1 means the second state evicts the first.
@@ -589,7 +630,7 @@ mod tests {
             search_range_us: 500,
             observation_buffer_size: 10,
         };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         let _ = push_f(&mut buf, "cam1", 1_000); // far below state - range (2_500)
         assert!(buf.push_state(3_000, vec![1.0]).is_empty());
@@ -614,7 +655,7 @@ mod tests {
             search_range_us: 500,
             observation_buffer_size: 10,
         };
-        let mut buf = SyncBuffer::new(&tracks, fields, config);
+        let mut buf = mk(&tracks, fields, config);
 
         assert!(buf.push_state(1_000, vec![1.0]).is_empty());
         let out = push_f(&mut buf, "cam1", 1_500); // delta == range, not a match
@@ -628,7 +669,7 @@ mod tests {
     fn stress_no_spurious_observations() {
         let tracks = vec!["cam1".to_string(), "cam2".to_string()];
         let fields = vec!["j1".to_string()];
-        let mut buf = SyncBuffer::new(&tracks, fields, SyncConfig::default());
+        let mut buf = mk(&tracks, fields, SyncConfig::default());
 
         let mut total_obs = 0;
         // Push 100 interleaved events; each state needs frames on BOTH tracks

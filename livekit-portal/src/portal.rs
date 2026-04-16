@@ -9,6 +9,8 @@ use tokio::task::JoinHandle;
 use crate::config::PortalConfig;
 use crate::data::{handle_data_received, DataCb, DataPublisher};
 use crate::error::{PortalError, PortalResult};
+use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
+use crate::rtt::RttService;
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver};
@@ -77,6 +79,10 @@ impl ObservationSink {
         self.buffer.lock().clear();
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.buffer.lock().len()
+    }
+
     pub(crate) fn set_observation_cb(&self, cb: ObservationCb) {
         *self.observation_cb.lock() = Some(cb);
     }
@@ -89,6 +95,7 @@ impl ObservationSink {
 struct ConnectionState {
     room: Option<Room>,
     event_task: Option<JoinHandle<()>>,
+    rtt: Option<Arc<RttService>>,
 }
 
 pub struct Portal {
@@ -116,6 +123,8 @@ pub struct Portal {
     state_cb: Arc<Mutex<Option<DataCb>>>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
+
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl Portal {
@@ -128,10 +137,11 @@ impl Portal {
 
         let obs_sink =
             Arc::new(ObservationSink::new(config.sync_config.observation_buffer_size as usize));
+        let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
 
         Self {
             config,
-            state: Mutex::new(ConnectionState { room: None, event_task: None }),
+            state: Mutex::new(ConnectionState { room: None, event_task: None, rtt: None }),
             video_receivers: Arc::new(Mutex::new(HashMap::new())),
             video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
@@ -141,6 +151,7 @@ impl Portal {
             action_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             video_cbs,
+            metrics,
         }
     }
 
@@ -163,6 +174,12 @@ impl Portal {
             Role::Operator => self.setup_operator(&room),
         }
 
+        let rtt = Arc::new(RttService::spawn(
+            room.local_participant(),
+            self.config.ping_interval_ms,
+            self.metrics.clone(),
+        ));
+
         log::info!("[{}] connected as {:?}", self.config.session, self.config.role);
 
         // Event dispatch runs off a snapshot of the fields it touches, not the
@@ -175,6 +192,8 @@ impl Portal {
             state_cb: self.state_cb.clone(),
             video_cbs: self.video_cbs.clone(),
             video_receivers: self.video_receivers.clone(),
+            metrics: self.metrics.clone(),
+            rtt: rtt.clone(),
         };
         let event_handle = tokio::spawn(async move {
             let mut events = events;
@@ -186,6 +205,7 @@ impl Portal {
         let mut state = self.state.lock();
         state.room = Some(room);
         state.event_task = Some(event_handle);
+        state.rtt = Some(rtt);
         Ok(())
     }
 
@@ -241,6 +261,7 @@ impl Portal {
             if let Some(task) = state.event_task.take() {
                 task.abort();
             }
+            state.rtt = None;
         }
         {
             let mut receivers = self.video_receivers.lock();
@@ -303,7 +324,11 @@ impl Portal {
         let lp = room.local_participant();
 
         for track_name in &self.config.video_tracks {
-            let publisher = VideoPublisher::new(track_name);
+            let track_metrics = self
+                .metrics
+                .track(track_name)
+                .expect("track metrics registered at construction");
+            let publisher = VideoPublisher::new(track_name, track_metrics);
             publisher.publish(&lp).await?;
             log::info!("[{}] published video track '{track_name}'", self.config.session);
             self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
@@ -315,6 +340,8 @@ impl Portal {
                 "portal_state",
                 self.config.state_reliable,
                 lp.clone(),
+                self.metrics.clone(),
+                DataStream::State,
             );
             let mode = if self.config.state_reliable { "reliable" } else { "unreliable" };
             log::info!(
@@ -335,6 +362,7 @@ impl Portal {
             &self.config.video_tracks,
             self.config.state_fields.clone(),
             self.config.sync_config,
+            self.metrics.clone(),
         )));
         *self.sync_buffer.lock() = Some(sync_buffer);
 
@@ -350,9 +378,28 @@ impl Portal {
                 "portal_action",
                 self.config.action_reliable,
                 lp,
+                self.metrics.clone(),
+                DataStream::Action,
             );
             *self.action_publisher.lock() = Some(Arc::new(publisher));
         }
+    }
+
+    /// Snapshot of metrics since construction or the last `reset_metrics()`.
+    pub fn metrics(&self) -> PortalMetrics {
+        let (video_fill, state_fill) = match self.sync_buffer.lock().as_ref() {
+            Some(sb) => {
+                let sb = sb.lock();
+                (sb.video_fill_snapshot(), sb.state_fill())
+            }
+            None => (HashMap::new(), 0),
+        };
+        let observation_fill = self.obs_sink.len();
+        self.metrics.snapshot(video_fill, state_fill, observation_fill)
+    }
+
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
     }
 }
 
@@ -366,6 +413,8 @@ struct EventContext {
     state_cb: Arc<Mutex<Option<DataCb>>>,
     video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+    metrics: Arc<MetricsRegistry>,
+    rtt: Arc<RttService>,
 }
 
 fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
@@ -387,6 +436,10 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                             .get(track_name.as_str())
                             .cloned()
                             .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        let track_metrics = ctx
+                            .metrics
+                            .track(track_name.as_str())
+                            .expect("track metrics registered at construction");
 
                         let stream = NativeVideoStream::new(video_track.rtc_track());
                         let receiver = VideoReceiver::spawn(
@@ -395,6 +448,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                             sync_buffer.clone(),
                             raw_cb,
                             ctx.obs_sink.clone(),
+                            track_metrics,
                         );
                         ctx.video_receivers.lock().insert(track_name.to_string(), receiver);
                     }
@@ -412,6 +466,8 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                     &ctx.action_cb,
                     &ctx.state_cb,
                     ctx.sync_buffer.as_ref(),
+                    &ctx.metrics,
+                    &ctx.rtt,
                 );
                 if !output.is_empty() {
                     ctx.obs_sink.dispatch(output);

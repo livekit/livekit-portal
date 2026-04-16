@@ -11,6 +11,7 @@ pub struct PortalConfig {
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
     pub(crate) sync_config: SyncConfig,
+    pub(crate) ping_interval_ms: u64,
 }
 
 impl PortalConfig {
@@ -24,6 +25,7 @@ impl PortalConfig {
             state_reliable: true,
             action_reliable: true,
             sync_config: SyncConfig::default(),
+            ping_interval_ms: 1000,
         }
     }
 
@@ -61,5 +63,12 @@ impl PortalConfig {
 
     pub fn set_action_reliable(&mut self, reliable: bool) {
         self.action_reliable = reliable;
+    }
+
+    /// RTT ping cadence in milliseconds. Set to `0` to disable active pinging
+    /// on this side; the pong echo path remains active regardless, so the peer
+    /// can still measure its own RTT. Default: 1000ms.
+    pub fn set_ping_interval_ms(&mut self, ms: u64) {
+        self.ping_interval_ms = ms;
     }
 }

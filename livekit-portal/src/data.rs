@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::{PortalError, PortalResult};
+use crate::metrics::{DataStream, MetricsRegistry};
+use crate::rtt::{RttService, RTT_TOPIC};
 use crate::serialization::{deserialize_values, serialize_values};
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::{to_field_map, Role};
@@ -23,6 +25,8 @@ pub(crate) struct DataPublisher {
     reliable: bool,
     tx: mpsc::UnboundedSender<DataPacket>,
     task: Option<JoinHandle<()>>,
+    metrics: Arc<MetricsRegistry>,
+    stream: DataStream,
 }
 
 impl DataPublisher {
@@ -31,6 +35,8 @@ impl DataPublisher {
         topic: &str,
         reliable: bool,
         local_participant: LocalParticipant,
+        metrics: Arc<MetricsRegistry>,
+        stream: DataStream,
     ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<DataPacket>();
         let task = tokio::spawn(async move {
@@ -40,7 +46,15 @@ impl DataPublisher {
                 }
             }
         });
-        Self { fields, topic: topic.to_string(), reliable, tx, task: Some(task) }
+        Self {
+            fields,
+            topic: topic.to_string(),
+            reliable,
+            tx,
+            task: Some(task),
+            metrics,
+            stream,
+        }
     }
 
     pub fn send(&self, values: &[f64], timestamp_us: Option<u64>) -> PortalResult<()> {
@@ -59,6 +73,7 @@ impl DataPublisher {
             destination_identities: Vec::new(),
         };
         let _ = self.tx.send(packet);
+        self.metrics.bump_sent(self.stream);
         Ok(())
     }
 
@@ -90,6 +105,7 @@ pub(crate) type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 /// Handle a `DataReceived` event. Pushes into the sync buffer if applicable and
 /// returns any observations/drops that resulted, for the caller to dispatch
 /// outside any locks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_data_received(
     payload: &[u8],
     topic: &str,
@@ -99,10 +115,17 @@ pub(crate) fn handle_data_received(
     action_cb: &Mutex<Option<DataCb>>,
     state_cb: &Mutex<Option<DataCb>>,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
+    metrics: &MetricsRegistry,
+    rtt: &RttService,
 ) -> SyncOutput {
+    if topic == RTT_TOPIC {
+        rtt.handle_packet(payload);
+        return SyncOutput::empty();
+    }
     match (config_role, topic) {
         (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
-            Ok((_, values)) => {
+            Ok((send_ts, values)) => {
+                metrics.record_action_received(send_ts, now_us());
                 if let Some(cb) = action_cb.lock().as_ref() {
                     cb(to_field_map(action_fields, &values));
                 }
@@ -111,6 +134,7 @@ pub(crate) fn handle_data_received(
         },
         (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
             Ok((timestamp_us, values)) => {
+                metrics.record_state_received(timestamp_us, now_us());
                 if let Some(cb) = state_cb.lock().as_ref() {
                     cb(to_field_map(state_fields, &values));
                 }

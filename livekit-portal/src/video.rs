@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::error::{PortalError, PortalResult};
+use crate::metrics::TrackMetrics;
 use crate::portal::ObservationSink;
 use crate::sync_buffer::SyncBuffer;
 use crate::types::VideoFrameData;
@@ -26,15 +27,16 @@ const DEFAULT_HEIGHT: u32 = 480;
 pub(crate) struct VideoPublisher {
     source: NativeVideoSource,
     track: LocalVideoTrack,
+    metrics: Arc<TrackMetrics>,
 }
 
 impl VideoPublisher {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, metrics: Arc<TrackMetrics>) -> Self {
         let resolution = VideoResolution { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT };
         let source = NativeVideoSource::new(resolution, false);
         let rtc_source = RtcVideoSource::Native(source.clone());
         let track = LocalVideoTrack::create_video_track(name, rtc_source);
-        Self { source, track }
+        Self { source, track, metrics }
     }
 
     pub async fn publish(&self, local_participant: &LocalParticipant) -> PortalResult<()> {
@@ -73,6 +75,7 @@ impl VideoPublisher {
         let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
         frame.frame_metadata = Some(FrameMetadata { user_timestamp: Some(ts), frame_id: None });
         self.source.capture_frame(&frame);
+        self.metrics.record_sent();
         Ok(())
     }
 }
@@ -92,6 +95,7 @@ impl VideoReceiver {
         sync_buffer: Arc<Mutex<SyncBuffer>>,
         raw_callback: Arc<Mutex<Option<VideoCb>>>,
         obs_sink: Arc<ObservationSink>,
+        metrics: Arc<TrackMetrics>,
     ) -> Self {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
@@ -99,6 +103,8 @@ impl VideoReceiver {
                 let timestamp_us = frame.frame_metadata.and_then(|m| m.user_timestamp).unwrap_or(0);
                 let frame_data = convert_frame(&frame, timestamp_us);
                 let frame_arc = Arc::new(frame_data);
+
+                metrics.record_received(timestamp_us, now_us());
 
                 if let Some(cb) = raw_callback.lock().as_ref() {
                     cb(&name, &frame_arc);

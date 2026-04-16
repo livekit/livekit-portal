@@ -126,7 +126,51 @@ config.set_observation_buffer(10) # how many synced observations to buffer
 
 config.set_state_reliable(True)   # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
 config.set_action_reliable(True)  # default: True. use False for high-frequency inference where latest value matters most
+
+config.set_ping_interval_ms(1000) # default: 1000. set 0 to disable RTT pinging on this side
 ```
+
+### Metrics
+
+Portal collects counters and gauges on hot paths with atomic updates, so observation is effectively free. Pull the current snapshot at any cadence:
+
+```python
+m = inference_portal.metrics()
+# inference_portal.reset_metrics()   # zero counters and sample windows
+```
+
+The snapshot is grouped into four sections:
+
+```
+metrics.sync
+  observations_emitted        # cumulative synced observations delivered
+  states_dropped              # cumulative: sync-fail drops + state-buffer overflow drops
+  match_delta_us_p50/p95      # worst per-track alignment within each observation, rolling window
+  last_blocker_track          # sticky: most recent track that stalled sync
+
+metrics.transport
+  frames_sent / frames_received   # per video track
+  states_sent / states_received
+  actions_sent / actions_received
+  frame_jitter_us                 # per video track, RFC 3550 inter-arrival jitter (EWMA, α=1/16)
+  state_jitter_us / action_jitter_us
+
+metrics.buffers                   # instantaneous fill gauges
+  video_fill                      # per video track
+  state_fill
+  observation_fill
+  evictions                       # per video track, cumulative
+
+metrics.rtt
+  rtt_us_last / rtt_us_mean / rtt_us_p95
+  pings_sent / pongs_received
+```
+
+RTT is measured on a reserved `portal_rtt` data topic. Each side sends an unreliable ping at `ping_interval_ms`; the other side echoes it as a pong carrying the original timestamp. The pinging side computes RTT = `now − ping_ts` when the pong arrives. Unreliable delivery is deliberate: reliable retransmits would inflate the measurement. Echo is always active, so one side can disable pinging and still let the other measure.
+
+Jitter is the RFC 3550 EWMA on inter-arrival deltas: `J += (|D| − J) / 16`, where `D = (recv_i − recv_{i-1}) − (send_i − send_{i-1})`. Drift-robust (only looks at deltas) and unitless of absolute clock offset.
+
+Percentiles are computed from a bounded ring of 256 recent samples — fast, bounded memory, accurate enough for health monitoring rather than SLO reporting.
 
 ### Drop Policy
 
