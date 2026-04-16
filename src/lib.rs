@@ -1,14 +1,16 @@
-pub mod error;
-pub mod types;
 pub mod config;
+pub mod error;
+mod portal;
 pub mod serialization;
-mod video_publisher;
+pub mod types;
+
 mod data_publisher;
-mod video_receiver;
 mod data_receiver;
 mod sync_buffer;
-mod portal;
+mod video_publisher;
+mod video_receiver;
 
 pub use config::PortalConfig;
 pub use error::{PortalError, PortalResult};
+pub use portal::Portal;
 pub use types::{Observation, Role, SyncConfig, VideoFrameData};

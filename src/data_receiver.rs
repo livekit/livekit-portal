@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use livekit::data_track::{DataTrack, DataTrackStream, Remote};
+use livekit::data_track::DataTrackStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 

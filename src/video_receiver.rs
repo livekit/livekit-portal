@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use livekit::webrtc::prelude::{VideoBuffer, VideoFrame};
-use livekit::webrtc::video_frame::native::VideoFrameBufferExt;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
