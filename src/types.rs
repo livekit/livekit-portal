@@ -1,19 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum Role {
     Robot,
     Operator,
-}
-
-impl Role {
-    pub fn identity(&self) -> &'static str {
-        match self {
-            Role::Robot => "robot",
-            Role::Operator => "operator",
-        }
-    }
 }
 
 /// A synchronized observation: one state matched with one frame from every registered video track.
@@ -33,22 +23,8 @@ pub struct VideoFrameData {
     pub timestamp_us: u64,
 }
 
-/// A video frame tagged with its sender timestamp, held in the sync buffer.
-#[derive(Debug)]
-pub(crate) struct TimestampedFrame {
-    pub timestamp_us: u64,
-    pub frame: Arc<VideoFrameData>,
-}
-
-/// A state sample tagged with its sender timestamp, held in the sync buffer.
-#[derive(Debug)]
-pub(crate) struct TimestampedState {
-    pub timestamp_us: u64,
-    pub values: Vec<f64>,
-}
-
 /// Sync configuration with sensible defaults for robotics.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct SyncConfig {
     pub video_buffer_size: u32,
     pub state_buffer_size: u32,
@@ -65,4 +41,9 @@ impl Default for SyncConfig {
             observation_buffer_size: 10,
         }
     }
+}
+
+/// Build a field-name → value HashMap from ordered fields and values.
+pub(crate) fn to_field_map(fields: &[String], values: Vec<f64>) -> HashMap<String, f64> {
+    fields.iter().zip(values).map(|(k, v)| (k.clone(), v)).collect()
 }

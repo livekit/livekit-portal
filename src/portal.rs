@@ -8,19 +8,14 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::{PortalConfig, PortalConfigData};
-use crate::data_publisher::DataPublisher;
-use crate::data_receiver::DataReceiver;
+use crate::data::{DataPublisher, DataReceiver};
 use crate::error::{PortalError, PortalResult};
 use crate::sync_buffer::SyncBuffer;
 use crate::types::*;
-use crate::video_publisher::VideoPublisher;
-use crate::video_receiver::VideoReceiver;
+use crate::video::{VideoPublisher, VideoReceiver};
 
-// --- Internal callback types ---
-
-type ActionCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
+type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 type ObservationCb = Box<dyn Fn(Observation) + Send + Sync>;
-type StateCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
 type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 
@@ -40,9 +35,9 @@ struct PortalInner {
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
 
     // Callbacks
-    action_cb: Arc<Mutex<Option<ActionCb>>>,
+    action_cb: Arc<Mutex<Option<DataCb>>>,
     observation_cb: Arc<Mutex<Option<ObservationCb>>>,
-    state_cb: Arc<Mutex<Option<StateCb>>>,
+    state_cb: Arc<Mutex<Option<DataCb>>>,
     video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
     drop_cb: Arc<Mutex<Option<DropCb>>>,
 
