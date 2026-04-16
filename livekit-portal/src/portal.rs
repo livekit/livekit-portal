@@ -69,6 +69,9 @@ impl ObservationSink {
                 }
                 if evicted > 0 {
                     self.metrics.record_observation_evicted(evicted);
+                    log::warn!(
+                        "observation buffer overflow: evicted {evicted} observation(s) — consumer is lagging"
+                    );
                 }
             }
         }

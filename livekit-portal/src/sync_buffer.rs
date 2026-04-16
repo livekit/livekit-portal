@@ -95,6 +95,7 @@ impl SyncBuffer {
             if let Some(tm) = self.metrics.track(track_name) {
                 tm.record_evictions(evicted as u64);
             }
+            log::warn!("video buffer overflow on '{track_name}': evicted {evicted} frame(s)");
         }
 
         // Skip try_sync when this push cannot have changed head-state matchability:
@@ -124,6 +125,7 @@ impl SyncBuffer {
         }
         if overflow_drops > 0 {
             self.metrics.record_state_dropped(overflow_drops);
+            log::warn!("state buffer overflow: dropped {overflow_drops} state(s)");
         }
         // If eviction (or first-ever push) changed the head state, the old blocker
         // hint no longer applies.
