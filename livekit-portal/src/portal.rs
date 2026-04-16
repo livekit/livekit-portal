@@ -28,15 +28,17 @@ pub(crate) struct ObservationSink {
     drop_cb: Mutex<Option<DropCb>>,
     buffer: Mutex<VecDeque<Observation>>,
     buffer_size: usize,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl ObservationSink {
-    pub(crate) fn new(buffer_size: usize) -> Self {
+    pub(crate) fn new(buffer_size: usize, metrics: Arc<MetricsRegistry>) -> Self {
         Self {
             observation_cb: Mutex::new(None),
             drop_cb: Mutex::new(None),
             buffer: Mutex::new(VecDeque::new()),
             buffer_size,
+            metrics,
         }
     }
 
@@ -54,12 +56,19 @@ impl ObservationSink {
                 }
             }
             if self.buffer_size > 0 {
-                let mut buf = self.buffer.lock();
-                for obs in observations {
-                    buf.push_back(obs);
-                    while buf.len() > self.buffer_size {
-                        buf.pop_front();
+                let mut evicted = 0u64;
+                {
+                    let mut buf = self.buffer.lock();
+                    for obs in observations {
+                        buf.push_back(obs);
+                        while buf.len() > self.buffer_size {
+                            buf.pop_front();
+                            evicted += 1;
+                        }
                     }
+                }
+                if evicted > 0 {
+                    self.metrics.record_observation_evicted(evicted);
                 }
             }
         }
@@ -135,9 +144,11 @@ impl Portal {
             .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
             .collect();
 
-        let obs_sink =
-            Arc::new(ObservationSink::new(config.sync_config.observation_buffer_size as usize));
         let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
+        let obs_sink = Arc::new(ObservationSink::new(
+            config.sync_config.observation_buffer_size as usize,
+            metrics.clone(),
+        ));
 
         Self {
             config,

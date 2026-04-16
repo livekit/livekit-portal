@@ -155,11 +155,12 @@ metrics.transport
   frame_jitter_us                 # per video track, RFC 3550 inter-arrival jitter (EWMA, α=1/16)
   state_jitter_us / action_jitter_us
 
-metrics.buffers                   # instantaneous fill gauges
-  video_fill                      # per video track
-  state_fill
-  observation_fill
-  evictions                       # per video track, cumulative
+metrics.buffers                   # fill gauges + overflow counters
+  video_fill                      # gauge, per video track
+  state_fill                      # gauge
+  observation_fill                # gauge
+  evictions                       # per video track, cumulative (overflow)
+  observations_evicted            # cumulative: consumer lagged on pull side
 
 metrics.rtt
   rtt_us_last / rtt_us_mean / rtt_us_p95
