@@ -121,6 +121,9 @@ inference_portal.set_video_buffer(30)       # (unit: samples) how many frames to
 inference_portal.set_state_buffer(30)       # (unit: samples) how many states to buffer for sync
 inference_portal.set_search_range(30)       # (unit: ms) match if |timestamp_state - timestamp_frame| < range, pick minimum delta
 inference_portal.set_observation_buffer(10) # how many synced observations to buffer
+
+inference_portal.set_state_reliable(True)   # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
+inference_portal.set_action_reliable(True)  # default: True. use False for high-frequency inference where latest value matters most
 ```
 
 ### Drop Policy

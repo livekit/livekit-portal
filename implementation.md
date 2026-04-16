@@ -7,7 +7,7 @@
 | Video publish | `NativeVideoSource` + `LocalVideoTrack` + `capture_frame()` | One per camera. User timestamp set via `FrameMetadata` packet trailer. |
 | Video timestamp | `PacketTrailerFeatures` + `FrameMetadata` ([PR #890](https://github.com/livekit/rust-sdks/pull/890)) | Embeds `user_timestamp` (u64 µs) as a binary trailer on encoded frames. Survives full WebRTC pipeline including E2EE. |
 | Video subscribe | `NativeVideoStream` (async `Stream` trait) | One per subscribed track. Yields `BoxVideoFrame` with `frame_metadata.user_timestamp`. |
-| State/action publish | `LocalParticipant::publish_data(DataPacket)` | Reliable SCTP delivery via `reliable: true`. Topic-based routing (`portal_state`, `portal_action`). |
+| State/action publish | `LocalParticipant::publish_data(DataPacket)` | Configurable reliability per topic (`state_reliable`, `action_reliable`, both default `true`). Topic-based routing (`portal_state`, `portal_action`). |
 | State/action receive | `RoomEvent::DataReceived` | Dispatched synchronously by topic in the room event handler. No async task needed. |
 | Session | LiveKit Room | `session` param maps to room name. |
 | Role | Participant identity | `role` sets identity. Unique per room — prevents duplicate robots. |
@@ -39,17 +39,15 @@ Total overhead per state/action: 8 bytes for timestamp.
 Holds the declared schema before connection. Built up by `add_video`, `add_state`, `add_action` calls.
 
 ```rust
-struct PortalConfig {
+struct PortalConfigData {
     session: String,
     role: Role,                    // Robot or Operator
     video_tracks: Vec<String>,     // ordered camera names
     state_fields: Vec<String>,     // ordered field names
     action_fields: Vec<String>,    // ordered field names
-    // sync params (with defaults)
-    video_buffer_size: usize,      // default 30
-    state_buffer_size: usize,      // default 30
-    search_range_us: i64,          // default 30_000 (30ms in µs)
-    observation_buffer_size: usize,// default 10
+    state_reliable: bool,          // default true
+    action_reliable: bool,         // default true
+    sync_config: SyncConfig,       // video_buffer, state_buffer, search_range, observation_buffer
 }
 ```
 
@@ -100,11 +98,12 @@ Wraps `LocalParticipant::publish_data` for reliable state/action delivery.
 struct DataPublisher {
     fields: Vec<String>,           // schema
     topic: String,                 // "portal_state" or "portal_action"
+    reliable: bool,                // from config.state_reliable / config.action_reliable
     local_participant: LocalParticipant,
 }
 ```
 
-- `send(values: &[f64], timestamp_us: Option<u64>)`: serializes to `[timestamp][f64...]`, sends via `publish_data(DataPacket { payload, topic, reliable: true })`
+- `send(values: &[f64], timestamp_us: Option<u64>)`: serializes to `[timestamp][f64...]`, sends via `publish_data(DataPacket { payload, topic, reliable: self.reliable })`
 - If no custom timestamp, uses `SystemTime::now()` converted to µs
 - Fire-and-forget: `publish_data` is async but spawned as a task to keep `send` synchronous
 
