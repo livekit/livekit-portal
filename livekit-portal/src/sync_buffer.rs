@@ -377,7 +377,7 @@ mod tests {
             let _ = push_f(&mut buf, "cam1", ts);
         }
 
-        // Closest to 3_010 within 30_000us is 3_000.
+        // Closest to 3_010 within search_range is 3_000.
         let out = buf.push_state(3_010, vec![7.0]);
         assert_eq!(out.observations.len(), 1);
         assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 3_000);
