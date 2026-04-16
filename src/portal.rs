@@ -136,13 +136,10 @@ impl Portal {
         timestamp_us: Option<u64>,
     ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
-        let publisher =
-            inner
-                .video_publishers
-                .get(&track_name)
-                .ok_or_else(|| PortalError::UnknownVideoTrack {
-                    name: track_name.clone(),
-                })?;
+        let publisher = inner
+            .video_publishers
+            .get(&track_name)
+            .ok_or_else(|| PortalError::UnknownVideoTrack { name: track_name.clone() })?;
         publisher.send_frame(&i420_data, width, height, timestamp_us)
     }
 
@@ -152,10 +149,8 @@ impl Portal {
         timestamp_us: Option<u64>,
     ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
-        let publisher = inner
-            .state_publisher
-            .as_ref()
-            .ok_or(PortalError::WrongRole(Role::Operator))?;
+        let publisher =
+            inner.state_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Operator))?;
         publisher.send_map(&values, timestamp_us)
     }
 
@@ -165,19 +160,15 @@ impl Portal {
         timestamp_us: Option<u64>,
     ) -> Result<(), PortalError> {
         let inner = self.inner.lock();
-        let publisher = inner
-            .action_publisher
-            .as_ref()
-            .ok_or(PortalError::WrongRole(Role::Robot))?;
+        let publisher =
+            inner.action_publisher.as_ref().ok_or(PortalError::WrongRole(Role::Robot))?;
         publisher.send_map(&values, timestamp_us)
     }
 
     pub async fn disconnect(&self) -> Result<(), PortalError> {
         let room = self.inner.lock().room.take();
         if let Some(room) = room {
-            room.close()
-                .await
-                .map_err(|e| PortalError::Room(e.to_string()))?;
+            room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
         }
 
         let mut inner = self.inner.lock();
@@ -231,10 +222,7 @@ impl Portal {
         }
     }
 
-    pub fn on_drop(
-        &self,
-        callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static,
-    ) {
+    pub fn on_drop(&self, callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static) {
         *self.inner.lock().drop_cb.lock() = Some(Box::new(callback));
     }
 }
@@ -248,10 +236,7 @@ impl Portal {
         for track_name in &config.video_tracks {
             let publisher = VideoPublisher::new(track_name);
             publisher.publish(&lp).await?;
-            self.inner
-                .lock()
-                .video_publishers
-                .insert(track_name.clone(), publisher);
+            self.inner.lock().video_publishers.insert(track_name.clone(), publisher);
         }
 
         if !config.state_fields.is_empty() {
@@ -312,9 +297,7 @@ async fn handle_room_event(
     event: RoomEvent,
 ) {
     match event {
-        RoomEvent::TrackSubscribed {
-            track, publication, ..
-        } => {
+        RoomEvent::TrackSubscribed { track, publication, .. } => {
             let track_name = publication.name();
             match config.role {
                 Role::Robot => {
@@ -337,8 +320,7 @@ async fn handle_room_event(
                                         .cloned()
                                         .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-                                    let stream =
-                                        NativeVideoStream::new(video_track.rtc_track());
+                                    let stream = NativeVideoStream::new(video_track.rtc_track());
                                     let receiver = VideoReceiver::spawn(
                                         track_name.to_string(),
                                         stream,
@@ -371,16 +353,10 @@ async fn handle_room_event(
     }
 }
 
-async fn subscribe_action_track(
-    _inner_ref: &Arc<Mutex<PortalInner>>,
-    _config: &PortalConfigData,
-) {
+async fn subscribe_action_track(_inner_ref: &Arc<Mutex<PortalInner>>, _config: &PortalConfigData) {
     // TODO: Wire data track subscription once the API is clarified
 }
 
-async fn subscribe_state_track(
-    _inner_ref: &Arc<Mutex<PortalInner>>,
-    _config: &PortalConfigData,
-) {
+async fn subscribe_state_track(_inner_ref: &Arc<Mutex<PortalInner>>, _config: &PortalConfigData) {
     // TODO: Wire data track subscription once the API is clarified
 }

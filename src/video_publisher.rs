@@ -21,18 +21,11 @@ pub(crate) struct VideoPublisher {
 
 impl VideoPublisher {
     pub fn new(name: &str) -> Self {
-        let resolution = VideoResolution {
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
-        };
+        let resolution = VideoResolution { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT };
         let source = NativeVideoSource::new(resolution, false);
         let rtc_source = RtcVideoSource::Native(source.clone());
         let track = LocalVideoTrack::create_video_track(name, rtc_source);
-        Self {
-            name: name.to_string(),
-            source,
-            track,
-        }
+        Self { name: name.to_string(), source, track }
     }
 
     pub async fn publish(&self, local_participant: &LocalParticipant) -> PortalResult<()> {
@@ -73,10 +66,7 @@ impl VideoPublisher {
         copy_i420_data(i420_data, &mut buffer);
 
         let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
-        frame.frame_metadata = Some(FrameMetadata {
-            user_timestamp: Some(ts),
-            frame_id: None,
-        });
+        frame.frame_metadata = Some(FrameMetadata { user_timestamp: Some(ts), frame_id: None });
 
         self.source.capture_frame(&frame);
         Ok(())
@@ -100,8 +90,5 @@ fn copy_i420_data(src: &[u8], buffer: &mut I420Buffer) {
 }
 
 pub(crate) fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
 }

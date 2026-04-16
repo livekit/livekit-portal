@@ -16,7 +16,11 @@ pub(crate) struct SyncBuffer {
 }
 
 impl SyncBuffer {
-    pub fn new(video_track_names: &[String], state_fields: Vec<String>, config: SyncConfig) -> Self {
+    pub fn new(
+        video_track_names: &[String],
+        state_fields: Vec<String>,
+        config: SyncConfig,
+    ) -> Self {
         let mut video_buffers = HashMap::new();
         for name in video_track_names {
             video_buffers.insert(name.clone(), VecDeque::new());
@@ -41,10 +45,7 @@ impl SyncBuffer {
 
     pub fn push_frame(&mut self, track_name: &str, frame: Arc<VideoFrameData>) {
         if let Some(buf) = self.video_buffers.get_mut(track_name) {
-            buf.push_back(TimestampedFrame {
-                timestamp_us: frame.timestamp_us,
-                frame,
-            });
+            buf.push_back(TimestampedFrame { timestamp_us: frame.timestamp_us, frame });
             while buf.len() > self.config.video_buffer_size as usize {
                 buf.pop_front();
             }
@@ -53,8 +54,7 @@ impl SyncBuffer {
     }
 
     pub fn push_state(&mut self, timestamp_us: u64, values: Vec<f64>) {
-        self.state_buffer
-            .push_back(TimestampedState { timestamp_us, values });
+        self.state_buffer.push_back(TimestampedState { timestamp_us, values });
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
             self.state_buffer.pop_front();
         }
@@ -92,8 +92,7 @@ impl SyncBuffer {
                 }
 
                 if let Some(idx) = best_idx {
-                    matched_frames
-                        .insert(track_name.clone(), (idx, frame_buf[idx].frame.clone()));
+                    matched_frames.insert(track_name.clone(), (idx, frame_buf[idx].frame.clone()));
                 } else if !frame_buf.is_empty()
                     && frame_buf
                         .iter()
@@ -172,7 +171,11 @@ impl SyncBuffer {
 }
 
 fn abs_diff(a: u64, b: u64) -> u64 {
-    if a >= b { a - b } else { b - a }
+    if a >= b {
+        a - b
+    } else {
+        b - a
+    }
 }
 
 #[cfg(test)]
@@ -295,11 +298,8 @@ mod tests {
     fn buffer_overflow_evicts_oldest() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
-        let config = SyncConfig {
-            video_buffer_size: 2,
-            state_buffer_size: 2,
-            ..Default::default()
-        };
+        let config =
+            SyncConfig { video_buffer_size: 2, state_buffer_size: 2, ..Default::default() };
         let mut buf = SyncBuffer::new(&tracks, fields, config);
 
         // Push 3 frames, buffer holds 2

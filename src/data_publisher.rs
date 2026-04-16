@@ -39,11 +39,8 @@ impl DataPublisher {
         map: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let values: Vec<f64> = self
-            .fields
-            .iter()
-            .map(|name| *map.get(name).unwrap_or(&0.0))
-            .collect();
+        let values: Vec<f64> =
+            self.fields.iter().map(|name| *map.get(name).unwrap_or(&0.0)).collect();
         self.send(&values, timestamp_us)
     }
 

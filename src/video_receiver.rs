@@ -27,10 +27,7 @@ impl VideoReceiver {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
             while let Some(frame) = stream.next().await {
-                let timestamp_us = frame
-                    .frame_metadata
-                    .and_then(|m| m.user_timestamp)
-                    .unwrap_or(0);
+                let timestamp_us = frame.frame_metadata.and_then(|m| m.user_timestamp).unwrap_or(0);
 
                 let frame_data = convert_frame(&frame, timestamp_us);
                 let frame_arc = Arc::new(frame_data);
@@ -42,10 +39,7 @@ impl VideoReceiver {
                 sync_buffer.lock().push_frame(&track_name, frame_arc);
             }
         });
-        Self {
-            _name: name,
-            task_handle: handle,
-        }
+        Self { _name: name, task_handle: handle }
     }
 
     pub fn abort(&self) {
@@ -53,17 +47,15 @@ impl VideoReceiver {
     }
 }
 
-fn convert_frame<T: AsRef<dyn VideoBuffer>>(frame: &VideoFrame<T>, timestamp_us: u64) -> VideoFrameData {
+fn convert_frame<T: AsRef<dyn VideoBuffer>>(
+    frame: &VideoFrame<T>,
+    timestamp_us: u64,
+) -> VideoFrameData {
     let i420 = frame.buffer.as_ref().to_i420();
     let (y, u, v) = i420.data();
     let mut data = Vec::with_capacity(y.len() + u.len() + v.len());
     data.extend_from_slice(y);
     data.extend_from_slice(u);
     data.extend_from_slice(v);
-    VideoFrameData {
-        width: i420.width(),
-        height: i420.height(),
-        data,
-        timestamp_us,
-    }
+    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
 }

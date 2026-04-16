@@ -40,10 +40,7 @@ impl DataReceiver {
                 }
             }
         });
-        Self {
-            _fields: fields,
-            task_handle: handle,
-        }
+        Self { _fields: fields, task_handle: handle }
     }
 
     /// Spawn a receiver for state (operator side) — feeds SyncBuffer.
@@ -74,10 +71,7 @@ impl DataReceiver {
                 }
             }
         });
-        Self {
-            _fields: fields,
-            task_handle: handle,
-        }
+        Self { _fields: fields, task_handle: handle }
     }
 
     pub fn abort(&self) {
