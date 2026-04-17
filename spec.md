@@ -77,8 +77,8 @@ inference_portal.add_action("joint1", "joint2", "joint3")
 
 Edge cases:
 
-- If operator adds a non-existent state or video (or doesn't add an existing one), nothing happens. They'll just not receive data for that particular state or video. Internally there is a buffer for state — if a new incomplete entry is added, it will carry forward the last known value.
-- If robot adds a non-existent action, they will just not receive anything. The non-existent action will be 0.
+- If a side declares a field or video track that the peer never publishes, the consumer simply never receives it — no error. Extra fields on the peer side are ignored.
+- When a caller sends a partial state/action dict (only some of the declared fields), missing fields **carry forward** their last sent value on the publisher side. Fields never sent start at `0.0`. This keeps the observation coherent when a sensor reports only a subset per tick.
 - Portal is built to be as stateless as possible, so disconnect and reconnect can be gracefully handled.
 
 ### Sending
