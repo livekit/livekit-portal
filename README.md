@@ -63,6 +63,22 @@ def on_observation(obs):
 portal.on_observation(on_observation)
 ```
 
+## Video frame format
+
+`send_video_frame` expects packed **RGB24** — byte order `R, G, B`, one byte per channel, no alpha. Layout is row-major and tightly packed (stride = `width * 3`), so an exact buffer is `width * height * 3` bytes. `width` and `height` must both be even (I420 chroma subsampling).
+
+This matches NumPy `uint8` arrays of shape `(H, W, 3)` in RGB order — the output of `PIL.Image.convert("RGB")`, or OpenCV's `cvtColor(frame, COLOR_BGR2RGB)`.
+
+Portal converts to I420 internally via libyuv's SIMD-optimized `RAWToI420` before handing the frame to WebRTC. Approximate cost on modern ARM64 (NEON) or x86 (AVX2):
+
+| Resolution | Per-frame | At 30 fps |
+|---|---|---|
+| 640×480 | ~0.3–0.9 ms | ~1–3% of a core |
+| 1280×720 | ~1–3 ms | ~3–10% |
+| 1920×1080 | ~2–6 ms | ~6–20% |
+
+If your camera already produces I420/NV12, you're paying for a round-trip. For RGB/BGR sources (most cameras + most Python pipelines), this is as fast as doing the conversion yourself and saves a call.
+
 ## Synchronization
 
 State and video frames are tagged with system time on the sender side. The receiver matches them locally within a configurable search range. An observation is only formed when all registered video tracks have a matching frame for a given state. Unmatched states are dropped and reported via the drop callback.

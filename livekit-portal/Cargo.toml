@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 livekit = { git = "https://github.com/livekit/rust-sdks.git", branch = "dc/feature/user_timestamp" }
+yuv-sys = { git = "https://github.com/livekit/rust-sdks.git", branch = "dc/feature/user_timestamp" }
 thiserror = "2"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }

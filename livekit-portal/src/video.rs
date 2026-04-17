@@ -81,7 +81,7 @@ impl VideoPublisher {
         }
         let ts = timestamp_us.unwrap_or_else(now_us);
         let mut buffer = I420Buffer::new(width, height);
-        rgb_to_i420(rgb_data, width as usize, height as usize, &mut buffer);
+        rgb_to_i420(rgb_data, width, height, &mut buffer);
         let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
         frame.frame_metadata = Some(FrameMetadata { user_timestamp: Some(ts), frame_id: None });
         self.source.capture_frame(&frame);
@@ -194,47 +194,28 @@ fn convert_frame<T: AsRef<dyn VideoBuffer>>(
     VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
 }
 
-// BT.601 limited-range RGB24 -> I420, matching libyuv's RAWToI420. Chroma is
-// 2x2-box-averaged so hard edges don't leak into adjacent blocks.
-fn rgb_to_i420(src: &[u8], width: usize, height: usize, buffer: &mut I420Buffer) {
-    let stride_y = buffer.stride_y() as usize;
-    let stride_u = buffer.stride_u() as usize;
-    let stride_v = buffer.stride_v() as usize;
+// RGB24 (R,G,B byte order) -> I420 via libyuv. libyuv's `RAW` format is R,G,B;
+// its `RGB24` is B,G,R. We advertise RGB, so RAWToI420 is the correct call.
+fn rgb_to_i420(src: &[u8], width: u32, height: u32, buffer: &mut I420Buffer) {
+    let (sy, su, sv) = buffer.strides();
     let (y_dst, u_dst, v_dst) = buffer.data_mut();
-    let src_stride = width * 3;
-
-    for y in 0..height {
-        let src_row = &src[y * src_stride..y * src_stride + src_stride];
-        let y_row = &mut y_dst[y * stride_y..y * stride_y + width];
-        for x in 0..width {
-            let r = src_row[x * 3] as i32;
-            let g = src_row[x * 3 + 1] as i32;
-            let b = src_row[x * 3 + 2] as i32;
-            y_row[x] = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
-        }
+    // SAFETY: `src` has width*height*3 bytes (checked by caller); dst planes
+    // are sized by I420Buffer::new(width, height); strides come from the
+    // buffer itself. libyuv only reads/writes within these bounds.
+    unsafe {
+        yuv_sys::rs_RAWToI420(
+            src.as_ptr(),
+            (width * 3) as i32,
+            y_dst.as_mut_ptr(),
+            sy as i32,
+            u_dst.as_mut_ptr(),
+            su as i32,
+            v_dst.as_mut_ptr(),
+            sv as i32,
+            width as i32,
+            height as i32,
+        );
     }
-
-    let cw = width / 2;
-    let ch = height / 2;
-    for cy in 0..ch {
-        let row0 = &src[(2 * cy) * src_stride..(2 * cy) * src_stride + src_stride];
-        let row1 = &src[(2 * cy + 1) * src_stride..(2 * cy + 1) * src_stride + src_stride];
-        let u_row = &mut u_dst[cy * stride_u..cy * stride_u + cw];
-        let v_row = &mut v_dst[cy * stride_v..cy * stride_v + cw];
-        for cx in 0..cw {
-            let i0 = 2 * cx * 3;
-            let i1 = i0 + 3;
-            let r = (row0[i0] as i32 + row0[i1] as i32 + row1[i0] as i32 + row1[i1] as i32 + 2) >> 2;
-            let g = (row0[i0 + 1] as i32 + row0[i1 + 1] as i32 + row1[i0 + 1] as i32 + row1[i1 + 1] as i32 + 2) >> 2;
-            let b = (row0[i0 + 2] as i32 + row0[i1 + 2] as i32 + row1[i0 + 2] as i32 + row1[i1 + 2] as i32 + 2) >> 2;
-            u_row[cx] = clamp_u8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-            v_row[cx] = clamp_u8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-        }
-    }
-}
-
-fn clamp_u8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
 }
 
 pub(crate) fn now_us() -> u64 {

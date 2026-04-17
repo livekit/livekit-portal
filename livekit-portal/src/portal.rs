@@ -201,7 +201,7 @@ impl Portal {
     pub fn send_video_frame(
         &self,
         track_name: &str,
-        i420_data: &[u8],
+        rgb_data: &[u8],
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
@@ -212,7 +212,7 @@ impl Portal {
                 name: track_name.to_string(),
             })?
         };
-        publisher.send_frame(i420_data, width, height, timestamp_us)
+        publisher.send_frame(rgb_data, width, height, timestamp_us)
     }
 
     pub fn send_state(
