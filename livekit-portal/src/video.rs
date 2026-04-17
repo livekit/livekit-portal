@@ -89,11 +89,13 @@ pub(crate) struct VideoReceiver {
 }
 
 impl VideoReceiver {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: String,
         stream: NativeVideoStream,
         sync_buffer: Arc<Mutex<SyncBuffer>>,
         raw_callback: Arc<Mutex<Option<VideoCb>>>,
+        latest: Arc<Mutex<Option<VideoFrameData>>>,
         obs_sink: Arc<ObservationSink>,
         metrics: Arc<TrackMetrics>,
     ) -> Self {
@@ -115,6 +117,8 @@ impl VideoReceiver {
                 if let Some(cb) = raw_callback.lock().as_ref() {
                     cb(&name, &frame_arc);
                 }
+                // VideoFrameData clone is cheap — pixel buffer is Arc<[u8]>.
+                *latest.lock() = Some((*frame_arc).clone());
                 let output = sync_buffer.lock().push_frame(&name, frame_arc);
                 if !output.is_empty() {
                     obs_sink.dispatch(output);

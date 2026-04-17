@@ -69,29 +69,25 @@ State and video frames are tagged with system time on the sender side. The recei
 
 Video frame timestamps are embedded using LiveKit's packet trailer feature, which survives the full WebRTC encode/decode pipeline.
 
-## Tuning the sync buffer
+## Tuning
 
-The defaults are tuned for 60fps video and state. All settings are on the config object before connecting.
-
-```python
-config.set_search_range_ms(10)    # max timestamp delta for a state-frame match (default: 10ms)
-config.set_video_buffer(5)        # frames buffered per video track (default: 5)
-config.set_state_buffer(5)        # states buffered for sync (default: 5)
-config.set_observation_buffer(3)  # synced observations buffered (default: 3)
-```
-
-**`search_range_ms`** — how close (in ms) a state timestamp and a video frame timestamp must be to pair. At 60fps, one frame is ~16.7ms. The default of 10ms is generous for same-loop-iteration sends but tight enough to never accidentally match a neighboring frame. Increase if your state and video are sent from different threads with more jitter.
-
-**`video_buffer`** / **`state_buffer`** — how many samples to hold while waiting for a match. At 60fps, 5 frames = ~83ms of headroom. If a match can't happen within that window, the state is dropped (and the drop callback fires). Increase if you have high network jitter or variable frame rates.
-
-**`observation_buffer`** — how many synced observations to hold before the oldest is evicted. If your model inference takes 50ms at 60fps, ~3 observations queue up. Increase if your consumer is bursty.
-
-**Data reliability** — state and action use reliable (lossless, ordered) delivery by default. For high-frequency inference where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss:
+Portal assumes unified sampling — the robot captures state + frames at the same tick. All sync parameters derive from a single `fps`, and all internal buffers share a single `slack` size.
 
 ```python
-config.set_state_reliable(False)   # default: True
-config.set_action_reliable(False)  # default: True
+config.set_fps(30)            # unified capture rate (default: 30)
+config.set_slack(5)           # ticks of pipeline headroom (default: 5)
+
+config.set_state_reliable(True)   # default: True
+config.set_action_reliable(True)  # default: True
+
+config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
 ```
+
+**`fps`** — the unified sampling rate. Derives `search_range = 1/(2·fps)`, so at 30fps a state matches a frame within ~16.6ms. Raise to 60 for high-rate robots.
+
+**`slack`** — ticks of pipeline headroom: the per-track video sync buffer, the state sync buffer, and the pull-side observation slot all use this. Larger values tolerate more network jitter and loss-detection latency at the cost of staleness. 5 ticks (≈83ms at 60fps) is comfortable; the minimum useful value is 2.
+
+**Reliability** — state and action use reliable (lossless, ordered) SCTP delivery by default. For high-frequency control where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss. Video is always unreliable (RTP).
 
 ## Language support
 

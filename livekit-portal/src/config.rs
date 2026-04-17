@@ -10,8 +10,9 @@ pub struct PortalConfig {
     pub(crate) action_fields: Vec<String>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
-    pub(crate) sync_config: SyncConfig,
-    pub(crate) ping_interval_ms: u64,
+    pub(crate) fps: u32,
+    pub(crate) slack: u32,
+    pub(crate) ping_ms: u64,
 }
 
 impl PortalConfig {
@@ -24,8 +25,9 @@ impl PortalConfig {
             action_fields: Vec::new(),
             state_reliable: true,
             action_reliable: true,
-            sync_config: SyncConfig::default(),
-            ping_interval_ms: 1000,
+            fps: 30,
+            slack: 5,
+            ping_ms: 1000,
         }
     }
 
@@ -41,20 +43,20 @@ impl PortalConfig {
         self.action_fields.extend(fields.iter().map(|s| s.to_string()));
     }
 
-    pub fn set_video_buffer(&mut self, size: u32) {
-        self.sync_config.video_buffer_size = size;
+    /// Unified observation rate. All sync parameters derive from this:
+    /// sender captures state + frames at this rate, and `search_range = 1/(2·fps)`.
+    pub fn set_fps(&mut self, fps: u32) {
+        assert!(fps > 0, "fps must be > 0");
+        self.fps = fps;
     }
 
-    pub fn set_state_buffer(&mut self, size: u32) {
-        self.sync_config.state_buffer_size = size;
-    }
-
-    pub fn set_search_range_ms(&mut self, ms: u64) {
-        self.sync_config.search_range_us = ms * 1000;
-    }
-
-    pub fn set_observation_buffer(&mut self, size: u32) {
-        self.sync_config.observation_buffer_size = size;
+    /// Ticks of pipeline headroom — how much jitter, loss-detection latency,
+    /// and consumer lag the pipeline tolerates before dropping. Applies to
+    /// the per-track video sync buffer, the state sync buffer, and the
+    /// pull-side observation buffer.
+    pub fn set_slack(&mut self, ticks: u32) {
+        assert!(ticks > 0, "slack must be > 0");
+        self.slack = ticks;
     }
 
     pub fn set_state_reliable(&mut self, reliable: bool) {
@@ -65,10 +67,20 @@ impl PortalConfig {
         self.action_reliable = reliable;
     }
 
-    /// RTT ping cadence in milliseconds. Set to `0` to disable active pinging
-    /// on this side; the pong echo path remains active regardless, so the peer
-    /// can still measure its own RTT. Default: 1000ms.
-    pub fn set_ping_interval_ms(&mut self, ms: u64) {
-        self.ping_interval_ms = ms;
+    /// RTT ping cadence. Set to `0` to disable active pinging on this side;
+    /// the pong echo path remains active so the peer can still measure.
+    pub fn set_ping_ms(&mut self, ms: u64) {
+        self.ping_ms = ms;
+    }
+
+    /// Derived sync config used internally by the sync buffer and observation
+    /// sink. Not part of the public API.
+    pub(crate) fn sync_config(&self) -> SyncConfig {
+        SyncConfig {
+            video_buffer_size: self.slack,
+            state_buffer_size: self.slack,
+            observation_buffer_size: self.slack,
+            search_range_us: 1_000_000 / (2 * self.fps as u64),
+        }
     }
 }

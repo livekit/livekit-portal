@@ -100,34 +100,42 @@ inference_portal.send_action({"joint1": 0.0, "joint2": 0.0, "joint3": 0.0})  # o
 
 ### Receiving
 
-State and action format: `Dict[str, float]`
+State and action format: `Dict[str, float]`. Both a push API (callbacks, fire on every receive) and a pull API (latest-wins peek) are provided. Use the callback if you want every sample (with your own history buffer). Use the pull API if you only care about the most recent value per inference tick.
 
 ```python
+# --- Push API (callbacks) ---
 # On robot side
 inference_portal.on_action(callback)
 
 # On operator side
-inference_portal.on_observation(callback)  # synced bundle of all video frames + state, called when a complete sync is formed
-inference_portal.on_state(callback)        # called when a new state is received (unsynced)
-inference_portal.on_video("camera1", callback)  # called when a new frame is received (unsynced)
+inference_portal.on_observation(callback)      # synced bundle, fires when a complete sync is formed
+inference_portal.on_state(callback)            # fires on every state received (unsynced)
+inference_portal.on_video_frame("camera1", callback)  # fires on every frame received (unsynced)
+inference_portal.on_drop(callback)             # fires on sync-fail and state-buffer overflow
+
+# --- Pull API (latest-wins) ---
+action = inference_portal.get_action()         # robot: Option[Dict[str, float]]
+obs    = inference_portal.get_observation()    # operator: Option[Observation]
+state  = inference_portal.get_state()          # operator: Option[Dict[str, float]]
+frame  = inference_portal.get_video_frame("camera1")  # operator: Option[VideoFrameData]
 ```
 
 An observation is a complete synced bundle: one state matched with one frame from every registered video track. There are no partial observations. If any registered video track is missing a matching frame within the sync window, the observation is not formed and the state is dropped.
 
+The pull API is peek-style: `get_*()` always returns the most recent value (or `None` if nothing has arrived yet), and repeated calls return the same value until a new one arrives. The library does not buffer history for the pull API — if you need every sample, register the callback and buffer on your side.
+
 ### Tuning
 
-All tuning is set on the config object before connecting.
+All tuning is set on the config object before connecting. Portal is built around unified sampling: the robot captures state + frames at the same tick rate, so a single `fps` knob derives the sync search window, and a single `slack` knob sizes all internal buffers.
 
 ```python
-config.set_video_buffer(30)       # (unit: samples) how many frames to buffer per video track for sync
-config.set_state_buffer(30)       # (unit: samples) how many states to buffer for sync
-config.set_search_range(30)       # (unit: ms) match if |timestamp_state - timestamp_frame| < range, pick minimum delta
-config.set_observation_buffer(10) # how many synced observations to buffer
+config.set_fps(30)               # unified capture rate; derives search_range = 1/(2·fps)
+config.set_slack(5)              # ticks of pipeline headroom (video + state sync buffers)
 
-config.set_state_reliable(True)   # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
-config.set_action_reliable(True)  # default: True. use False for high-frequency inference where latest value matters most
+config.set_state_reliable(True)  # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
+config.set_action_reliable(True) # default: True. use False for high-frequency inference where latest value matters most
 
-config.set_ping_interval_ms(1000) # default: 1000. set 0 to disable RTT pinging on this side
+config.set_ping_ms(1000)         # default: 1000. set 0 to disable RTT pinging on this side
 ```
 
 ### Metrics
@@ -158,16 +166,14 @@ metrics.transport
 metrics.buffers                   # fill gauges + overflow counters
   video_fill                      # gauge, per video track
   state_fill                      # gauge
-  observation_fill                # gauge
   evictions                       # per video track, cumulative (overflow)
-  observations_evicted            # cumulative: consumer lagged on pull side
 
 metrics.rtt
   rtt_us_last / rtt_us_mean / rtt_us_p95
   pings_sent / pongs_received
 ```
 
-RTT is measured on a reserved `portal_rtt` data topic. Each side sends an unreliable ping at `ping_interval_ms`; the other side echoes it as a pong carrying the original timestamp. The pinging side computes RTT = `now − ping_ts` when the pong arrives. Unreliable delivery is deliberate: reliable retransmits would inflate the measurement. Echo is always active, so one side can disable pinging and still let the other measure.
+RTT is measured on a reserved `portal_rtt` data topic. Each side sends an unreliable ping at `ping_ms`; the other side echoes it as a pong carrying the original timestamp. The pinging side computes RTT = `now − ping_ts` when the pong arrives. Unreliable delivery is deliberate: reliable retransmits would inflate the measurement. Echo is always active, so one side can disable pinging and still let the other measure.
 
 Jitter is the RFC 3550 EWMA on inter-arrival deltas: `J += (|D| − J) / 16`, where `D = (recv_i − recv_{i-1}) − (send_i − send_{i-1})`. Drift-robust (only looks at deltas) and unitless of absolute clock offset.
 

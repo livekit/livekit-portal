@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use livekit::prelude::*;
@@ -26,19 +26,17 @@ type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 pub(crate) struct ObservationSink {
     observation_cb: Mutex<Option<ObservationCb>>,
     drop_cb: Mutex<Option<DropCb>>,
-    buffer: Mutex<VecDeque<Observation>>,
-    buffer_size: usize,
-    metrics: Arc<MetricsRegistry>,
+    // Latest-wins slot. Consumers peek via `get()` (clone). Consumers that
+    // want history register `on_observation` and buffer on their own side.
+    latest: Mutex<Option<Observation>>,
 }
 
 impl ObservationSink {
-    pub(crate) fn new(buffer_size: usize, metrics: Arc<MetricsRegistry>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             observation_cb: Mutex::new(None),
             drop_cb: Mutex::new(None),
-            buffer: Mutex::new(VecDeque::new()),
-            buffer_size,
-            metrics,
+            latest: Mutex::new(None),
         }
     }
 
@@ -46,7 +44,6 @@ impl ObservationSink {
         let SyncOutput { observations, drops } = output;
 
         if !observations.is_empty() {
-            // Fire callback by reference — no clone, even with a registered consumer.
             {
                 let cb_slot = self.observation_cb.lock();
                 if let Some(cb) = cb_slot.as_ref() {
@@ -55,24 +52,12 @@ impl ObservationSink {
                     }
                 }
             }
-            if self.buffer_size > 0 {
-                let mut evicted = 0u64;
-                {
-                    let mut buf = self.buffer.lock();
-                    for obs in observations {
-                        buf.push_back(obs);
-                        while buf.len() > self.buffer_size {
-                            buf.pop_front();
-                            evicted += 1;
-                        }
-                    }
-                }
-                if evicted > 0 {
-                    self.metrics.record_observation_evicted(evicted);
-                    log::warn!(
-                        "observation buffer overflow: evicted {evicted} observation(s) — consumer is lagging"
-                    );
-                }
+            // Writer always wins — overwrite is the expected behavior in
+            // latest-wins mode. Consumers that care about every observation
+            // use the callback.
+            let mut slot = self.latest.lock();
+            for obs in observations {
+                *slot = Some(obs);
             }
         }
 
@@ -83,16 +68,12 @@ impl ObservationSink {
         }
     }
 
-    pub(crate) fn take(&self) -> Vec<Observation> {
-        self.buffer.lock().drain(..).collect()
+    pub(crate) fn get(&self) -> Option<Observation> {
+        self.latest.lock().clone()
     }
 
     pub(crate) fn clear(&self) {
-        self.buffer.lock().clear();
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.buffer.lock().len()
+        *self.latest.lock() = None;
     }
 
     pub(crate) fn set_observation_cb(&self, cb: ObservationCb) {
@@ -130,11 +111,17 @@ pub struct Portal {
     sync_buffer: Mutex<Option<Arc<Mutex<SyncBuffer>>>>,
     obs_sink: Arc<ObservationSink>,
 
-    // Data callbacks.
+    // Data callbacks (push API).
     action_cb: Arc<Mutex<Option<DataCb>>>,
     state_cb: Arc<Mutex<Option<DataCb>>>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
+
+    // Latest-wins slots (pull API). Parallel to the callback slots — updated
+    // on every receive regardless of whether a callback is registered.
+    action_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
+    state_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
+    video_latest: HashMap<String, Arc<Mutex<Option<VideoFrameData>>>>,
 
     metrics: Arc<MetricsRegistry>,
 }
@@ -146,12 +133,14 @@ impl Portal {
             .iter()
             .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
             .collect();
+        let video_latest: HashMap<_, _> = config
+            .video_tracks
+            .iter()
+            .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
+            .collect();
 
         let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
-        let obs_sink = Arc::new(ObservationSink::new(
-            config.sync_config.observation_buffer_size as usize,
-            metrics.clone(),
-        ));
+        let obs_sink = Arc::new(ObservationSink::new());
 
         Self {
             config,
@@ -165,6 +154,9 @@ impl Portal {
             action_cb: Arc::new(Mutex::new(None)),
             state_cb: Arc::new(Mutex::new(None)),
             video_cbs,
+            action_latest: Arc::new(Mutex::new(None)),
+            state_latest: Arc::new(Mutex::new(None)),
+            video_latest,
             metrics,
         }
     }
@@ -190,7 +182,7 @@ impl Portal {
 
         let rtt = Arc::new(RttService::spawn(
             room.local_participant(),
-            self.config.ping_interval_ms,
+            self.config.ping_ms,
             self.metrics.clone(),
         ));
 
@@ -206,6 +198,9 @@ impl Portal {
             state_cb: self.state_cb.clone(),
             video_cbs: self.video_cbs.clone(),
             video_receivers: self.video_receivers.clone(),
+            action_latest: self.action_latest.clone(),
+            state_latest: self.state_latest.clone(),
+            video_latest: self.video_latest.clone(),
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
         };
@@ -293,15 +288,40 @@ impl Portal {
             sb.lock().clear();
         }
         self.obs_sink.clear();
+        *self.action_latest.lock() = None;
+        *self.state_latest.lock() = None;
+        for slot in self.video_latest.values() {
+            *slot.lock() = None;
+        }
 
         Ok(())
     }
 
-    pub fn take_observations(&self) -> Vec<Observation> {
-        self.obs_sink.take()
+    // --- Pull API (latest-wins, peek semantics) ---
+
+    /// Clone of the latest observation, or `None` if none received yet.
+    /// Consumers wanting a history of observations should register
+    /// `on_observation` and buffer on their own side.
+    pub fn get_observation(&self) -> Option<Observation> {
+        self.obs_sink.get()
     }
 
-    // --- Callback registration ---
+    /// Clone of the latest action received (Robot side), or `None`.
+    pub fn get_action(&self) -> Option<HashMap<String, f64>> {
+        self.action_latest.lock().clone()
+    }
+
+    /// Clone of the latest state received (Operator side), or `None`.
+    pub fn get_state(&self) -> Option<HashMap<String, f64>> {
+        self.state_latest.lock().clone()
+    }
+
+    /// Clone of the latest frame received for `track_name`, or `None`.
+    pub fn get_video_frame(&self, track_name: &str) -> Option<VideoFrameData> {
+        self.video_latest.get(track_name).and_then(|s| s.lock().clone())
+    }
+
+    // --- Callback registration (push API) ---
 
     pub fn on_action(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
         *self.action_cb.lock() = Some(Box::new(callback));
@@ -315,16 +335,16 @@ impl Portal {
         *self.state_cb.lock() = Some(Box::new(callback));
     }
 
-    pub fn on_video(
+    pub fn on_video_frame(
         &self,
         track_name: &str,
         callback: impl Fn(&str, &VideoFrameData) + Send + Sync + 'static,
     ) {
         match self.video_cbs.get(track_name) {
             Some(cb_slot) => *cb_slot.lock() = Some(Box::new(callback)),
-            None => {
-                log::warn!("on_video: track '{track_name}' is not registered — callback ignored")
-            }
+            None => log::warn!(
+                "on_video_frame: track '{track_name}' is not registered — callback ignored"
+            ),
         }
     }
 
@@ -375,7 +395,7 @@ impl Portal {
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &self.config.video_tracks,
             self.config.state_fields.clone(),
-            self.config.sync_config,
+            self.config.sync_config(),
             self.metrics.clone(),
         )));
         *self.sync_buffer.lock() = Some(sync_buffer);
@@ -408,8 +428,7 @@ impl Portal {
             }
             None => (HashMap::new(), 0),
         };
-        let observation_fill = self.obs_sink.len();
-        self.metrics.snapshot(video_fill, state_fill, observation_fill)
+        self.metrics.snapshot(video_fill, state_fill)
     }
 
     pub fn reset_metrics(&self) {
@@ -427,6 +446,9 @@ struct EventContext {
     state_cb: Arc<Mutex<Option<DataCb>>>,
     video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+    action_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
+    state_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
+    video_latest: HashMap<String, Arc<Mutex<Option<VideoFrameData>>>>,
     metrics: Arc<MetricsRegistry>,
     rtt: Arc<RttService>,
 }
@@ -450,6 +472,11 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                             .get(track_name.as_str())
                             .cloned()
                             .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                        let latest = ctx
+                            .video_latest
+                            .get(track_name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
                         let track_metrics = ctx
                             .metrics
                             .track(track_name.as_str())
@@ -461,6 +488,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                             stream,
                             sync_buffer.clone(),
                             raw_cb,
+                            latest,
                             ctx.obs_sink.clone(),
                             track_metrics,
                         );
@@ -479,6 +507,8 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                     &ctx.config.state_fields,
                     &ctx.action_cb,
                     &ctx.state_cb,
+                    &ctx.action_latest,
+                    &ctx.state_latest,
                     ctx.sync_buffer.as_ref(),
                     &ctx.metrics,
                     &ctx.rtt,

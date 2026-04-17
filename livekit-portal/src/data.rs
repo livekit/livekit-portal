@@ -115,6 +115,8 @@ pub(crate) fn handle_data_received(
     state_fields: &[String],
     action_cb: &Mutex<Option<DataCb>>,
     state_cb: &Mutex<Option<DataCb>>,
+    action_latest: &Mutex<Option<HashMap<String, f64>>>,
+    state_latest: &Mutex<Option<HashMap<String, f64>>>,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
     metrics: &MetricsRegistry,
     rtt: &RttService,
@@ -127,18 +129,22 @@ pub(crate) fn handle_data_received(
         (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
             Ok((send_ts, values)) => {
                 metrics.record_action_received(send_ts, now_us());
+                let map = to_field_map(action_fields, &values);
                 if let Some(cb) = action_cb.lock().as_ref() {
-                    cb(to_field_map(action_fields, &values));
+                    cb(map.clone());
                 }
+                *action_latest.lock() = Some(map);
             }
             Err(e) => log::warn!("failed to deserialize action payload: {e}"),
         },
         (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
             Ok((timestamp_us, values)) => {
                 metrics.record_state_received(timestamp_us, now_us());
+                let map = to_field_map(state_fields, &values);
                 if let Some(cb) = state_cb.lock().as_ref() {
-                    cb(to_field_map(state_fields, &values));
+                    cb(map.clone());
                 }
+                *state_latest.lock() = Some(map);
                 if let Some(sb) = sync_buffer {
                     return sb.lock().push_state(timestamp_us, values);
                 }
