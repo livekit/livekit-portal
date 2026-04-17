@@ -69,6 +69,8 @@ State and video frames are tagged with system time on the sender side. The recei
 
 Video frame timestamps are embedded using LiveKit's packet trailer feature, which survives the full WebRTC encode/decode pipeline.
 
+> **Sender requirement:** every received video frame must carry a `user_timestamp` in its packet-trailer metadata. Portal enables this automatically on tracks it publishes (`PacketTrailerFeatures.user_timestamp = true`). A subscribed track produced by anything that does *not* set this field is unsupported — Portal cannot synchronize it and the receive task will panic on the first such frame. Either republish the source through Portal or enable user-timestamp trailers on the upstream publisher.
+
 ## Tuning
 
 Portal assumes unified sampling — the robot captures state + frames at the same tick. All sync parameters derive from a single `fps`, and all internal buffers share a single `slack` size.

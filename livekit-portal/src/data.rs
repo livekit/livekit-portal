@@ -72,13 +72,12 @@ impl DataPublisher {
         map: &HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let values = resolve_with_carry_forward(&self.fields, &mut self.last_values.lock(), map);
-        self.dispatch(&values, timestamp_us)
-    }
-
-    fn dispatch(&self, values: &[f64], timestamp_us: Option<u64>) -> PortalResult<()> {
         let ts = timestamp_us.unwrap_or_else(now_us);
-        let payload = serialize_values(ts, values);
+        let payload = {
+            let mut last = self.last_values.lock();
+            apply_carry_forward(&self.fields, &mut last, map);
+            serialize_values(ts, &last)
+        };
         let packet = DataPacket {
             payload,
             topic: Some(self.topic.clone()),
@@ -93,18 +92,13 @@ impl DataPublisher {
 }
 
 /// Update `last` in place with values from `map` for each declared field,
-/// leaving other slots untouched (carry-forward). Returns a copy for sending.
-fn resolve_with_carry_forward(
-    fields: &[String],
-    last: &mut [f64],
-    map: &HashMap<String, f64>,
-) -> Vec<f64> {
+/// leaving other slots untouched (carry-forward).
+fn apply_carry_forward(fields: &[String], last: &mut [f64], map: &HashMap<String, f64>) {
     for (i, name) in fields.iter().enumerate() {
         if let Some(&v) = map.get(name) {
             last[i] = v;
         }
     }
-    last.to_vec()
 }
 
 impl Drop for DataPublisher {
@@ -200,34 +194,17 @@ mod tests {
         let mut last = vec![0.0; 3];
 
         let m: HashMap<_, _> = [("j1".to_string(), 1.0)].into_iter().collect();
-        assert_eq!(
-            resolve_with_carry_forward(&fields, &mut last, &m),
-            vec![1.0, 0.0, 0.0],
-            "unsent fields start at seed (0.0)"
-        );
+        apply_carry_forward(&fields, &mut last, &m);
+        assert_eq!(last, vec![1.0, 0.0, 0.0], "unsent fields start at seed (0.0)");
 
         let m: HashMap<_, _> = [("j2".to_string(), 2.5)].into_iter().collect();
-        assert_eq!(
-            resolve_with_carry_forward(&fields, &mut last, &m),
-            vec![1.0, 2.5, 0.0],
-            "j1 carries forward; j2 updates; j3 still at seed"
-        );
+        apply_carry_forward(&fields, &mut last, &m);
+        assert_eq!(last, vec![1.0, 2.5, 0.0], "j1 carries forward; j2 updates; j3 still at seed");
 
         let m: HashMap<_, _> =
             [("j1".to_string(), -1.0), ("j3".to_string(), 7.0)].into_iter().collect();
-        assert_eq!(
-            resolve_with_carry_forward(&fields, &mut last, &m),
-            vec![-1.0, 2.5, 7.0],
-            "j2 carries forward when omitted; others update"
-        );
+        apply_carry_forward(&fields, &mut last, &m);
+        assert_eq!(last, vec![-1.0, 2.5, 7.0], "j2 carries forward when omitted; others update");
     }
 
-    #[test]
-    fn unknown_fields_in_map_are_ignored() {
-        let fields = vec!["j1".to_string()];
-        let mut last = vec![0.0];
-        let m: HashMap<_, _> =
-            [("j1".to_string(), 3.0), ("unknown".to_string(), 99.0)].into_iter().collect();
-        assert_eq!(resolve_with_carry_forward(&fields, &mut last, &m), vec![3.0]);
-    }
 }

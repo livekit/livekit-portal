@@ -51,12 +51,10 @@ impl ObservationSink {
                     }
                 }
             }
-            // Writer always wins — overwrite is the expected behavior in
-            // latest-wins mode. Consumers that care about every observation
-            // use the callback.
-            let mut slot = self.latest.lock();
-            for obs in observations {
-                *slot = Some(obs);
+            // Latest-wins: only the final observation needs to reach the pull
+            // slot — intermediates are discarded either way.
+            if let Some(last_obs) = observations.into_iter().last() {
+                *self.latest.lock() = Some(last_obs);
             }
         }
 
@@ -243,9 +241,14 @@ impl Portal {
     pub async fn disconnect(&self) -> PortalResult<()> {
         let room = self.conn.lock().room.take();
         log::info!("disconnecting");
-        if let Some(room) = room {
-            room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
-        }
+
+        // close() is best-effort; cleanup must happen even if it errors,
+        // otherwise the Portal would be half-disconnected (room=None but
+        // tasks/publishers still running) and the next connect() would race.
+        let close_result = match room {
+            Some(room) => room.close().await.map_err(|e| PortalError::Room(e.to_string())),
+            None => Ok(()),
+        };
 
         {
             let mut state = self.conn.lock();
@@ -276,7 +279,7 @@ impl Portal {
             slots.clear();
         }
 
-        Ok(())
+        close_result
     }
 
     // --- Pull API (latest-wins, peek semantics) ---
@@ -345,7 +348,12 @@ impl Portal {
                 .track(track_name)
                 .expect("track metrics registered at construction");
             let publisher = VideoPublisher::new(track_name, track_metrics);
-            publisher.publish(&lp).await?;
+            if let Err(e) = publisher.publish(&lp).await {
+                // Roll back any earlier publishers so their send tasks stop
+                // and connect() leaves Portal in a clean state.
+                self.video_publishers.lock().clear();
+                return Err(e);
+            }
             log::info!("[{}] published video track '{track_name}'", self.config.session);
             self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
         }

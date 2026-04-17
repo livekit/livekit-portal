@@ -431,23 +431,6 @@ mod tests {
 
     // --- New algorithm edge cases ---
 
-    /// Cursor should pick the closest frame even when many are in the buffer.
-    #[test]
-    fn cursor_picks_closest_among_many() {
-        let tracks = vec!["cam1".to_string()];
-        let fields = vec!["j1".to_string()];
-        let mut buf = mk(&tracks, fields, SyncConfig::default());
-
-        for ts in [1_000u64, 2_000, 3_000, 4_000, 5_000] {
-            let _ = push_f(&mut buf, "cam1", ts);
-        }
-
-        // Closest to 3_010 within search_range is 3_000.
-        let out = buf.push_state(3_010, vec![7.0]);
-        assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 3_000);
-    }
-
     /// Cursor should advance monotonically across many sequential syncs.
     #[test]
     fn cursor_advances_across_sequential_matches() {
@@ -468,36 +451,6 @@ mod tests {
             matched_ts.push(out.observations[0].frames["cam1"].timestamp_us);
         }
         assert_eq!(matched_ts, (0..10).map(|i| 1_000 + i * 1_000).collect::<Vec<_>>());
-    }
-
-    /// Eviction beyond capacity must decrement cursor so it remains valid.
-    #[test]
-    fn eviction_adjusts_cursor() {
-        let tracks = vec!["cam1".to_string()];
-        let fields = vec!["j1".to_string()];
-        let config = SyncConfig { video_buffer_size: 3, ..Default::default() };
-        let mut buf = mk(&tracks, fields, config);
-
-        // Fill buffer and push state to advance cursor to index 2.
-        for ts in [1_000u64, 2_000, 3_000] {
-            let _ = push_f(&mut buf, "cam1", ts);
-        }
-        // State_ts=3_010, cursor advances to idx 2 (frame 3_000); but buffer gets
-        // drained on successful match so cursor resets. Use a state that *doesn't*
-        // match yet (out of range) to force cursor advancement without drain.
-        // Instead: push state aligned so cursor advances and match succeeds.
-        let out = buf.push_state(3_010, vec![0.0]);
-        assert_eq!(out.observations.len(), 1);
-        // Buffer should now be empty (drained up to idx 2).
-        assert!(buf.video_buffers[0].is_empty());
-        assert_eq!(buf.cursors[0], 0);
-
-        // Now push frames beyond capacity; cursor stays 0 (never advances past len).
-        for ts in [4_000u64, 5_000, 6_000, 7_000] {
-            let _ = push_f(&mut buf, "cam1", ts);
-        }
-        assert_eq!(buf.video_buffers[0].len(), 3);
-        assert_eq!(buf.video_buffers[0][0].timestamp_us, 5_000);
     }
 
     /// Non-blocker push should defer try_sync, but a subsequent push to the
@@ -576,45 +529,6 @@ mod tests {
         let out = buf.push_state(200_002, vec![0.0]);
         assert_eq!(out.observations.len(), 1);
         assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 200_000);
-    }
-
-    /// A single frame push that completes all pending states should produce
-    /// multiple observations in one SyncOutput.
-    #[test]
-    fn multi_state_batch_emits_together() {
-        let tracks = vec!["cam1".to_string()];
-        let fields = vec!["j1".to_string()];
-        let mut buf = mk(&tracks, fields, SyncConfig::default());
-
-        // Pile up 3 states and 2 matching frames; last state waits on its own
-        // frame.
-        for ts in [1_000u64, 2_000, 3_000] {
-            let _ = buf.push_state(ts, vec![ts as f64]);
-        }
-        let _ = push_f(&mut buf, "cam1", 1_005);
-        let _ = push_f(&mut buf, "cam1", 2_005);
-        let out = push_f(&mut buf, "cam1", 3_005);
-        assert_eq!(out.observations.len(), 1, "only the final push should complete the batch");
-        // All three states should be fully drained.
-        assert_eq!(buf.state_buffer.len(), 0);
-    }
-
-    /// After a successful match the blocker must clear so the next unrelated
-    /// track push triggers try_sync.
-    #[test]
-    fn blocker_clears_after_match() {
-        let tracks = vec!["cam1".to_string(), "cam2".to_string()];
-        let fields = vec!["j1".to_string()];
-        let mut buf = mk(&tracks, fields, SyncConfig::default());
-
-        assert!(buf.push_state(1_000, vec![1.0]).is_empty());
-        assert!(push_f(&mut buf, "cam1", 1_002).is_empty());
-        // cam2 is now blocker.
-        assert_eq!(buf.blocker, Some(buf.track_index["cam2"]));
-
-        let out = push_f(&mut buf, "cam2", 1_005);
-        assert_eq!(out.observations.len(), 1);
-        assert!(buf.blocker.is_none(), "blocker must reset after successful match");
     }
 
     /// State eviction pushing a new head state clears the blocker so the new

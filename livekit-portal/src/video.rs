@@ -40,6 +40,9 @@ impl VideoPublisher {
     }
 
     pub async fn publish(&self, local_participant: &LocalParticipant) -> PortalResult<()> {
+        // user_timestamp is mandatory: the receive path uses it to align frames
+        // with state, and panics if it is missing. Subscribed tracks produced
+        // by publishers that don't set this trailer are unsupported.
         let mut features = PacketTrailerFeatures::default();
         features.user_timestamp = true;
         let options = TrackPublishOptions {
@@ -117,6 +120,10 @@ impl VideoReceiver {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
             while let Some(frame) = stream.next().await {
+                // Hard requirement: every frame must carry a user_timestamp.
+                // Portal-published tracks set this automatically; subscribed
+                // tracks from other publishers must do the same. See the
+                // "Sender requirement" note in README.md.
                 let timestamp_us = frame
                     .frame_metadata
                     .and_then(|m| m.user_timestamp)
