@@ -82,20 +82,35 @@ impl VideoPublisher {
 
 // --- Receiver ---
 
-type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
+pub(crate) type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
+
+/// Push callback + latest-wins slot for a single video track, paired so the
+/// receiver task and `get_video_frame` share one allocation.
+pub(crate) struct VideoTrackSlots {
+    pub cb: Mutex<Option<VideoCb>>,
+    pub latest: Mutex<Option<VideoFrameData>>,
+}
+
+impl VideoTrackSlots {
+    pub fn new() -> Self {
+        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
+    }
+
+    pub fn clear(&self) {
+        *self.latest.lock() = None;
+    }
+}
 
 pub(crate) struct VideoReceiver {
     task_handle: JoinHandle<()>,
 }
 
 impl VideoReceiver {
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: String,
         stream: NativeVideoStream,
         sync_buffer: Arc<Mutex<SyncBuffer>>,
-        raw_callback: Arc<Mutex<Option<VideoCb>>>,
-        latest: Arc<Mutex<Option<VideoFrameData>>>,
+        slots: Arc<VideoTrackSlots>,
         obs_sink: Arc<ObservationSink>,
         metrics: Arc<TrackMetrics>,
     ) -> Self {
@@ -114,11 +129,11 @@ impl VideoReceiver {
 
                 metrics.record_received(timestamp_us, now_us());
 
-                if let Some(cb) = raw_callback.lock().as_ref() {
+                if let Some(cb) = slots.cb.lock().as_ref() {
                     cb(&name, &frame_arc);
                 }
                 // VideoFrameData clone is cheap — pixel buffer is Arc<[u8]>.
-                *latest.lock() = Some((*frame_arc).clone());
+                *slots.latest.lock() = Some((*frame_arc).clone());
                 let output = sync_buffer.lock().push_frame(&name, frame_arc);
                 if !output.is_empty() {
                     obs_sink.dispatch(output);

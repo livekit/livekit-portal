@@ -96,7 +96,7 @@ impl MetricsRegistry {
     pub fn new(video_tracks: &[String]) -> Self {
         let per_track: HashMap<String, Arc<TrackMetrics>> = video_tracks
             .iter()
-            .map(|n| (n.clone(), Arc::new(TrackMetrics::new(n.clone()))))
+            .map(|n| (n.clone(), Arc::new(TrackMetrics::new())))
             .collect();
         Self {
             track_order: video_tracks.to_vec(),
@@ -244,8 +244,6 @@ impl MetricsRegistry {
 }
 
 pub(crate) struct TrackMetrics {
-    #[allow(dead_code)]
-    pub name: String,
     pub frames_sent: AtomicU64,
     pub frames_received: AtomicU64,
     pub evictions: AtomicU64,
@@ -253,9 +251,8 @@ pub(crate) struct TrackMetrics {
 }
 
 impl TrackMetrics {
-    pub fn new(name: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            name,
             frames_sent: AtomicU64::new(0),
             frames_received: AtomicU64::new(0),
             evictions: AtomicU64::new(0),

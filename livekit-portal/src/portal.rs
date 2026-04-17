@@ -7,16 +7,15 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::PortalConfig;
-use crate::data::{handle_data_received, DataCb, DataPublisher};
+use crate::data::{handle_data_received, DataPublisher, DataSlots};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rtt::RttService;
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
-use crate::video::{VideoPublisher, VideoReceiver};
+use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
 
 type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
-type VideoCb = Box<dyn Fn(&str, &VideoFrameData) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
 
 /// Drains the buffers returned by `SyncBuffer::push_*` and dispatches them to
@@ -95,7 +94,7 @@ pub struct Portal {
     config: PortalConfig,
 
     // Lifecycle state (connect/disconnect).
-    state: Mutex<ConnectionState>,
+    conn: Mutex<ConnectionState>,
 
     // Video receivers are spawned by the event loop (on TrackSubscribed) and
     // torn down by `disconnect`, so they live in an Arc shared with both.
@@ -111,32 +110,21 @@ pub struct Portal {
     sync_buffer: Mutex<Option<Arc<Mutex<SyncBuffer>>>>,
     obs_sink: Arc<ObservationSink>,
 
-    // Data callbacks (push API).
-    action_cb: Arc<Mutex<Option<DataCb>>>,
-    state_cb: Arc<Mutex<Option<DataCb>>>,
+    // Push callback + pull latest-wins slot, bundled per stream.
+    action: Arc<DataSlots>,
+    state: Arc<DataSlots>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
-    video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
-
-    // Latest-wins slots (pull API). Parallel to the callback slots — updated
-    // on every receive regardless of whether a callback is registered.
-    action_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
-    state_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
-    video_latest: HashMap<String, Arc<Mutex<Option<VideoFrameData>>>>,
+    video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
 
     metrics: Arc<MetricsRegistry>,
 }
 
 impl Portal {
     pub fn new(config: PortalConfig) -> Self {
-        let video_cbs: HashMap<_, _> = config
+        let video_tracks: HashMap<_, _> = config
             .video_tracks
             .iter()
-            .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
-            .collect();
-        let video_latest: HashMap<_, _> = config
-            .video_tracks
-            .iter()
-            .map(|name| (name.clone(), Arc::new(Mutex::new(None))))
+            .map(|name| (name.clone(), Arc::new(VideoTrackSlots::new())))
             .collect();
 
         let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
@@ -144,25 +132,22 @@ impl Portal {
 
         Self {
             config,
-            state: Mutex::new(ConnectionState { room: None, event_task: None, rtt: None }),
+            conn: Mutex::new(ConnectionState { room: None, event_task: None, rtt: None }),
             video_receivers: Arc::new(Mutex::new(HashMap::new())),
             video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
             action_publisher: Mutex::new(None),
             sync_buffer: Mutex::new(None),
             obs_sink,
-            action_cb: Arc::new(Mutex::new(None)),
-            state_cb: Arc::new(Mutex::new(None)),
-            video_cbs,
-            action_latest: Arc::new(Mutex::new(None)),
-            state_latest: Arc::new(Mutex::new(None)),
-            video_latest,
+            action: Arc::new(DataSlots::new()),
+            state: Arc::new(DataSlots::new()),
+            video_tracks,
             metrics,
         }
     }
 
     pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
-        if self.state.lock().room.is_some() {
+        if self.conn.lock().room.is_some() {
             return Err(PortalError::AlreadyConnected);
         }
 
@@ -194,13 +179,10 @@ impl Portal {
             config: self.config.clone(),
             sync_buffer: self.sync_buffer.lock().clone(),
             obs_sink: self.obs_sink.clone(),
-            action_cb: self.action_cb.clone(),
-            state_cb: self.state_cb.clone(),
-            video_cbs: self.video_cbs.clone(),
+            action: self.action.clone(),
+            state: self.state.clone(),
+            video_tracks: self.video_tracks.clone(),
             video_receivers: self.video_receivers.clone(),
-            action_latest: self.action_latest.clone(),
-            state_latest: self.state_latest.clone(),
-            video_latest: self.video_latest.clone(),
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
         };
@@ -211,7 +193,7 @@ impl Portal {
             }
         });
 
-        let mut state = self.state.lock();
+        let mut state = self.conn.lock();
         state.room = Some(room);
         state.event_task = Some(event_handle);
         state.rtt = Some(rtt);
@@ -259,14 +241,14 @@ impl Portal {
     }
 
     pub async fn disconnect(&self) -> PortalResult<()> {
-        let room = self.state.lock().room.take();
+        let room = self.conn.lock().room.take();
         log::info!("disconnecting");
         if let Some(room) = room {
             room.close().await.map_err(|e| PortalError::Room(e.to_string()))?;
         }
 
         {
-            let mut state = self.state.lock();
+            let mut state = self.conn.lock();
             if let Some(task) = state.event_task.take() {
                 task.abort();
             }
@@ -288,10 +270,10 @@ impl Portal {
             sb.lock().clear();
         }
         self.obs_sink.clear();
-        *self.action_latest.lock() = None;
-        *self.state_latest.lock() = None;
-        for slot in self.video_latest.values() {
-            *slot.lock() = None;
+        self.action.clear();
+        self.state.clear();
+        for slots in self.video_tracks.values() {
+            slots.clear();
         }
 
         Ok(())
@@ -308,31 +290,31 @@ impl Portal {
 
     /// Clone of the latest action received (Robot side), or `None`.
     pub fn get_action(&self) -> Option<HashMap<String, f64>> {
-        self.action_latest.lock().clone()
+        self.action.latest.lock().clone()
     }
 
     /// Clone of the latest state received (Operator side), or `None`.
     pub fn get_state(&self) -> Option<HashMap<String, f64>> {
-        self.state_latest.lock().clone()
+        self.state.latest.lock().clone()
     }
 
     /// Clone of the latest frame received for `track_name`, or `None`.
     pub fn get_video_frame(&self, track_name: &str) -> Option<VideoFrameData> {
-        self.video_latest.get(track_name).and_then(|s| s.lock().clone())
+        self.video_tracks.get(track_name).and_then(|s| s.latest.lock().clone())
     }
 
     // --- Callback registration (push API) ---
 
-    pub fn on_action(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
-        *self.action_cb.lock() = Some(Box::new(callback));
+    pub fn on_action(&self, callback: impl Fn(&HashMap<String, f64>) + Send + Sync + 'static) {
+        *self.action.cb.lock() = Some(Box::new(callback));
     }
 
     pub fn on_observation(&self, callback: impl Fn(&Observation) + Send + Sync + 'static) {
         self.obs_sink.set_observation_cb(Box::new(callback));
     }
 
-    pub fn on_state(&self, callback: impl Fn(HashMap<String, f64>) + Send + Sync + 'static) {
-        *self.state_cb.lock() = Some(Box::new(callback));
+    pub fn on_state(&self, callback: impl Fn(&HashMap<String, f64>) + Send + Sync + 'static) {
+        *self.state.cb.lock() = Some(Box::new(callback));
     }
 
     pub fn on_video_frame(
@@ -340,8 +322,8 @@ impl Portal {
         track_name: &str,
         callback: impl Fn(&str, &VideoFrameData) + Send + Sync + 'static,
     ) {
-        match self.video_cbs.get(track_name) {
-            Some(cb_slot) => *cb_slot.lock() = Some(Box::new(callback)),
+        match self.video_tracks.get(track_name) {
+            Some(slots) => *slots.cb.lock() = Some(Box::new(callback)),
             None => log::warn!(
                 "on_video_frame: track '{track_name}' is not registered — callback ignored"
             ),
@@ -442,13 +424,10 @@ struct EventContext {
     config: PortalConfig,
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
     obs_sink: Arc<ObservationSink>,
-    action_cb: Arc<Mutex<Option<DataCb>>>,
-    state_cb: Arc<Mutex<Option<DataCb>>>,
-    video_cbs: HashMap<String, Arc<Mutex<Option<VideoCb>>>>,
+    action: Arc<DataSlots>,
+    state: Arc<DataSlots>,
+    video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
-    action_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
-    state_latest: Arc<Mutex<Option<HashMap<String, f64>>>>,
-    video_latest: HashMap<String, Arc<Mutex<Option<VideoFrameData>>>>,
     metrics: Arc<MetricsRegistry>,
     rtt: Arc<RttService>,
 }
@@ -467,16 +446,11 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                         ctx.config.session
                     );
                     if let Some(sync_buffer) = &ctx.sync_buffer {
-                        let raw_cb = ctx
-                            .video_cbs
+                        let slots = ctx
+                            .video_tracks
                             .get(track_name.as_str())
                             .cloned()
-                            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
-                        let latest = ctx
-                            .video_latest
-                            .get(track_name.as_str())
-                            .cloned()
-                            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+                            .unwrap_or_else(|| Arc::new(VideoTrackSlots::new()));
                         let track_metrics = ctx
                             .metrics
                             .track(track_name.as_str())
@@ -487,8 +461,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                             track_name.to_string(),
                             stream,
                             sync_buffer.clone(),
-                            raw_cb,
-                            latest,
+                            slots,
                             ctx.obs_sink.clone(),
                             track_metrics,
                         );
@@ -497,25 +470,21 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 }
             }
         }
-        RoomEvent::DataReceived { payload, topic, .. } => {
-            if let Some(topic) = &topic {
-                let output = handle_data_received(
-                    &payload,
-                    topic,
-                    ctx.config.role,
-                    &ctx.config.action_fields,
-                    &ctx.config.state_fields,
-                    &ctx.action_cb,
-                    &ctx.state_cb,
-                    &ctx.action_latest,
-                    &ctx.state_latest,
-                    ctx.sync_buffer.as_ref(),
-                    &ctx.metrics,
-                    &ctx.rtt,
-                );
-                if !output.is_empty() {
-                    ctx.obs_sink.dispatch(output);
-                }
+        RoomEvent::DataReceived { payload, topic: Some(topic), .. } => {
+            let output = handle_data_received(
+                &payload,
+                &topic,
+                ctx.config.role,
+                &ctx.config.action_fields,
+                &ctx.config.state_fields,
+                &ctx.action,
+                &ctx.state,
+                ctx.sync_buffer.as_ref(),
+                &ctx.metrics,
+                &ctx.rtt,
+            );
+            if !output.is_empty() {
+                ctx.obs_sink.dispatch(output);
             }
         }
         RoomEvent::Reconnected => {

@@ -24,22 +24,20 @@ pub struct VideoFrameData {
     pub timestamp_us: u64,
 }
 
-/// Sync configuration with sensible defaults for 60fps robotics.
+/// Internal sync configuration, derived from `PortalConfig` knobs.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncConfig {
     pub video_buffer_size: u32,
     pub state_buffer_size: u32,
     pub search_range_us: u64,
-    pub observation_buffer_size: u32,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            video_buffer_size: 5,       // ~83ms at 60fps
-            state_buffer_size: 5,       // ~83ms at 60fps
-            search_range_us: 10_000,    // 10ms — half a frame interval at 60fps
-            observation_buffer_size: 3, // ~50ms of consumer headroom
+            video_buffer_size: 5,    // ~83ms at 60fps
+            state_buffer_size: 5,    // ~83ms at 60fps
+            search_range_us: 10_000, // 10ms — half a frame interval at 60fps
         }
     }
 }

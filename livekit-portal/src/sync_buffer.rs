@@ -521,7 +521,6 @@ mod tests {
             video_buffer_size: 1,
             state_buffer_size: 10,
             search_range_us: 30_000,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 
@@ -642,7 +641,6 @@ mod tests {
             video_buffer_size: 10,
             state_buffer_size: 10,
             search_range_us: 500,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 
@@ -667,7 +665,6 @@ mod tests {
             video_buffer_size: 10,
             state_buffer_size: 10,
             search_range_us: 500,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 

@@ -73,13 +73,11 @@ impl PortalConfig {
         self.ping_ms = ms;
     }
 
-    /// Derived sync config used internally by the sync buffer and observation
-    /// sink. Not part of the public API.
+    /// Derived sync config used internally by the sync buffer. Not public.
     pub(crate) fn sync_config(&self) -> SyncConfig {
         SyncConfig {
             video_buffer_size: self.slack,
             state_buffer_size: self.slack,
-            observation_buffer_size: self.slack,
             search_range_us: 1_000_000 / (2 * self.fps as u64),
         }
     }

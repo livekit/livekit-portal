@@ -101,7 +101,34 @@ impl Drop for DataPublisher {
 
 // --- Receiver (dispatches DataReceived events) ---
 
-pub(crate) type DataCb = Box<dyn Fn(HashMap<String, f64>) + Send + Sync>;
+pub(crate) type DataCb = Box<dyn Fn(&HashMap<String, f64>) + Send + Sync>;
+
+/// Push callback + latest-wins slot for a single data stream (state or action),
+/// paired so receivers and getters share one allocation.
+pub(crate) struct DataSlots {
+    pub cb: Mutex<Option<DataCb>>,
+    pub latest: Mutex<Option<HashMap<String, f64>>>,
+}
+
+impl DataSlots {
+    pub fn new() -> Self {
+        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
+    }
+
+    /// Build the field map once, fire the callback by reference (no clone),
+    /// then hand ownership to the latest slot.
+    fn deliver(&self, fields: &[String], values: &[f64]) {
+        let map = to_field_map(fields, values);
+        if let Some(cb) = self.cb.lock().as_ref() {
+            cb(&map);
+        }
+        *self.latest.lock() = Some(map);
+    }
+
+    pub fn clear(&self) {
+        *self.latest.lock() = None;
+    }
+}
 
 /// Handle a `DataReceived` event. Pushes into the sync buffer if applicable and
 /// returns any observations/drops that resulted, for the caller to dispatch
@@ -113,10 +140,8 @@ pub(crate) fn handle_data_received(
     config_role: Role,
     action_fields: &[String],
     state_fields: &[String],
-    action_cb: &Mutex<Option<DataCb>>,
-    state_cb: &Mutex<Option<DataCb>>,
-    action_latest: &Mutex<Option<HashMap<String, f64>>>,
-    state_latest: &Mutex<Option<HashMap<String, f64>>>,
+    action: &DataSlots,
+    state: &DataSlots,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
     metrics: &MetricsRegistry,
     rtt: &RttService,
@@ -129,22 +154,14 @@ pub(crate) fn handle_data_received(
         (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
             Ok((send_ts, values)) => {
                 metrics.record_action_received(send_ts, now_us());
-                let map = to_field_map(action_fields, &values);
-                if let Some(cb) = action_cb.lock().as_ref() {
-                    cb(map.clone());
-                }
-                *action_latest.lock() = Some(map);
+                action.deliver(action_fields, &values);
             }
             Err(e) => log::warn!("failed to deserialize action payload: {e}"),
         },
         (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
             Ok((timestamp_us, values)) => {
                 metrics.record_state_received(timestamp_us, now_us());
-                let map = to_field_map(state_fields, &values);
-                if let Some(cb) = state_cb.lock().as_ref() {
-                    cb(map.clone());
-                }
-                *state_latest.lock() = Some(map);
+                state.deliver(state_fields, &values);
                 if let Some(sb) = sync_buffer {
                     return sb.lock().push_state(timestamp_us, values);
                 }
