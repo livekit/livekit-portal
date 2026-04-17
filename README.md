@@ -76,6 +76,7 @@ Portal assumes unified sampling — the robot captures state + frames at the sam
 ```python
 config.set_fps(30)            # unified capture rate (default: 30)
 config.set_slack(5)           # ticks of pipeline headroom (default: 5)
+config.set_tolerance(1.5)     # match window in tick units (default: 1.5)
 
 config.set_state_reliable(True)   # default: True
 config.set_action_reliable(True)  # default: True
@@ -83,9 +84,14 @@ config.set_action_reliable(True)  # default: True
 config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
 ```
 
-**`fps`** — the unified sampling rate. Derives `search_range = 1/(2·fps)`, so at 30fps a state matches a frame within ~16.6ms. Raise to 60 for high-rate robots.
+**`fps`** — unified sampling rate (use the video rate if video and state differ). Drives the match window with `tolerance`. Raise to 60 for high-rate robots.
 
-**`slack`** — ticks of pipeline headroom: the per-track video sync buffer, the state sync buffer, and the pull-side observation slot all use this. Larger values tolerate more network jitter and loss-detection latency at the cost of staleness. 5 ticks (≈83ms at 60fps) is comfortable; the minimum useful value is 2.
+**`slack`** — ticks of pipeline headroom: the per-track video sync buffer and the state sync buffer use this. Larger values tolerate more jitter and loss-detection latency at the cost of staleness. Minimum useful value is 2; default 5 ≈ 167ms at 30fps.
+
+**`tolerance`** — how far a state reaches when matching a frame, in tick units. `search_range = tolerance / fps`.
+- `0.5` (tight) — match only within half a tick. A single lost frame drops the observation. Best for real-time control.
+- `1.5` (default, widened) — state falls back to the ±1 neighbor frame if its native frame was lost. Preserves observations at the cost of ±1-tick misalignment. Best for data collection and lossy links. A fair-share check prevents earlier states from stealing neighbor frames.
+- `> 2.0` — allows T±2 matches. Higher recovery but the misalignment risk outweighs the benefit for most setups.
 
 **Reliability** — state and action use reliable (lossless, ordered) SCTP delivery by default. For high-frequency control where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss. Video is always unreliable (RTP).
 

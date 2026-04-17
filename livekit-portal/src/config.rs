@@ -12,6 +12,7 @@ pub struct PortalConfig {
     pub(crate) action_reliable: bool,
     pub(crate) fps: u32,
     pub(crate) slack: u32,
+    pub(crate) tolerance: f32,
     pub(crate) ping_ms: u64,
 }
 
@@ -27,6 +28,7 @@ impl PortalConfig {
             action_reliable: true,
             fps: 30,
             slack: 5,
+            tolerance: 1.5,
             ping_ms: 1000,
         }
     }
@@ -43,11 +45,30 @@ impl PortalConfig {
         self.action_fields.extend(fields.iter().map(|s| s.to_string()));
     }
 
-    /// Unified observation rate. All sync parameters derive from this:
-    /// sender captures state + frames at this rate, and `search_range = 1/(2·fps)`.
+    /// Unified observation rate (set to the video capture rate if state and
+    /// video differ). Drives `search_range = tolerance/fps`.
     pub fn set_fps(&mut self, fps: u32) {
         assert!(fps > 0, "fps must be > 0");
         self.fps = fps;
+    }
+
+    /// How far (in tick intervals at `fps`) a state may reach when matching
+    /// a video frame. `search_range = tolerance / fps`.
+    ///
+    /// - `0.5` (tight): state only matches a frame within ±half a tick.
+    ///   One lost frame → one dropped observation. Lowest misalignment risk.
+    /// - `1.5` (default, widened): state matches its own frame, or falls
+    ///   back to T±1 if its native frame was lost. Preserves observations
+    ///   at the cost of occasional ±1-tick misalignment. A fair-share check
+    ///   prevents an earlier state from stealing a frame closer to a later
+    ///   state already in the buffer.
+    /// - `> 2.0`: state may match T±2 frames. Higher recovery, higher
+    ///   misalignment risk. Rarely worth it.
+    ///
+    /// Values must be in `(0, ∞)`. Defaults to `1.5`.
+    pub fn set_tolerance(&mut self, ticks: f32) {
+        assert!(ticks > 0.0, "tolerance must be > 0");
+        self.tolerance = ticks;
     }
 
     /// Ticks of pipeline headroom — how much jitter, loss-detection latency,
@@ -75,10 +96,11 @@ impl PortalConfig {
 
     /// Derived sync config used internally by the sync buffer. Not public.
     pub(crate) fn sync_config(&self) -> SyncConfig {
+        let search_range_us = (self.tolerance * 1_000_000.0 / self.fps as f32) as u64;
         SyncConfig {
             video_buffer_size: self.slack,
             state_buffer_size: self.slack,
-            search_range_us: 1_000_000 / (2 * self.fps as u64),
+            search_range_us,
         }
     }
 }

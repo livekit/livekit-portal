@@ -129,14 +129,17 @@ The pull API is peek-style: `get_*()` always returns the most recent value (or `
 All tuning is set on the config object before connecting. Portal is built around unified sampling: the robot captures state + frames at the same tick rate, so a single `fps` knob derives the sync search window, and a single `slack` knob sizes all internal buffers.
 
 ```python
-config.set_fps(30)               # unified capture rate; derives search_range = 1/(2·fps)
+config.set_fps(30)               # unified capture rate (video rate if asymmetric); tolerance*fps = search window
 config.set_slack(5)              # ticks of pipeline headroom (video + state sync buffers)
+config.set_tolerance(1.5)        # ticks of match window. 0.5 = tight (drop on loss); 1.5 = ±1 neighbor fallback
 
 config.set_state_reliable(True)  # default: True. reliable = lossless ordered delivery, unreliable = lowest latency
 config.set_action_reliable(True) # default: True. use False for high-frequency inference where latest value matters most
 
 config.set_ping_ms(1000)         # default: 1000. set 0 to disable RTT pinging on this side
 ```
+
+**Tolerance tradeoff**: at `tolerance=0.5`, a state only matches a frame within half a tick — a single lost frame drops the observation (precision over recovery). At the default `tolerance=1.5`, a state can fall back to the adjacent frame (T±1) if its own was lost, preserving the observation at the cost of ±1 tick of misalignment. A fair-share check prevents an earlier state from stealing a frame that a later state in the buffer has a closer claim to. Values `>2.0` allow T±2 fallback (rarely worth it). Pick **tight (≤1.0)** for real-time control where misalignment is unsafe; pick **widened (≥1.5)** for data collection or lossy links where dropping is worse than slight misalignment.
 
 ### Metrics
 
