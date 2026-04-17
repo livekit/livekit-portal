@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -83,7 +83,9 @@ pub(crate) struct MetricsRegistry {
     observations_emitted: AtomicU64,
     states_dropped: AtomicU64,
     match_deltas: Mutex<SampleRing>,
-    last_blocker_track: Mutex<Option<String>>,
+    // Index into `track_order`; `usize::MAX` means "no blocker recorded".
+    // Stored as an atomic so `record_blocker` allocates nothing on the hot path.
+    last_blocker_track: AtomicUsize,
 
     rtt_samples: Mutex<SampleRing>,
     // 0 sentinel = "no sample yet"; samples of 0 are bumped to 1 on record.
@@ -110,7 +112,7 @@ impl MetricsRegistry {
             observations_emitted: AtomicU64::new(0),
             states_dropped: AtomicU64::new(0),
             match_deltas: Mutex::new(SampleRing::new(SAMPLE_RING_CAP)),
-            last_blocker_track: Mutex::new(None),
+            last_blocker_track: AtomicUsize::new(usize::MAX),
             rtt_samples: Mutex::new(SampleRing::new(SAMPLE_RING_CAP)),
             rtt_last: AtomicU64::new(0),
             pings_sent: AtomicU64::new(0),
@@ -148,8 +150,8 @@ impl MetricsRegistry {
         self.states_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn record_blocker(&self, track_name: &str) {
-        *self.last_blocker_track.lock() = Some(track_name.to_string());
+    pub fn record_blocker(&self, track_index: usize) {
+        self.last_blocker_track.store(track_index, Ordering::Relaxed);
     }
 
     pub fn record_ping_sent(&self) {
@@ -192,13 +194,18 @@ impl MetricsRegistry {
         let rtt_last_raw = self.rtt_last.load(Ordering::Relaxed);
         let rtt_us_last = (rtt_last_raw != 0).then_some(rtt_last_raw);
 
+        let last_blocker_track = {
+            let idx = self.last_blocker_track.load(Ordering::Relaxed);
+            (idx != usize::MAX).then(|| self.track_order.get(idx).cloned()).flatten()
+        };
+
         PortalMetrics {
             sync: SyncMetrics {
                 observations_emitted: self.observations_emitted.load(Ordering::Relaxed),
                 states_dropped: self.states_dropped.load(Ordering::Relaxed),
                 match_delta_us_p50: match_p50,
                 match_delta_us_p95: match_p95,
-                last_blocker_track: self.last_blocker_track.lock().clone(),
+                last_blocker_track,
             },
             transport: TransportMetrics {
                 frames_sent,
@@ -232,7 +239,7 @@ impl MetricsRegistry {
         self.observations_emitted.store(0, Ordering::Relaxed);
         self.states_dropped.store(0, Ordering::Relaxed);
         self.match_deltas.lock().clear();
-        *self.last_blocker_track.lock() = None;
+        self.last_blocker_track.store(usize::MAX, Ordering::Relaxed);
         self.rtt_samples.lock().clear();
         self.rtt_last.store(0, Ordering::Relaxed);
         self.pings_sent.store(0, Ordering::Relaxed);
@@ -413,7 +420,7 @@ mod tests {
         reg.track("cam1").unwrap().record_sent();
         reg.record_observation(500);
         reg.record_rtt(1000);
-        reg.record_blocker("cam1");
+        reg.record_blocker(0);
 
         reg.reset();
         let snap = reg.snapshot(HashMap::new(), 0);

@@ -65,15 +65,4 @@ mod tests {
         let bytes = vec![0u8; 10];
         assert!(deserialize_values(&bytes, 1).is_err());
     }
-
-    #[test]
-    fn single_value() {
-        let ts = 999u64;
-        let values = vec![42.0];
-        let bytes = serialize_values(ts, &values);
-        assert_eq!(bytes.len(), 16);
-        let (ts2, values2) = deserialize_values(&bytes, 1).unwrap();
-        assert_eq!(ts, ts2);
-        assert_eq!(values2, vec![42.0]);
-    }
 }

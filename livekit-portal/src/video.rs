@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,9 @@ impl VideoPublisher {
     }
 
     pub async fn publish(&self, local_participant: &LocalParticipant) -> PortalResult<()> {
+        // user_timestamp is mandatory: the receive path uses it to align frames
+        // with state, and panics if it is missing. Subscribed tracks produced
+        // by publishers that don't set this trailer are unsupported.
         let mut features = PacketTrailerFeatures::default();
         features.user_timestamp = true;
         let options = TrackPublishOptions {
@@ -57,21 +61,27 @@ impl VideoPublisher {
 
     pub fn send_frame(
         &self,
-        i420_data: &[u8],
+        rgb_data: &[u8],
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let expected_size = (width * height * 3 / 2) as usize;
-        if i420_data.len() != expected_size {
+        // I420 packs U and V at half resolution in each axis. Odd dimensions
+        // would silently desynchronize plane sizes (width/2 truncates), so
+        // reject up front rather than copy garbage into the chroma planes.
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(PortalError::InvalidFrameDimensions { width, height });
+        }
+        let expected_size = (width * height * 3) as usize;
+        if rgb_data.len() != expected_size {
             return Err(PortalError::WrongFrameSize {
                 expected: expected_size,
-                got: i420_data.len(),
+                got: rgb_data.len(),
             });
         }
         let ts = timestamp_us.unwrap_or_else(now_us);
         let mut buffer = I420Buffer::new(width, height);
-        copy_i420_data(i420_data, &mut buffer);
+        rgb_to_i420(rgb_data, width, height, &mut buffer);
         let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
         frame.frame_metadata = Some(FrameMetadata { user_timestamp: Some(ts), frame_id: None });
         self.source.capture_frame(&frame);
@@ -117,6 +127,10 @@ impl VideoReceiver {
         let handle = tokio::spawn(async move {
             let mut stream = stream;
             while let Some(frame) = stream.next().await {
+                // Hard requirement: every frame must carry a user_timestamp.
+                // Portal-published tracks set this automatically; subscribed
+                // tracks from other publishers must do the same. See the
+                // "Sender requirement" note in README.md.
                 let timestamp_us = frame
                     .frame_metadata
                     .and_then(|m| m.user_timestamp)
@@ -156,22 +170,52 @@ fn convert_frame<T: AsRef<dyn VideoBuffer>>(
 ) -> VideoFrameData {
     let i420 = frame.buffer.as_ref().to_i420();
     let (y, u, v) = i420.data();
-    let mut data = Vec::with_capacity(y.len() + u.len() + v.len());
-    data.extend_from_slice(y);
-    data.extend_from_slice(u);
-    data.extend_from_slice(v);
-    VideoFrameData { width: i420.width(), height: i420.height(), data: data.into(), timestamp_us }
+    let total = y.len() + u.len() + v.len();
+
+    // Build the Arc payload in a single allocation/copy. The naive
+    // `Vec::extend_from_slice * 3` followed by `Arc::from(vec)` allocates
+    // twice and copies twice — at 640x480 that's ~460KB doubled per frame.
+    let mut data: Arc<[MaybeUninit<u8>]> = Arc::new_uninit_slice(total);
+    {
+        // SAFETY: freshly allocated Arc, no other references exist.
+        let dst = Arc::get_mut(&mut data).expect("freshly allocated Arc has unique ownership");
+        // SAFETY: dst is exactly `total` bytes, sources are independent of
+        // dst, and MaybeUninit<u8> shares u8's layout.
+        unsafe {
+            let p = dst.as_mut_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(y.as_ptr(), p, y.len());
+            std::ptr::copy_nonoverlapping(u.as_ptr(), p.add(y.len()), u.len());
+            std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(y.len() + u.len()), v.len());
+        }
+    }
+    // SAFETY: every byte was initialized by the three copies above.
+    let data: Arc<[u8]> = unsafe { data.assume_init() };
+
+    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
 }
 
-fn copy_i420_data(src: &[u8], buffer: &mut I420Buffer) {
-    let width = buffer.width() as usize;
-    let height = buffer.height() as usize;
-    let y_size = width * height;
-    let uv_size = (width / 2) * (height / 2);
+// RGB24 (R,G,B byte order) -> I420 via libyuv. libyuv's `RAW` format is R,G,B;
+// its `RGB24` is B,G,R. We advertise RGB, so RAWToI420 is the correct call.
+fn rgb_to_i420(src: &[u8], width: u32, height: u32, buffer: &mut I420Buffer) {
+    let (sy, su, sv) = buffer.strides();
     let (y_dst, u_dst, v_dst) = buffer.data_mut();
-    y_dst[..y_size].copy_from_slice(&src[..y_size]);
-    u_dst[..uv_size].copy_from_slice(&src[y_size..y_size + uv_size]);
-    v_dst[..uv_size].copy_from_slice(&src[y_size + uv_size..y_size + 2 * uv_size]);
+    // SAFETY: `src` has width*height*3 bytes (checked by caller); dst planes
+    // are sized by I420Buffer::new(width, height); strides come from the
+    // buffer itself. libyuv only reads/writes within these bounds.
+    unsafe {
+        yuv_sys::rs_RAWToI420(
+            src.as_ptr(),
+            (width * 3) as i32,
+            y_dst.as_mut_ptr(),
+            sy as i32,
+            u_dst.as_mut_ptr(),
+            su as i32,
+            v_dst.as_mut_ptr(),
+            sv as i32,
+            width as i32,
+            height as i32,
+        );
+    }
 }
 
 pub(crate) fn now_us() -> u64 {

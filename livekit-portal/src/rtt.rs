@@ -11,12 +11,17 @@ use crate::video::now_us;
 pub(crate) const RTT_TOPIC: &str = "portal_rtt";
 const PING_KIND: u8 = 0;
 const PONG_KIND: u8 = 1;
+/// Bound on the in-flight RTT packet queue. Pings are 1Hz by default and
+/// pongs are echoed 1:1, so a healthy peer never queues more than a handful.
+/// The cap is a backstop; on overflow we drop without warn since RTT is
+/// best-effort and a noisy log adds nothing.
+const RTT_QUEUE_CAP: usize = 64;
 
 /// Handles both outbound pings (on a timer) and outbound pongs (echoes of
-/// received pings), serialized through a single unbounded channel so the
+/// received pings), serialized through a single bounded channel so the
 /// receive handler can enqueue a pong without awaiting.
 pub(crate) struct RttService {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
     ping_task: Option<JoinHandle<()>>,
     send_task: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
@@ -28,7 +33,7 @@ impl RttService {
         ping_interval_ms: u64,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(RTT_QUEUE_CAP);
 
         let lp_send = local_participant;
         let send_task = tokio::spawn(async move {
@@ -59,10 +64,13 @@ impl RttService {
                     let mut payload = Vec::with_capacity(9);
                     payload.push(PING_KIND);
                     payload.extend_from_slice(&ts.to_le_bytes());
-                    if tx_ping.send(payload).is_err() {
-                        break;
+                    match tx_ping.try_send(payload) {
+                        Ok(()) => metrics_ping.record_ping_sent(),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Send loop is backed up; skip this ping.
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
-                    metrics_ping.record_ping_sent();
                 }
             }))
         } else {
@@ -85,7 +93,9 @@ impl RttService {
                 let mut pong = Vec::with_capacity(9);
                 pong.push(PONG_KIND);
                 pong.extend_from_slice(&send_ts.to_le_bytes());
-                let _ = self.tx.send(pong);
+                // Drop on full / closed: pong loss only inflates RTT for one
+                // sample and the peer will retry on its next ping.
+                let _ = self.tx.try_send(pong);
             }
             PONG_KIND => {
                 let rtt = now_us().saturating_sub(send_ts);
