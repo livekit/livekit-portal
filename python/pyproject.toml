@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.20"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livekit-portal"
+version = "0.1.0"
+description = "Python bindings for livekit-portal. robot ↔ operator sync over LiveKit"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # protobuf>=7: the generated _pb2.py files are gencode 7.34.x, which the
+    # 7.x runtime is required to load. Compatible with livekit-api (>=4).
+    "protobuf>=7",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+examples = [
+    "livekit-api>=0.7",
+    "python-dotenv>=1",
+]
+
+# The Rust cdylib is built out-of-band via `scripts/build_native.sh` and
+# copied into `livekit_portal/`. For local dev, `LIVEKIT_PORTAL_FFI_LIB` can
+# point at the cdylib directly (e.g. in target/release/).
+
+# PEP 420 implicit namespace package: `livekit` has no __init__.py so it can
+# coexist with livekit-api (`livekit.api`), livekit-protocol (`livekit.protocol`),
+# etc. Listing `livekit` as the package keeps hatchling's editable .pth pointed
+# at the package root so `from livekit.portal import ...` resolves.
+[tool.hatch.build.targets.wheel]
+packages = ["livekit"]
+artifacts = [
+    "livekit/portal/liblivekit_portal_ffi.dylib",
+    "livekit/portal/liblivekit_portal_ffi.so",
+    "livekit/portal/livekit_portal_ffi.dll",
+]
+
+[tool.hatch.build]
+exclude = ["tests", "examples", ".venv", ".pytest_cache"]

@@ -347,7 +347,7 @@ impl Portal {
                 .metrics
                 .track(track_name)
                 .expect("track metrics registered at construction");
-            let publisher = VideoPublisher::new(track_name, track_metrics);
+            let publisher = VideoPublisher::new(track_name, track_metrics, self.config.fps);
             if let Err(e) = publisher.publish(&lp).await {
                 // Roll back any earlier publishers so their send tasks stop
                 // and connect() leaves Portal in a clean state.

@@ -13,6 +13,18 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+.pytest_cache/
+
+# Env files — keep `.env.example` as a committed template.
+.env
+.env.*
+!.env.example
+
+# Built cdylib (copied in by scripts/build_native.sh)
+python/livekit/portal/liblivekit_portal_ffi.dylib
+python/livekit/portal/liblivekit_portal_ffi.so
+python/livekit/portal/livekit_portal_ffi.dll
 
 # OS
 .DS_Store
