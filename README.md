@@ -93,6 +93,34 @@ config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
 - `1.5` (default, widened) — state falls back to the ±1 neighbor frame if its native frame was lost. Preserves observations at the cost of ±1-tick misalignment. Best for data collection and lossy links. A fair-share check prevents earlier states from stealing neighbor frames.
 - `> 2.0` — allows T±2 matches. Higher recovery but the misalignment risk outweighs the benefit for most setups.
 
+### Choosing `tolerance`
+
+| Use case | Pick | Why |
+|---|---|---|
+| Real-time inference / control | `0.5` | Misalignment (acting on a visibly different frame) is worse than dropping. A drop is an explicit signal; a misaligned observation is silently wrong. |
+| Data collection for VLA training | `1.5` | Every observation is a training sample. A ±1-tick misalignment (~16ms at 60fps) is usually invisible to a trained model; a dropped observation is lost data. |
+| Teleop viewer | `1.5` | Visual continuity matters more than frame-perfect state alignment. |
+| Clean local network (<1% loss) | either | Drops are already rare. Default is fine. |
+| Lossy / cellular / wireless | `1.5` | Widening materially reduces drop rate under real loss conditions. |
+| Strict-alignment datasets | `0.5` | If downstream tooling relies on exact state/frame pairing, drops are cheaper than mislabeled pairs. |
+
+### Asymmetric rates (video faster than state)
+
+The library handles video > state rates transparently — intervening frames between state ticks get drained at match time and don't pile up, **provided the buffer is large enough**. Two rules:
+
+1. **Set `fps` to the video rate**, not the state rate. The match window is measured in frame intervals, so it has to know the video cadence. Example: video 60fps, state 30Hz → `set_fps(60)`.
+2. **Set `slack ≥ ceil(video_rate / state_rate) + 1`**. Between consecutive state matches, roughly `video_rate / state_rate` frames accumulate per track; slack must cover that plus jitter headroom. At default slack=5 the library cleanly handles up to ~4× asymmetry. For 10× asymmetry (video 60fps, state 6Hz), bump to `slack=12` or so.
+
+Example: video 60fps, state 10Hz (asymmetric teleop with slow sensor):
+
+```python
+config.set_fps(60)
+config.set_slack(8)          # ceil(60/10) + 2 = 8
+config.set_tolerance(1.5)    # still measured in video-tick intervals (~16.6ms each)
+```
+
+One thing to note: under asymmetric rates, the overall drop rate is proportional to `state_rate × video_loss_rate`, not the video rate. Losing a video frame that happened to fall on a state tick costs one observation; losing a video frame between state ticks costs nothing (it would have been drained anyway).
+
 **Reliability** — state and action use reliable (lossless, ordered) SCTP delivery by default. For high-frequency control where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss. Video is always unreliable (RTP).
 
 ## Language support
