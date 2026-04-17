@@ -8,7 +8,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# scripts/ lives at packages/livekit-portal/scripts/ under the python workspace,
+# so repo root is four levels up from here.
+REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 PROTO_SRC="$REPO_ROOT/livekit-portal-ffi/protocol"
 OUT_DIR="$HERE/../livekit/portal/_proto"
 
@@ -33,6 +35,25 @@ protoc \
     -I "$PROTO_SRC" \
     --python_out="$OUT_DIR" \
     "$PROTO_SRC"/*.proto
+
+# Rewrite the gencode runtime-version check so the _pb2.py files load on
+# protobuf >= 5.26 instead of requiring the protobuf 7 runtime (which lerobot's
+# transitive deps currently cap out of). The check is a no-op on a newer
+# runtime, so this widens compatibility without losing safety.
+for f in "$OUT_DIR"/*_pb2.py; do
+    python3 - "$f" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+s = re.sub(
+    r"_runtime_version\.ValidateProtobufRuntimeVersion\(\s*_runtime_version\.Domain\.PUBLIC,\s*\d+,\s*\d+,\s*\d+,",
+    "_runtime_version.ValidateProtobufRuntimeVersion(\n    _runtime_version.Domain.PUBLIC,\n    5,\n    26,\n    0,",
+    s,
+)
+s = re.sub(r"# Protobuf Python Version: [\d.]+", "# Protobuf Python Version: 5.26.0 (downgraded for protobuf>=5)", s)
+p.write_text(s)
+PY
+done
 
 # Generated files use flat `import foo_pb2` statements which fail when loaded
 # inside a Python package. Our hand-written __init__.py puts $OUT_DIR on

@@ -4,7 +4,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# scripts/ lives at packages/livekit-portal/scripts/ under the python workspace,
+# so repo root is four levels up from here.
+REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 PKG_DIR="$HERE/../livekit/portal"
 
 MODE="${1:-release}"

@@ -21,10 +21,11 @@ build/
 .env.*
 !.env.example
 
-# Built cdylib (copied in by scripts/build_native.sh)
-python/livekit/portal/liblivekit_portal_ffi.dylib
-python/livekit/portal/liblivekit_portal_ffi.so
-python/livekit/portal/livekit_portal_ffi.dll
+# Built cdylib (copied in by scripts/build_native.sh).
+# Match at any depth so it covers the workspace layout under packages/.
+**/livekit/portal/liblivekit_portal_ffi.dylib
+**/livekit/portal/liblivekit_portal_ffi.so
+**/livekit/portal/livekit_portal_ffi.dll
 
 # OS
 .DS_Store
