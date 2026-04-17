@@ -16,6 +16,12 @@ use crate::video::now_us;
 
 // --- Publisher ---
 
+/// Bound on the in-flight publish queue. Sized for ~10s at 100Hz so normal
+/// operation never hits it. The bound exists so a stalled publish loop
+/// (slow SFU, lossy link) cannot grow memory without limit; on overflow we
+/// drop and warn rather than block the synchronous send path.
+const PUBLISH_QUEUE_CAP: usize = 1024;
+
 /// Publishes serialized state/action packets. Spawns a single background task
 /// at construction; `send` enqueues onto an mpsc channel, preserving ordering
 /// for reliable publishes and avoiding a task allocation per packet.
@@ -23,7 +29,7 @@ pub(crate) struct DataPublisher {
     fields: Vec<String>,
     topic: String,
     reliable: bool,
-    tx: mpsc::UnboundedSender<DataPacket>,
+    tx: mpsc::Sender<DataPacket>,
     task: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
     stream: DataStream,
@@ -43,7 +49,7 @@ impl DataPublisher {
         metrics: Arc<MetricsRegistry>,
         stream: DataStream,
     ) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<DataPacket>();
+        let (tx, mut rx) = mpsc::channel::<DataPacket>(PUBLISH_QUEUE_CAP);
         let task = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 if let Err(e) = local_participant.publish_data(packet).await {
@@ -84,8 +90,21 @@ impl DataPublisher {
             reliable: self.reliable,
             destination_identities: Vec::new(),
         };
-        if self.tx.send(packet).is_ok() {
-            self.metrics.bump_sent(self.stream);
+        match self.tx.try_send(packet) {
+            Ok(()) => {
+                self.metrics.bump_sent(self.stream);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "publish queue full for topic '{}' (cap={}); dropping packet",
+                    self.topic,
+                    PUBLISH_QUEUE_CAP
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Send task is gone (disconnect / drop). Silent — caller is
+                // already in teardown.
+            }
         }
         Ok(())
     }

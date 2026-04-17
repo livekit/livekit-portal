@@ -17,6 +17,9 @@ pub enum PortalError {
     #[error("wrong frame size: expected {expected} bytes, got {got}")]
     WrongFrameSize { expected: usize, got: usize },
 
+    #[error("invalid frame dimensions: width={width}, height={height} (must both be even)")]
+    InvalidFrameDimensions { width: u32, height: u32 },
+
     #[error("deserialization error: {0}")]
     Deserialization(String),
 

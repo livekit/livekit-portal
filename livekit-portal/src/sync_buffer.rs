@@ -266,7 +266,7 @@ impl SyncBuffer {
 
             if let Some(b) = iter_blocker {
                 self.blocker = Some(b);
-                self.metrics.record_blocker(&self.track_names[b]);
+                self.metrics.record_blocker(b);
                 return output;
             }
 

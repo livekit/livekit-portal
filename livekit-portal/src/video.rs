@@ -1,3 +1,4 @@
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,21 +61,27 @@ impl VideoPublisher {
 
     pub fn send_frame(
         &self,
-        i420_data: &[u8],
+        rgb_data: &[u8],
         width: u32,
         height: u32,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let expected_size = (width * height * 3 / 2) as usize;
-        if i420_data.len() != expected_size {
+        // I420 packs U and V at half resolution in each axis. Odd dimensions
+        // would silently desynchronize plane sizes (width/2 truncates), so
+        // reject up front rather than copy garbage into the chroma planes.
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(PortalError::InvalidFrameDimensions { width, height });
+        }
+        let expected_size = (width * height * 3) as usize;
+        if rgb_data.len() != expected_size {
             return Err(PortalError::WrongFrameSize {
                 expected: expected_size,
-                got: i420_data.len(),
+                got: rgb_data.len(),
             });
         }
         let ts = timestamp_us.unwrap_or_else(now_us);
         let mut buffer = I420Buffer::new(width, height);
-        copy_i420_data(i420_data, &mut buffer);
+        rgb_to_i420(rgb_data, width as usize, height as usize, &mut buffer);
         let mut frame = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
         frame.frame_metadata = Some(FrameMetadata { user_timestamp: Some(ts), frame_id: None });
         self.source.capture_frame(&frame);
@@ -163,22 +170,71 @@ fn convert_frame<T: AsRef<dyn VideoBuffer>>(
 ) -> VideoFrameData {
     let i420 = frame.buffer.as_ref().to_i420();
     let (y, u, v) = i420.data();
-    let mut data = Vec::with_capacity(y.len() + u.len() + v.len());
-    data.extend_from_slice(y);
-    data.extend_from_slice(u);
-    data.extend_from_slice(v);
-    VideoFrameData { width: i420.width(), height: i420.height(), data: data.into(), timestamp_us }
+    let total = y.len() + u.len() + v.len();
+
+    // Build the Arc payload in a single allocation/copy. The naive
+    // `Vec::extend_from_slice * 3` followed by `Arc::from(vec)` allocates
+    // twice and copies twice — at 640x480 that's ~460KB doubled per frame.
+    let mut data: Arc<[MaybeUninit<u8>]> = Arc::new_uninit_slice(total);
+    {
+        // SAFETY: freshly allocated Arc, no other references exist.
+        let dst = Arc::get_mut(&mut data).expect("freshly allocated Arc has unique ownership");
+        // SAFETY: dst is exactly `total` bytes, sources are independent of
+        // dst, and MaybeUninit<u8> shares u8's layout.
+        unsafe {
+            let p = dst.as_mut_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(y.as_ptr(), p, y.len());
+            std::ptr::copy_nonoverlapping(u.as_ptr(), p.add(y.len()), u.len());
+            std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(y.len() + u.len()), v.len());
+        }
+    }
+    // SAFETY: every byte was initialized by the three copies above.
+    let data: Arc<[u8]> = unsafe { data.assume_init() };
+
+    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
 }
 
-fn copy_i420_data(src: &[u8], buffer: &mut I420Buffer) {
-    let width = buffer.width() as usize;
-    let height = buffer.height() as usize;
-    let y_size = width * height;
-    let uv_size = (width / 2) * (height / 2);
+// BT.601 limited-range RGB24 -> I420, matching libyuv's RAWToI420. Chroma is
+// 2x2-box-averaged so hard edges don't leak into adjacent blocks.
+fn rgb_to_i420(src: &[u8], width: usize, height: usize, buffer: &mut I420Buffer) {
+    let stride_y = buffer.stride_y() as usize;
+    let stride_u = buffer.stride_u() as usize;
+    let stride_v = buffer.stride_v() as usize;
     let (y_dst, u_dst, v_dst) = buffer.data_mut();
-    y_dst[..y_size].copy_from_slice(&src[..y_size]);
-    u_dst[..uv_size].copy_from_slice(&src[y_size..y_size + uv_size]);
-    v_dst[..uv_size].copy_from_slice(&src[y_size + uv_size..y_size + 2 * uv_size]);
+    let src_stride = width * 3;
+
+    for y in 0..height {
+        let src_row = &src[y * src_stride..y * src_stride + src_stride];
+        let y_row = &mut y_dst[y * stride_y..y * stride_y + width];
+        for x in 0..width {
+            let r = src_row[x * 3] as i32;
+            let g = src_row[x * 3 + 1] as i32;
+            let b = src_row[x * 3 + 2] as i32;
+            y_row[x] = clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+        }
+    }
+
+    let cw = width / 2;
+    let ch = height / 2;
+    for cy in 0..ch {
+        let row0 = &src[(2 * cy) * src_stride..(2 * cy) * src_stride + src_stride];
+        let row1 = &src[(2 * cy + 1) * src_stride..(2 * cy + 1) * src_stride + src_stride];
+        let u_row = &mut u_dst[cy * stride_u..cy * stride_u + cw];
+        let v_row = &mut v_dst[cy * stride_v..cy * stride_v + cw];
+        for cx in 0..cw {
+            let i0 = 2 * cx * 3;
+            let i1 = i0 + 3;
+            let r = (row0[i0] as i32 + row0[i1] as i32 + row1[i0] as i32 + row1[i1] as i32 + 2) >> 2;
+            let g = (row0[i0 + 1] as i32 + row0[i1 + 1] as i32 + row1[i0 + 1] as i32 + row1[i1 + 1] as i32 + 2) >> 2;
+            let b = (row0[i0 + 2] as i32 + row0[i1 + 2] as i32 + row1[i0 + 2] as i32 + row1[i1 + 2] as i32 + 2) >> 2;
+            u_row[cx] = clamp_u8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+            v_row[cx] = clamp_u8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+        }
+    }
+}
+
+fn clamp_u8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
 }
 
 pub(crate) fn now_us() -> u64 {

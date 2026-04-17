@@ -496,9 +496,21 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             }
         }
         RoomEvent::Reconnected => {
-            log::info!("[{}] reconnected, clearing sync buffers", ctx.config.session);
+            log::info!(
+                "[{}] reconnected, clearing sync buffers and latest slots",
+                ctx.config.session
+            );
             if let Some(sb) = &ctx.sync_buffer {
                 sb.lock().clear();
+            }
+            // Pre-reconnect data is stale by definition; consumers calling
+            // get_* after a reconnect should see None until fresh packets
+            // arrive, matching the semantics already applied to sync_buffer.
+            ctx.obs_sink.clear();
+            ctx.action.clear();
+            ctx.state.clear();
+            for slots in ctx.video_tracks.values() {
+                slots.clear();
             }
         }
         _ => {}
