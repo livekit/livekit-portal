@@ -46,12 +46,8 @@ pub struct TransportMetrics {
 pub struct BufferMetrics {
     pub video_fill: HashMap<String, usize>,
     pub state_fill: usize,
-    pub observation_fill: usize,
     /// Per-video-track cumulative evictions from overflow.
     pub evictions: HashMap<String, u64>,
-    /// Observations dropped from the pull-side buffer because the consumer
-    /// lagged behind — distinct from `sync.states_dropped` (sync failure).
-    pub observations_evicted: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -85,7 +81,6 @@ pub(crate) struct MetricsRegistry {
     action_jitter: Mutex<JitterState>,
 
     observations_emitted: AtomicU64,
-    observations_evicted: AtomicU64,
     states_dropped: AtomicU64,
     match_deltas: Mutex<SampleRing>,
     last_blocker_track: Mutex<Option<String>>,
@@ -101,7 +96,7 @@ impl MetricsRegistry {
     pub fn new(video_tracks: &[String]) -> Self {
         let per_track: HashMap<String, Arc<TrackMetrics>> = video_tracks
             .iter()
-            .map(|n| (n.clone(), Arc::new(TrackMetrics::new(n.clone()))))
+            .map(|n| (n.clone(), Arc::new(TrackMetrics::new())))
             .collect();
         Self {
             track_order: video_tracks.to_vec(),
@@ -113,7 +108,6 @@ impl MetricsRegistry {
             state_jitter: Mutex::new(JitterState::default()),
             action_jitter: Mutex::new(JitterState::default()),
             observations_emitted: AtomicU64::new(0),
-            observations_evicted: AtomicU64::new(0),
             states_dropped: AtomicU64::new(0),
             match_deltas: Mutex::new(SampleRing::new(SAMPLE_RING_CAP)),
             last_blocker_track: Mutex::new(None),
@@ -150,10 +144,6 @@ impl MetricsRegistry {
         self.match_deltas.lock().push(worst_delta_us);
     }
 
-    pub fn record_observation_evicted(&self, n: u64) {
-        self.observations_evicted.fetch_add(n, Ordering::Relaxed);
-    }
-
     pub fn record_state_dropped(&self, n: u64) {
         self.states_dropped.fetch_add(n, Ordering::Relaxed);
     }
@@ -176,7 +166,6 @@ impl MetricsRegistry {
         &self,
         video_fill: HashMap<String, usize>,
         state_fill: usize,
-        observation_fill: usize,
     ) -> PortalMetrics {
         let n = self.track_order.len();
         let mut frames_sent = HashMap::with_capacity(n);
@@ -222,13 +211,7 @@ impl MetricsRegistry {
                 state_jitter_us: self.state_jitter.lock().jitter_us,
                 action_jitter_us: self.action_jitter.lock().jitter_us,
             },
-            buffers: BufferMetrics {
-                video_fill,
-                state_fill,
-                observation_fill,
-                evictions,
-                observations_evicted: self.observations_evicted.load(Ordering::Relaxed),
-            },
+            buffers: BufferMetrics { video_fill, state_fill, evictions },
             rtt: RttMetrics {
                 rtt_us_last,
                 rtt_us_mean: rtt_mean,
@@ -247,7 +230,6 @@ impl MetricsRegistry {
         *self.state_jitter.lock() = JitterState::default();
         *self.action_jitter.lock() = JitterState::default();
         self.observations_emitted.store(0, Ordering::Relaxed);
-        self.observations_evicted.store(0, Ordering::Relaxed);
         self.states_dropped.store(0, Ordering::Relaxed);
         self.match_deltas.lock().clear();
         *self.last_blocker_track.lock() = None;
@@ -262,8 +244,6 @@ impl MetricsRegistry {
 }
 
 pub(crate) struct TrackMetrics {
-    #[allow(dead_code)]
-    pub name: String,
     pub frames_sent: AtomicU64,
     pub frames_received: AtomicU64,
     pub evictions: AtomicU64,
@@ -271,9 +251,8 @@ pub(crate) struct TrackMetrics {
 }
 
 impl TrackMetrics {
-    pub fn new(name: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            name,
             frames_sent: AtomicU64::new(0),
             frames_received: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
@@ -421,7 +400,7 @@ mod tests {
         reg.track("cam1").unwrap().record_sent();
         reg.track("cam2").unwrap().record_received(0, 100);
 
-        let snap = reg.snapshot(HashMap::new(), 0, 0);
+        let snap = reg.snapshot(HashMap::new(), 0);
         assert_eq!(snap.transport.frames_sent["cam1"], 2);
         assert_eq!(snap.transport.frames_sent["cam2"], 0);
         assert_eq!(snap.transport.frames_received["cam2"], 1);
@@ -437,7 +416,7 @@ mod tests {
         reg.record_blocker("cam1");
 
         reg.reset();
-        let snap = reg.snapshot(HashMap::new(), 0, 0);
+        let snap = reg.snapshot(HashMap::new(), 0);
         assert_eq!(snap.transport.frames_sent["cam1"], 0);
         assert_eq!(snap.sync.observations_emitted, 0);
         assert!(snap.rtt.rtt_us_last.is_none());

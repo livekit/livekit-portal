@@ -14,9 +14,6 @@ pub enum PortalError {
     #[error("unknown video track: {name}")]
     UnknownVideoTrack { name: String },
 
-    #[error("wrong number of values: expected {expected}, got {got}")]
-    WrongValueCount { expected: usize, got: usize },
-
     #[error("wrong frame size: expected {expected} bytes, got {got}")]
     WrongFrameSize { expected: usize, got: usize },
 

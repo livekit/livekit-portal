@@ -166,6 +166,10 @@ impl SyncBuffer {
             }
 
             let state_ts = self.state_buffer[0].0;
+            // Next state in the buffer (if any) — used for fair-share: if a
+            // candidate frame is closer to the next state than to the head
+            // state, we skip it so the later state can claim it.
+            let next_state_ts = self.state_buffer.get(1).map(|(ts, _)| *ts);
 
             for slot in &mut self.matched_scratch {
                 *slot = None;
@@ -212,10 +216,20 @@ impl SyncBuffer {
                 {
                     if let Some(f) = frame_buf.get(candidate) {
                         let d = state_ts.abs_diff(f.timestamp_us);
-                        if d < range && d < best_delta {
-                            best_delta = d;
-                            best_idx = Some(candidate);
+                        if d >= range || d >= best_delta {
+                            continue;
                         }
+                        // Fair-share: if a later buffered state has a strictly
+                        // closer claim, leave the frame for it. Prevents a
+                        // greedy head-state from stealing its neighbor's frame
+                        // when tolerance > 1 tick.
+                        if let Some(nts) = next_state_ts {
+                            if nts.abs_diff(f.timestamp_us) < d {
+                                continue;
+                            }
+                        }
+                        best_delta = d;
+                        best_idx = Some(candidate);
                     }
                 }
 
@@ -521,7 +535,6 @@ mod tests {
             video_buffer_size: 1,
             state_buffer_size: 10,
             search_range_us: 30_000,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 
@@ -642,7 +655,6 @@ mod tests {
             video_buffer_size: 10,
             state_buffer_size: 10,
             search_range_us: 500,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 
@@ -667,7 +679,6 @@ mod tests {
             video_buffer_size: 10,
             state_buffer_size: 10,
             search_range_us: 500,
-            observation_buffer_size: 10,
         };
         let mut buf = mk(&tracks, fields, config);
 
@@ -693,6 +704,87 @@ mod tests {
         let out = buf.push_state(300, vec![3.0]);
         assert_eq!(out.drops.len(), 1);
         assert_eq!(out.drops[0]["j1"], 1.0);
+    }
+
+    /// With a widened range (>1 tick), a state whose exact frame was lost
+    /// falls back to an adjacent frame if no later state has a closer claim.
+    #[test]
+    fn wide_range_matches_neighbor_when_native_lost() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        // 30fps ticks = 33_333us; tolerance 1.5 → range = 50_000us.
+        let config = SyncConfig {
+            video_buffer_size: 5,
+            state_buffer_size: 5,
+            search_range_us: 50_000,
+        };
+        let mut buf = mk(&tracks, fields, config);
+
+        // Frame at tick 0 stands in for "T−1"; frame at T was lost; only
+        // frame@0 is available for state@33_333.
+        let _ = push_f(&mut buf, "cam1", 0);
+        let out = buf.push_state(33_333, vec![1.0]);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 0);
+    }
+
+    /// Fair-share: if an earlier state and a later state are both in the
+    /// buffer and a single frame sits closer to the later state, the earlier
+    /// state must NOT steal it. It may drop, but the later state gets to use
+    /// its own frame.
+    #[test]
+    fn fair_share_prevents_stealing() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        let config = SyncConfig {
+            video_buffer_size: 5,
+            state_buffer_size: 5,
+            search_range_us: 50_000, // tolerance 1.5 at 30fps
+        };
+        let mut buf = mk(&tracks, fields, config);
+
+        // Both states buffered before any frames arrive.
+        assert!(buf.push_state(0, vec![1.0]).is_empty());
+        assert!(buf.push_state(33_333, vec![2.0]).is_empty());
+
+        // frame@33_333 is closer to state@33_333 than to state@0;
+        // fair-share must keep state@0 from grabbing it.
+        let out = push_f(&mut buf, "cam1", 33_333);
+        assert!(
+            out.observations.is_empty(),
+            "state@0 must not steal frame@33_333 from state@33_333"
+        );
+
+        // Push a later frame past state@0's horizon to force the drop;
+        // state@33_333 then matches its own frame.
+        let out = push_f(&mut buf, "cam1", 100_000);
+        assert_eq!(out.drops.len(), 1, "state@0 drops once its horizon is crossed");
+        assert_eq!(out.drops[0]["j1"], 1.0);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(out.observations[0].state["j1"], 2.0);
+        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 33_333);
+    }
+
+    /// Tight range (<1 tick) preserves the legacy drop-on-loss behavior:
+    /// a state can't reach an adjacent frame, so it drops as soon as a
+    /// later frame crosses the horizon.
+    #[test]
+    fn tight_range_still_drops_on_loss() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        // tolerance 0.5 at 30fps → range = 16_666us, adjacent frames unreachable.
+        let config = SyncConfig {
+            video_buffer_size: 5,
+            state_buffer_size: 5,
+            search_range_us: 16_666,
+        };
+        let mut buf = mk(&tracks, fields, config);
+
+        let _ = push_f(&mut buf, "cam1", 0);
+        assert!(buf.push_state(33_333, vec![1.0]).is_empty()); // blocks: no match in range
+        let out = push_f(&mut buf, "cam1", 100_000); // crosses horizon, fires drop
+        assert!(out.observations.is_empty());
+        assert_eq!(out.drops.len(), 1, "tight range must drop when native frame is missing");
     }
 
     /// Sanity: inputs that stress the binary/cursor path with many empty and

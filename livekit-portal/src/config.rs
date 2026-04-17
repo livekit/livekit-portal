@@ -10,8 +10,10 @@ pub struct PortalConfig {
     pub(crate) action_fields: Vec<String>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
-    pub(crate) sync_config: SyncConfig,
-    pub(crate) ping_interval_ms: u64,
+    pub(crate) fps: u32,
+    pub(crate) slack: u32,
+    pub(crate) tolerance: f32,
+    pub(crate) ping_ms: u64,
 }
 
 impl PortalConfig {
@@ -24,8 +26,10 @@ impl PortalConfig {
             action_fields: Vec::new(),
             state_reliable: true,
             action_reliable: true,
-            sync_config: SyncConfig::default(),
-            ping_interval_ms: 1000,
+            fps: 30,
+            slack: 5,
+            tolerance: 1.5,
+            ping_ms: 1000,
         }
     }
 
@@ -41,20 +45,39 @@ impl PortalConfig {
         self.action_fields.extend(fields.iter().map(|s| s.to_string()));
     }
 
-    pub fn set_video_buffer(&mut self, size: u32) {
-        self.sync_config.video_buffer_size = size;
+    /// Unified observation rate (set to the video capture rate if state and
+    /// video differ). Drives `search_range = tolerance/fps`.
+    pub fn set_fps(&mut self, fps: u32) {
+        assert!(fps > 0, "fps must be > 0");
+        self.fps = fps;
     }
 
-    pub fn set_state_buffer(&mut self, size: u32) {
-        self.sync_config.state_buffer_size = size;
+    /// How far (in tick intervals at `fps`) a state may reach when matching
+    /// a video frame. `search_range = tolerance / fps`.
+    ///
+    /// - `0.5` (tight): state only matches a frame within ±half a tick.
+    ///   One lost frame → one dropped observation. Lowest misalignment risk.
+    /// - `1.5` (default, widened): state matches its own frame, or falls
+    ///   back to T±1 if its native frame was lost. Preserves observations
+    ///   at the cost of occasional ±1-tick misalignment. A fair-share check
+    ///   prevents an earlier state from stealing a frame closer to a later
+    ///   state already in the buffer.
+    /// - `> 2.0`: state may match T±2 frames. Higher recovery, higher
+    ///   misalignment risk. Rarely worth it.
+    ///
+    /// Values must be in `(0, ∞)`. Defaults to `1.5`.
+    pub fn set_tolerance(&mut self, ticks: f32) {
+        assert!(ticks > 0.0, "tolerance must be > 0");
+        self.tolerance = ticks;
     }
 
-    pub fn set_search_range_ms(&mut self, ms: u64) {
-        self.sync_config.search_range_us = ms * 1000;
-    }
-
-    pub fn set_observation_buffer(&mut self, size: u32) {
-        self.sync_config.observation_buffer_size = size;
+    /// Ticks of pipeline headroom — how much jitter, loss-detection latency,
+    /// and consumer lag the pipeline tolerates before dropping. Applies to
+    /// the per-track video sync buffer, the state sync buffer, and the
+    /// pull-side observation buffer.
+    pub fn set_slack(&mut self, ticks: u32) {
+        assert!(ticks > 0, "slack must be > 0");
+        self.slack = ticks;
     }
 
     pub fn set_state_reliable(&mut self, reliable: bool) {
@@ -65,10 +88,19 @@ impl PortalConfig {
         self.action_reliable = reliable;
     }
 
-    /// RTT ping cadence in milliseconds. Set to `0` to disable active pinging
-    /// on this side; the pong echo path remains active regardless, so the peer
-    /// can still measure its own RTT. Default: 1000ms.
-    pub fn set_ping_interval_ms(&mut self, ms: u64) {
-        self.ping_interval_ms = ms;
+    /// RTT ping cadence. Set to `0` to disable active pinging on this side;
+    /// the pong echo path remains active so the peer can still measure.
+    pub fn set_ping_ms(&mut self, ms: u64) {
+        self.ping_ms = ms;
+    }
+
+    /// Derived sync config used internally by the sync buffer. Not public.
+    pub(crate) fn sync_config(&self) -> SyncConfig {
+        let search_range_us = (self.tolerance * 1_000_000.0 / self.fps as f32) as u64;
+        SyncConfig {
+            video_buffer_size: self.slack,
+            state_buffer_size: self.slack,
+            search_range_us,
+        }
     }
 }

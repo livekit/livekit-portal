@@ -69,29 +69,59 @@ State and video frames are tagged with system time on the sender side. The recei
 
 Video frame timestamps are embedded using LiveKit's packet trailer feature, which survives the full WebRTC encode/decode pipeline.
 
-## Tuning the sync buffer
+## Tuning
 
-The defaults are tuned for 60fps video and state. All settings are on the config object before connecting.
-
-```python
-config.set_search_range_ms(10)    # max timestamp delta for a state-frame match (default: 10ms)
-config.set_video_buffer(5)        # frames buffered per video track (default: 5)
-config.set_state_buffer(5)        # states buffered for sync (default: 5)
-config.set_observation_buffer(3)  # synced observations buffered (default: 3)
-```
-
-**`search_range_ms`** — how close (in ms) a state timestamp and a video frame timestamp must be to pair. At 60fps, one frame is ~16.7ms. The default of 10ms is generous for same-loop-iteration sends but tight enough to never accidentally match a neighboring frame. Increase if your state and video are sent from different threads with more jitter.
-
-**`video_buffer`** / **`state_buffer`** — how many samples to hold while waiting for a match. At 60fps, 5 frames = ~83ms of headroom. If a match can't happen within that window, the state is dropped (and the drop callback fires). Increase if you have high network jitter or variable frame rates.
-
-**`observation_buffer`** — how many synced observations to hold before the oldest is evicted. If your model inference takes 50ms at 60fps, ~3 observations queue up. Increase if your consumer is bursty.
-
-**Data reliability** — state and action use reliable (lossless, ordered) delivery by default. For high-frequency inference where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss:
+Portal assumes unified sampling — the robot captures state + frames at the same tick. All sync parameters derive from a single `fps`, and all internal buffers share a single `slack` size.
 
 ```python
-config.set_state_reliable(False)   # default: True
-config.set_action_reliable(False)  # default: True
+config.set_fps(30)            # unified capture rate (default: 30)
+config.set_slack(5)           # ticks of pipeline headroom (default: 5)
+config.set_tolerance(1.5)     # match window in tick units (default: 1.5)
+
+config.set_state_reliable(True)   # default: True
+config.set_action_reliable(True)  # default: True
+
+config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
 ```
+
+**`fps`** — unified sampling rate (use the video rate if video and state differ). Drives the match window with `tolerance`. Raise to 60 for high-rate robots.
+
+**`slack`** — ticks of pipeline headroom: the per-track video sync buffer and the state sync buffer use this. Larger values tolerate more jitter and loss-detection latency at the cost of staleness. Minimum useful value is 2; default 5 ≈ 167ms at 30fps.
+
+**`tolerance`** — how far a state reaches when matching a frame, in tick units. `search_range = tolerance / fps`.
+- `0.5` (tight) — match only within half a tick. A single lost frame drops the observation. Best for real-time control.
+- `1.5` (default, widened) — state falls back to the ±1 neighbor frame if its native frame was lost. Preserves observations at the cost of ±1-tick misalignment. Best for data collection and lossy links. A fair-share check prevents earlier states from stealing neighbor frames.
+- `> 2.0` — allows T±2 matches. Higher recovery but the misalignment risk outweighs the benefit for most setups.
+
+### Choosing `tolerance`
+
+| Use case | Pick | Why |
+|---|---|---|
+| Real-time inference / control | `0.5` | Misalignment (acting on a visibly different frame) is worse than dropping. A drop is an explicit signal; a misaligned observation is silently wrong. |
+| Data collection for VLA training | `1.5` | Every observation is a training sample. A ±1-tick misalignment (~16ms at 60fps) is usually invisible to a trained model; a dropped observation is lost data. |
+| Teleop viewer | `1.5` | Visual continuity matters more than frame-perfect state alignment. |
+| Clean local network (<1% loss) | either | Drops are already rare. Default is fine. |
+| Lossy / cellular / wireless | `1.5` | Widening materially reduces drop rate under real loss conditions. |
+| Strict-alignment datasets | `0.5` | If downstream tooling relies on exact state/frame pairing, drops are cheaper than mislabeled pairs. |
+
+### Asymmetric rates (video faster than state)
+
+The library handles video > state rates transparently — intervening frames between state ticks get drained at match time and don't pile up, **provided the buffer is large enough**. Two rules:
+
+1. **Set `fps` to the video rate**, not the state rate. The match window is measured in frame intervals, so it has to know the video cadence. Example: video 60fps, state 30Hz → `set_fps(60)`.
+2. **Set `slack ≥ ceil(video_rate / state_rate) + 1`**. Between consecutive state matches, roughly `video_rate / state_rate` frames accumulate per track; slack must cover that plus jitter headroom. At default slack=5 the library cleanly handles up to ~4× asymmetry. For 10× asymmetry (video 60fps, state 6Hz), bump to `slack=12` or so.
+
+Example: video 60fps, state 10Hz (asymmetric teleop with slow sensor):
+
+```python
+config.set_fps(60)
+config.set_slack(8)          # ceil(60/10) + 2 = 8
+config.set_tolerance(1.5)    # still measured in video-tick intervals (~16.6ms each)
+```
+
+One thing to note: under asymmetric rates, the overall drop rate is proportional to `state_rate × video_loss_rate`, not the video rate. Losing a video frame that happened to fall on a state tick costs one observation; losing a video frame between state ticks costs nothing (it would have been drained anyway).
+
+**Reliability** — state and action use reliable (lossless, ordered) SCTP delivery by default. For high-frequency control where only the latest value matters, switch to unreliable to avoid head-of-line blocking under packet loss. Video is always unreliable (RTP).
 
 ## Language support
 
