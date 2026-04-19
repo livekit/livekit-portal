@@ -1,0 +1,136 @@
+"""End-to-end test robot.
+
+Reads LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET from .env (or env),
+mints a token for identity=robot, joins room=LIVEKIT_ROOM, publishes one
+video track ("cam1") and one state stream ("j1","j2","j3") at PORTAL_FPS.
+Prints any action it receives from the operator. Runs for
+PORTAL_DURATION_SECONDS (default 30) then cleanly disconnects.
+
+Usage:
+    cp examples/.env.example examples/.env   # fill in API_KEY / API_SECRET
+    python examples/robot.py
+"""
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+
+import numpy as np
+
+from livekit.portal import Portal, PortalConfig, Role
+from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
+
+IDENTITY = "robot"
+TRACK_NAME = "cam1"
+STATE_FIELDS = ["j1", "j2", "j3"]
+
+
+_DOT_COLOR = np.array([255, 255, 255], dtype=np.uint8)
+
+
+def _make_frame(width: int, height: int, phase: float) -> np.ndarray:
+    """High-entropy test pattern stressing the encoder like a real camera feed.
+
+    Full-screen moving sinusoidal gradients on R and G channels, plus a moving
+    white dot to visually confirm sync. Every pixel changes every frame, so
+    the encoder can't coast on inter-frame prediction. Cheap to generate but
+    gives a realistic bitrate workload.
+
+    Returns (H, W, 3) uint8 RGB.
+    """
+    x = np.arange(width, dtype=np.float32) / width
+    y = np.arange(height, dtype=np.float32)[:, None] / height
+    two_pi = 2.0 * math.pi
+    r = (0.5 + 0.5 * np.sin(two_pi * (x + phase))) * 255.0
+    g = (0.5 + 0.5 * np.sin(two_pi * (y + phase * 0.7))) * 255.0
+    b = (0.5 + 0.5 * np.sin(two_pi * (x * 0.5 + y * 0.5 + phase * 1.3))) * 255.0
+
+    r_full = np.broadcast_to(r, (height, width))
+    g_full = np.broadcast_to(g, (height, width))
+    frame = np.stack([r_full, g_full, b], axis=-1).astype(np.uint8)
+
+    # Moving dot overlay: completes one orbit per 2s. Gives the operator a
+    # clear visual anchor for sync without meaningfully changing entropy.
+    radius = min(width, height) // 3
+    cx = width // 2 + int(radius * math.cos(math.pi * phase))
+    cy = height // 2 + int(radius * math.sin(math.pi * phase))
+    size = max(4, min(width, height) // 20)
+    y0, y1 = max(0, cy - size), min(height, cy + size)
+    x0, x1 = max(0, cx - size), min(width, cx + size)
+    frame[y0:y1, x0:x1] = _DOT_COLOR
+    return frame
+
+
+async def main() -> None:
+    load_env()
+    url = required_env("LIVEKIT_URL")
+    room = required_env("LIVEKIT_ROOM")
+    token = mint_token(IDENTITY, room)
+    fps = env_int("PORTAL_FPS", 30)
+    width = env_int("PORTAL_FRAME_WIDTH", 320)
+    height = env_int("PORTAL_FRAME_HEIGHT", 240)
+    duration = env_float("PORTAL_DURATION_SECONDS", 30.0)
+
+    cfg = PortalConfig(room, Role.ROBOT)
+    cfg.add_video(TRACK_NAME)
+    cfg.add_state(STATE_FIELDS)
+    cfg.add_action(STATE_FIELDS)
+    cfg.set_fps(fps)
+
+    portal = Portal(cfg)
+
+    actions_received = 0
+
+    def on_action(values: dict) -> None:
+        nonlocal actions_received
+        actions_received += 1
+        if actions_received % max(1, fps) == 0:
+            print(f"[robot] action #{actions_received}: {values}")
+
+    portal.on_action(on_action)
+
+    print(f"[robot] connecting to {url} as '{IDENTITY}' in room '{room}' ...")
+    await portal.connect(url, token)
+    print(f"[robot] connected; streaming at {fps} fps for {duration:.0f}s")
+
+    metrics_task = asyncio.create_task(periodic_metrics(portal, "[robot]", interval=2.0))
+
+    try:
+        n_frames = int(duration * fps)
+        interval = 1.0 / fps
+        start = time.monotonic()
+        next_tick = start
+        for i in range(n_frames):
+            phase = i / fps  # seconds
+            frame = _make_frame(width, height, phase)
+            ts_us = int(time.time() * 1_000_000)
+            portal.send_video_frame(TRACK_NAME, frame, timestamp_us=ts_us)
+            portal.send_state(
+                {
+                    "j1": math.sin(phase),
+                    "j2": math.cos(phase),
+                    "j3": 0.1 * phase,
+                },
+                timestamp_us=ts_us,
+            )
+            next_tick += interval
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        _dump_metrics("[robot]", portal.metrics())
+    finally:
+        metrics_task.cancel()
+        try:
+            await metrics_task
+        except asyncio.CancelledError:
+            pass
+        print("[robot] disconnecting...")
+        await portal.disconnect()
+        portal.close()
+        cfg.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

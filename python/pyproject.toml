@@ -1,0 +1,33 @@
+[project]
+name = "livekit-portal-workspace"
+version = "0.1.0"
+description = "Workspace root for livekit-portal Python packages"
+requires-python = ">=3.12"
+# The root is a meta-project that pulls in all workspace members so a single
+# `uv sync` at python/ installs everything for dev. Consumers of individual
+# packages should depend on them directly (e.g. livekit-portal, not this root).
+dependencies = [
+    "livekit-portal",
+    "lerobot-robot-livekit",
+    "lerobot-teleoperator-livekit",
+]
+
+[project.optional-dependencies]
+examples = [
+    "livekit-api>=0.7",
+    "python-dotenv>=1",
+]
+
+[tool.uv.sources]
+livekit-portal = { workspace = true }
+lerobot-robot-livekit = { workspace = true }
+lerobot-teleoperator-livekit = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]

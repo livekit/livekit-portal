@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package livekit.portal.proto;
+
+enum Role {
+  ROBOT = 0;
+  OPERATOR = 1;
+}
+
+// A synchronized observation: one state matched with one frame from every
+// registered video track.
+message Observation {
+  uint64 timestamp_us = 1;
+  map<string, double> state = 2;
+  map<string, VideoFrameData> frames = 3;
+}
+
+// Decoded video frame. Outgoing frames (send_video_frame) are RGB24 packed
+// (W*H*3). Incoming frames (get_video_frame, ObservationEvent, VideoFrameEvent)
+// are I420 planar: Y plane (W*H) + U plane (W/2 * H/2) + V plane (W/2 * H/2),
+// concatenated.
+message VideoFrameData {
+  uint32 width = 1;
+  uint32 height = 2;
+  bytes data = 3;
+  uint64 timestamp_us = 4;
+}
+
+message SyncMetrics {
+  uint64 observations_emitted = 1;
+  uint64 states_dropped = 2;
+  optional uint64 match_delta_us_p50 = 3;
+  optional uint64 match_delta_us_p95 = 4;
+  optional string last_blocker_track = 5;
+}
+
+message TransportMetrics {
+  map<string, uint64> frames_sent = 1;
+  map<string, uint64> frames_received = 2;
+  uint64 states_sent = 3;
+  uint64 states_received = 4;
+  uint64 actions_sent = 5;
+  uint64 actions_received = 6;
+  map<string, uint64> frame_jitter_us = 7;
+  uint64 state_jitter_us = 8;
+  uint64 action_jitter_us = 9;
+}
+
+message BufferMetrics {
+  map<string, uint64> video_fill = 1;
+  uint64 state_fill = 2;
+  map<string, uint64> evictions = 3;
+}
+
+message RttMetrics {
+  optional uint64 rtt_us_last = 1;
+  optional uint64 rtt_us_mean = 2;
+  optional uint64 rtt_us_p95 = 3;
+  uint64 pings_sent = 4;
+  uint64 pongs_received = 5;
+}
+
+message PortalMetrics {
+  SyncMetrics sync = 1;
+  TransportMetrics transport = 2;
+  BufferMetrics buffers = 3;
+  RttMetrics rtt = 4;
+}
+
+// Maps 1:1 to livekit_portal::PortalError.
+// `variant` is the Rust variant name; `message` is the Display form.
+message FfiError {
+  string variant = 1;
+  string message = 2;
+}

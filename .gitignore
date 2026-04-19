@@ -13,6 +13,19 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.venv/
+.pytest_cache/
+
+# Env files — keep `.env.example` as a committed template.
+.env
+.env.*
+!.env.example
+
+# Built cdylib (copied in by scripts/build_native.sh).
+# Match at any depth so it covers the workspace layout under packages/.
+**/livekit/portal/liblivekit_portal_ffi.dylib
+**/livekit/portal/liblivekit_portal_ffi.so
+**/livekit/portal/livekit_portal_ffi.dll
 
 # OS
 .DS_Store

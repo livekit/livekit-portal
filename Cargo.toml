@@ -1,3 +1,3 @@
 [workspace]
-members = ["livekit-portal"]
+members = ["livekit-portal", "livekit-portal-ffi"]
 resolver = "2"

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
-use livekit::options::{PacketTrailerFeatures, TrackPublishOptions, VideoCodec};
+use livekit::options::{PacketTrailerFeatures, TrackPublishOptions, VideoCodec, VideoEncoding};
 use livekit::prelude::*;
 use livekit::webrtc::prelude::{
     I420Buffer, RtcVideoSource, VideoBuffer, VideoFrame, VideoResolution, VideoRotation,
@@ -29,15 +29,16 @@ pub(crate) struct VideoPublisher {
     source: NativeVideoSource,
     track: LocalVideoTrack,
     metrics: Arc<TrackMetrics>,
+    fps: u32,
 }
 
 impl VideoPublisher {
-    pub fn new(name: &str, metrics: Arc<TrackMetrics>) -> Self {
+    pub fn new(name: &str, metrics: Arc<TrackMetrics>, fps: u32) -> Self {
         let resolution = VideoResolution { width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT };
         let source = NativeVideoSource::new(resolution, false);
         let rtc_source = RtcVideoSource::Native(source.clone());
         let track = LocalVideoTrack::create_video_track(name, rtc_source);
-        Self { source, track, metrics }
+        Self { source, track, metrics, fps }
     }
 
     pub async fn publish(&self, local_participant: &LocalParticipant) -> PortalResult<()> {
@@ -46,10 +47,25 @@ impl VideoPublisher {
         // by publishers that don't set this trailer are unsupported.
         let mut features = PacketTrailerFeatures::default();
         features.user_timestamp = true;
+
+        // Pin encoder ceilings explicitly. Without `video_encoding`, libwebrtc's
+        // `VideoStreamEncoder` picks conservative defaults and drops frames to
+        // stay under its own rate target. For a teleop publisher we want the
+        // encoder to keep up with the capture cadence, not the other way around.
+        //
+        //   max_framerate = fps * 2 — 2x headroom over the capture rate so the
+        //     adaptive-framerate logic never throttles below our cadence.
+        //   max_bitrate   = 10 Mbps — generous ceiling; the encoder still picks
+        //     a much lower operating bitrate based on content. We just don't
+        //     want a tight cap forcing frame drops on high-motion bursts.
         let options = TrackPublishOptions {
             video_codec: VideoCodec::H264,
             simulcast: false,
             packet_trailer_features: features,
+            video_encoding: Some(VideoEncoding {
+                max_framerate: (self.fps as f64) * 2.0,
+                max_bitrate: 10_000_000,
+            }),
             ..Default::default()
         };
         local_participant

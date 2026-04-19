@@ -1,0 +1,22 @@
+[package]
+name = "livekit-portal-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+livekit-portal = { path = "../livekit-portal" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+prost = "0.13"
+parking_lot = "0.12"
+dashmap = "6"
+thiserror = "2"
+lazy_static = "1"
+log = "0.4"
+downcast-rs = "1"
+
+[build-dependencies]
+prost-build = "0.13"
