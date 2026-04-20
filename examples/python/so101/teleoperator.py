@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.visualization_utils import init_rerun
 from lerobot_robot_livekit import LiveKitRobot, LiveKitRobotConfig
@@ -26,13 +27,17 @@ IDENTITY = "so101-operator"
 
 
 def log_rerun(namespace: str, data: dict) -> None:
-    """Log a lerobot-shaped dict (motor floats + camera ndarrays) under `namespace`.
+    """Log a lerobot-shaped dict (motor floats + camera ndarrays) under `namespace/`.
+
+    Uses `/` as the rerun path separator so entities nest under the namespace
+    (e.g. `observation/shoulder_pan.pos`, `observation/front`) — lets the
+    blueprint target whole groups via `origin=...`.
 
     Images are JPEG-compressed so memory stays bounded even with scrubbable
     history retained; scalars are logged as rerun scalar series.
     """
     for k, v in data.items():
-        entity = f"{namespace}.{k}"
+        entity = f"{namespace}/{k}"
         if isinstance(v, np.ndarray):
             rr.log(entity, rr.Image(v).compress())
         else:
@@ -44,7 +49,7 @@ def _us_to_ms(us: int | None) -> float | None:
 
 
 def log_metrics(m) -> str:
-    """Log Portal metrics to rerun under `metrics.*` and return a one-line summary.
+    """Log Portal metrics under `metrics/` and return a one-line summary.
 
     Only logs fields that are actually present — Portal's metrics proto marks
     warm-up values (RTT / sync delta p50/p95) as optional so we don't pollute
@@ -56,9 +61,9 @@ def log_metrics(m) -> str:
     rtt_mean = _us_to_ms(m.rtt.rtt_us_mean if m.rtt.HasField("rtt_us_mean") else None)
     rtt_p95 = _us_to_ms(m.rtt.rtt_us_p95 if m.rtt.HasField("rtt_us_p95") else None)
     if rtt_last is not None:
-        rr.log("metrics.rtt_last_ms", rr.Scalars(rtt_last))
+        rr.log("metrics/rtt_last_ms", rr.Scalars(rtt_last))
     if rtt_mean is not None:
-        rr.log("metrics.rtt_mean_ms", rr.Scalars(rtt_mean))
+        rr.log("metrics/rtt_mean_ms", rr.Scalars(rtt_mean))
     parts.append(
         f"rtt={rtt_last:.1f}/{rtt_mean:.1f}/{rtt_p95:.1f}ms"
         if rtt_last is not None and rtt_mean is not None and rtt_p95 is not None
@@ -72,9 +77,9 @@ def log_metrics(m) -> str:
         m.sync.match_delta_us_p95 if m.sync.HasField("match_delta_us_p95") else None
     )
     if sync_p50 is not None:
-        rr.log("metrics.sync_delta_p50_ms", rr.Scalars(sync_p50))
+        rr.log("metrics/sync_delta_p50_ms", rr.Scalars(sync_p50))
     if sync_p95 is not None:
-        rr.log("metrics.sync_delta_p95_ms", rr.Scalars(sync_p95))
+        rr.log("metrics/sync_delta_p95_ms", rr.Scalars(sync_p95))
     parts.append(
         f"sync={sync_p50:.1f}/{sync_p95:.1f}ms"
         if sync_p50 is not None and sync_p95 is not None
@@ -83,15 +88,39 @@ def log_metrics(m) -> str:
 
     state_jitter = _us_to_ms(m.transport.state_jitter_us) or 0.0
     action_jitter = _us_to_ms(m.transport.action_jitter_us) or 0.0
-    rr.log("metrics.state_jitter_ms", rr.Scalars(state_jitter))
-    rr.log("metrics.action_jitter_ms", rr.Scalars(action_jitter))
+    rr.log("metrics/state_jitter_ms", rr.Scalars(state_jitter))
+    rr.log("metrics/action_jitter_ms", rr.Scalars(action_jitter))
     parts.append(f"jitter={state_jitter:.1f}/{action_jitter:.1f}ms")
 
     drops = m.sync.states_dropped
-    rr.log("metrics.states_dropped", rr.Scalars(float(drops)))
+    rr.log("metrics/states_dropped", rr.Scalars(float(drops)))
     parts.append(f"drops={drops}")
 
     return " ".join(parts)
+
+
+def build_blueprint(camera_name: str) -> rrb.Blueprint:
+    """Four-panel layout: camera image, observation scalars, action scalars, metrics.
+
+    Each panel is scoped by `origin=...` so rerun auto-discovers new entities
+    within the group (per-motor scalars appear on the right panel without
+    needing to enumerate them here).
+    """
+    return rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial2DView(
+                origin=f"/observation/{camera_name}",
+                name="Camera",
+            ),
+            rrb.Vertical(
+                rrb.TimeSeriesView(origin="/observation", name="Observation (state)"),
+                rrb.TimeSeriesView(origin="/action", name="Action (commanded)"),
+                rrb.TimeSeriesView(origin="/metrics", name="Portal metrics"),
+            ),
+            column_shares=[2, 3],
+        ),
+        collapse_panels=True,
+    )
 
 
 def main() -> None:
@@ -122,6 +151,7 @@ def main() -> None:
     leader.connect()
     robot.connect()
     init_rerun(session_name=f"so101-{room}")  # spawns the rerun viewer
+    rr.send_blueprint(build_blueprint(camera_name))
     print(f"[operator] '{IDENTITY}' in '{room}' @ {fps} fps; ctrl-c to stop")
 
     try:
@@ -139,7 +169,7 @@ def main() -> None:
                 # End-to-end staleness: how old is the obs we're acting on?
                 # Includes sender→receiver transport + Portal sync buffering.
                 age_ms = (time.time() * 1e6 - ts_us) / 1e3
-                rr.log("metrics.obs_age_ms", rr.Scalars(age_ms))
+                rr.log("metrics/obs_age_ms", rr.Scalars(age_ms))
 
             log_rerun("observation", obs or {})
             log_rerun("action", action or {})
