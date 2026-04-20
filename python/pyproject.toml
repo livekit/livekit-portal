@@ -12,12 +12,6 @@ dependencies = [
     "lerobot-teleoperator-livekit",
 ]
 
-[project.optional-dependencies]
-examples = [
-    "livekit-api>=0.7",
-    "python-dotenv>=1",
-]
-
 [tool.uv.sources]
 livekit-portal = { workspace = true }
 lerobot-robot-livekit = { workspace = true }

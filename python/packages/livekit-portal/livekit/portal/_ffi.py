@@ -1,7 +1,7 @@
 """ctypes bridge to the livekit-portal-ffi cdylib.
 
 Responsibilities:
-  - locate and load the shared library (maturin drops it beside this package)
+  - locate and load the shared library (build_native.sh copies it beside this package)
   - declare the three `extern "C"` signatures
   - register the single event callback once at import
   - expose `request(FfiRequest) -> FfiResponse` for the wrapper classes
@@ -31,19 +31,20 @@ _LIB_BASENAMES = {
     "win32": "livekit_portal_ffi.dll",
 }
 
-# Maturin with `module-name = "livekit_portal._native"` installs the cdylib as
-# `_native.<ext_suffix>` inside the package. Fall back to the plain-Rust name
-# in case the user built with a different configuration (e.g. `cargo build`).
+# build_native.sh copies the cargo-produced cdylib (liblivekit_portal_ffi.{so,dylib,dll})
+# into this directory. We also check for a `_native.<ext>` name in case a
+# different build setup (e.g. maturin with `module-name = "livekit_portal._native"`)
+# is used, so the package remains compatible.
 def _find_cdylib() -> str:
     here = pathlib.Path(__file__).parent
     platform = "linux" if sys.platform.startswith("linux") else sys.platform
     candidates = []
-    # Maturin-installed native module (platform-specific suffix)
-    for suffix in (".abi3.so", ".so", ".dylib", ".pyd"):
-        candidates.append(here / f"_native{suffix}")
-    # Plain Rust-produced cdylib (from `cargo build`)
+    # Plain Rust-produced cdylib (from build_native.sh / cargo build)
     if platform in _LIB_BASENAMES:
         candidates.append(here / _LIB_BASENAMES[platform])
+    # Fallback: `_native.<ext>` name used by maturin-style builds
+    for suffix in (".abi3.so", ".so", ".dylib", ".pyd"):
+        candidates.append(here / f"_native{suffix}")
     # Allow override for dev
     env_override = os.environ.get("LIVEKIT_PORTAL_FFI_LIB")
     if env_override:
@@ -55,8 +56,9 @@ def _find_cdylib() -> str:
     raise FileNotFoundError(
         "livekit-portal-ffi cdylib not found. Tried: "
         + ", ".join(str(c) for c in candidates)
-        + ". Run `maturin develop` in the python/ directory, or set "
-        "LIVEKIT_PORTAL_FFI_LIB to the absolute path of the shared library."
+        + ". Build it with `bash python/packages/livekit-portal/scripts/build_native.sh`"
+        " (run from the repo root), or set LIVEKIT_PORTAL_FFI_LIB to the"
+        " absolute path of the shared library."
     )
 
 

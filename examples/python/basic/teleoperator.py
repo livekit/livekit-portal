@@ -5,8 +5,8 @@ and state, receives synchronized observations via `on_observation`, and
 echoes a synthetic action back to the robot at `PORTAL_FPS`.
 
 Usage:
-    cp examples/.env.example examples/.env  # fill in API_KEY / API_SECRET
-    python examples/teleoperator.py
+    cp .env.example .env  # fill in API_KEY / API_SECRET
+    uv run teleoperator.py
 """
 from __future__ import annotations
 

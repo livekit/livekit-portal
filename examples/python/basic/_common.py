@@ -77,7 +77,7 @@ def mint_token(
     secret = os.environ.get("LIVEKIT_API_SECRET")
     if not key or not secret:
         raise RuntimeError(
-            "LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set (see examples/.env.example)"
+            "LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set (see .env.example)"
         )
 
     grants = api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True)
@@ -102,7 +102,7 @@ def mint_token(
 def required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        raise RuntimeError(f"{name} must be set (see examples/.env.example)")
+        raise RuntimeError(f"{name} must be set (see .env.example)")
     return value
 
 

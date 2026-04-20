@@ -1,0 +1,17 @@
+[project]
+name = "livekit-portal-basic-example"
+version = "0.1.0"
+description = "Minimal robot+operator Portal demo with generated video and state"
+requires-python = ">=3.12"
+dependencies = [
+    "livekit-portal",
+    "livekit-api>=0.7",
+    "python-dotenv>=1",
+    "numpy>=1.24",
+]
+
+# Relative path so the example stays self-contained: `uv sync` in this
+# directory links livekit-portal as an editable install from the package
+# source tree without requiring workspace coordination.
+[tool.uv.sources]
+livekit-portal = { path = "../../../python/packages/livekit-portal", editable = true }

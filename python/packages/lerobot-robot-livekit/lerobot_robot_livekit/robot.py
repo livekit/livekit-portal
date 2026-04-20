@@ -90,6 +90,7 @@ class LiveKitRobot(Robot):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._connected = False
+        self._last_observation_timestamp_us: int | None = None
 
     # -- lerobot interface ----------------------------------------------------
 
@@ -164,12 +165,17 @@ class LiveKitRobot(Robot):
     def get_observation(self) -> dict[str, Any]:
         """Latest synced observation from the remote robot, shaped for
         lerobot (``{motor}.pos -> float``, ``{camera} -> np.ndarray(H,W,3)``
-        uint8 RGB). Empty dict until the first observation syncs."""
+        uint8 RGB). Empty dict until the first observation syncs.
+
+        The sender-side timestamp of this observation is available via
+        :attr:`last_observation_timestamp_us` after the call returns.
+        """
         if self._portal is None:
             return {}
         obs = self._portal.get_observation()
         if obs is None:
             return {}
+        self._last_observation_timestamp_us = obs.timestamp_us
         out: dict[str, Any] = {}
         for key, motor in zip(self._state_keys, self._state_motors):
             if motor in obs.state:
@@ -181,6 +187,19 @@ class LiveKitRobot(Robot):
                     frame.data, frame.width, frame.height
                 )
         return out
+
+    @property
+    def last_observation_timestamp_us(self) -> int | None:
+        """Sender's system time in µs (epoch) for the most recent observation
+        returned by :meth:`get_observation`, or ``None`` if none yet."""
+        return self._last_observation_timestamp_us
+
+    def metrics(self):
+        """Snapshot of the underlying Portal's metrics (RTT, sync delta, jitter,
+        buffer fill, drops). Returns ``None`` when disconnected."""
+        if self._portal is None:
+            return None
+        return self._portal.metrics()
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Publish an action to the remote robot. Returns ``action`` unchanged
