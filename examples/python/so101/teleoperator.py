@@ -4,13 +4,15 @@ Drives a local SO-101 leader arm and presents the remote SO-101 follower
 as a local lerobot ``Robot`` over a LiveKit Portal session as
 ``Role.OPERATOR``. Each tick: read leader pose, push as action; pull
 synced observation back (joint positions + camera frame) and stream it
-to a rerun viewer.
+to a rerun viewer along with Portal transport metrics.
 
 Usage:
     cp .env.example .env  # fill in API_KEY / API_SECRET / serial port
     uv run teleoperator.py
 """
 from __future__ import annotations
+
+import time
 
 import numpy as np
 import rerun as rr
@@ -35,6 +37,61 @@ def log_rerun(namespace: str, data: dict) -> None:
             rr.log(entity, rr.Image(v).compress())
         else:
             rr.log(entity, rr.Scalars(float(v)))
+
+
+def _us_to_ms(us: int | None) -> float | None:
+    return us / 1e3 if us else None
+
+
+def log_metrics(m) -> str:
+    """Log Portal metrics to rerun under `metrics.*` and return a one-line summary.
+
+    Only logs fields that are actually present — Portal's metrics proto marks
+    warm-up values (RTT / sync delta p50/p95) as optional so we don't pollute
+    plots with zeros before enough samples have accumulated.
+    """
+    parts: list[str] = []
+
+    rtt_last = _us_to_ms(m.rtt.rtt_us_last if m.rtt.HasField("rtt_us_last") else None)
+    rtt_mean = _us_to_ms(m.rtt.rtt_us_mean if m.rtt.HasField("rtt_us_mean") else None)
+    rtt_p95 = _us_to_ms(m.rtt.rtt_us_p95 if m.rtt.HasField("rtt_us_p95") else None)
+    if rtt_last is not None:
+        rr.log("metrics.rtt_last_ms", rr.Scalars(rtt_last))
+    if rtt_mean is not None:
+        rr.log("metrics.rtt_mean_ms", rr.Scalars(rtt_mean))
+    parts.append(
+        f"rtt={rtt_last:.1f}/{rtt_mean:.1f}/{rtt_p95:.1f}ms"
+        if rtt_last is not None and rtt_mean is not None and rtt_p95 is not None
+        else "rtt=-"
+    )
+
+    sync_p50 = _us_to_ms(
+        m.sync.match_delta_us_p50 if m.sync.HasField("match_delta_us_p50") else None
+    )
+    sync_p95 = _us_to_ms(
+        m.sync.match_delta_us_p95 if m.sync.HasField("match_delta_us_p95") else None
+    )
+    if sync_p50 is not None:
+        rr.log("metrics.sync_delta_p50_ms", rr.Scalars(sync_p50))
+    if sync_p95 is not None:
+        rr.log("metrics.sync_delta_p95_ms", rr.Scalars(sync_p95))
+    parts.append(
+        f"sync={sync_p50:.1f}/{sync_p95:.1f}ms"
+        if sync_p50 is not None and sync_p95 is not None
+        else "sync=-"
+    )
+
+    state_jitter = _us_to_ms(m.transport.state_jitter_us) or 0.0
+    action_jitter = _us_to_ms(m.transport.action_jitter_us) or 0.0
+    rr.log("metrics.state_jitter_ms", rr.Scalars(state_jitter))
+    rr.log("metrics.action_jitter_ms", rr.Scalars(action_jitter))
+    parts.append(f"jitter={state_jitter:.1f}/{action_jitter:.1f}ms")
+
+    drops = m.sync.states_dropped
+    rr.log("metrics.states_dropped", rr.Scalars(float(drops)))
+    parts.append(f"drops={drops}")
+
+    return " ".join(parts)
 
 
 def main() -> None:
@@ -68,7 +125,7 @@ def main() -> None:
     print(f"[operator] '{IDENTITY}' in '{room}' @ {fps} fps; ctrl-c to stop")
 
     try:
-        for _ in pace(fps):
+        for i in pace(fps):
             # Send action first so control latency never waits on rerun logging.
             if action := leader.get_action():
                 robot.send_action(action)
@@ -79,9 +136,19 @@ def main() -> None:
             # reflects what happened on the physical robot, not receive time.
             if ts_us := robot.last_observation_timestamp_us:
                 rr.set_time("robot_time", timestamp=ts_us / 1e6)
+                # End-to-end staleness: how old is the obs we're acting on?
+                # Includes sender→receiver transport + Portal sync buffering.
+                age_ms = (time.time() * 1e6 - ts_us) / 1e3
+                rr.log("metrics.obs_age_ms", rr.Scalars(age_ms))
 
             log_rerun("observation", obs or {})
             log_rerun("action", action or {})
+
+            # Snapshot transport metrics once per second — cheap, but no need
+            # to poll the FFI every tick.
+            if i % fps == 0 and (m := robot.metrics()) is not None:
+                summary = log_metrics(m)
+                print(f"[operator] {summary}")
     except KeyboardInterrupt:
         print("\n[operator] stopping ...")
     finally:

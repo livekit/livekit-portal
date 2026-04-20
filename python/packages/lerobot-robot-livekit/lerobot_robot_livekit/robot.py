@@ -194,6 +194,13 @@ class LiveKitRobot(Robot):
         returned by :meth:`get_observation`, or ``None`` if none yet."""
         return self._last_observation_timestamp_us
 
+    def metrics(self):
+        """Snapshot of the underlying Portal's metrics (RTT, sync delta, jitter,
+        buffer fill, drops). Returns ``None`` when disconnected."""
+        if self._portal is None:
+            return None
+        return self._portal.metrics()
+
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """Publish an action to the remote robot. Returns ``action`` unchanged
         so callers can record it."""
