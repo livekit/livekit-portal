@@ -127,10 +127,10 @@ def dispatch(event: ffi_pb2.FfiEvent) -> None:
         _resolve_async(cb.async_id, cb.error if cb.HasField("error") else None)
     elif which == "action":
         ev = event.action
-        _dispatch_push(ev.portal_handle, "action", dict(ev.values))
+        _dispatch_push(ev.portal_handle, "action", _build_action(ev))
     elif which == "state":
         ev = event.state
-        _dispatch_push(ev.portal_handle, "state", dict(ev.values))
+        _dispatch_push(ev.portal_handle, "state", _build_state(ev))
     elif which == "observation":
         ev = event.observation
         _dispatch_push(ev.portal_handle, "observation", _build_observation(ev.observation))
@@ -175,3 +175,15 @@ def _build_video_frame(proto_frame: Any) -> Any:
         data=proto_frame.data,
         timestamp_us=proto_frame.timestamp_us,
     )
+
+
+def _build_action(ev: Any) -> Any:
+    from . import Action
+
+    return Action(values=dict(ev.values), timestamp_us=ev.timestamp_us)
+
+
+def _build_state(ev: Any) -> Any:
+    from . import State
+
+    return State(values=dict(ev.values), timestamp_us=ev.timestamp_us)

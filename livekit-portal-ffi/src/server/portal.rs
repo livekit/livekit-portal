@@ -37,24 +37,29 @@ impl FfiPortal {
         let action_fields = Arc::new(action_fields);
         let video_tracks = Arc::new(video_tracks);
 
-        // on_action: Robot-side. Emit the received action values, ordered by
-        // declared action_fields.
+        // on_action: Robot-side. Emit the received action values with the
+        // sender's timestamp, ordered by declared action_fields.
         {
             let fields = action_fields.clone();
-            inner.on_action(move |map| {
-                FFI_SERVER.send_event(proto::ffi_event::Message::Action(
-                    proto::ActionEvent { portal_handle: handle, values: clone_map(map, &fields) },
-                ));
+            inner.on_action(move |timestamp_us, map| {
+                FFI_SERVER.send_event(proto::ffi_event::Message::Action(proto::ActionEvent {
+                    portal_handle: handle,
+                    values: clone_map(map, &fields),
+                    timestamp_us,
+                }));
             });
         }
 
-        // on_state: Operator-side. Emit the raw received state (unsynced).
+        // on_state: Operator-side. Emit the raw received state (unsynced)
+        // with the sender's timestamp.
         {
             let fields = state_fields.clone();
-            inner.on_state(move |map| {
-                FFI_SERVER.send_event(proto::ffi_event::Message::State(
-                    proto::StateEvent { portal_handle: handle, values: clone_map(map, &fields) },
-                ));
+            inner.on_state(move |timestamp_us, map| {
+                FFI_SERVER.send_event(proto::ffi_event::Message::State(proto::StateEvent {
+                    portal_handle: handle,
+                    values: clone_map(map, &fields),
+                    timestamp_us,
+                }));
             });
         }
 

@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import Action, Portal, PortalConfig, Role
 from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
 
 IDENTITY = "robot"
@@ -82,11 +82,14 @@ async def main() -> None:
 
     actions_received = 0
 
-    def on_action(values: dict) -> None:
+    def on_action(action: Action) -> None:
         nonlocal actions_received
         actions_received += 1
         if actions_received % max(1, fps) == 0:
-            print(f"[robot] action #{actions_received}: {values}")
+            print(
+                f"[robot] action #{actions_received}: ts={action.timestamp_us} "
+                f"values={action.values}"
+            )
 
     portal.on_action(on_action)
 

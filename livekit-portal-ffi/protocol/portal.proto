@@ -157,6 +157,7 @@ message GetActionRequest {
 message GetActionResponse {
   map<string, double> values = 1;
   bool present = 2;
+  optional uint64 timestamp_us = 3;
 }
 
 message GetStateRequest {
@@ -165,6 +166,7 @@ message GetStateRequest {
 message GetStateResponse {
   map<string, double> values = 1;
   bool present = 2;
+  optional uint64 timestamp_us = 3;
 }
 
 message GetVideoFrameRequest {
@@ -194,6 +196,7 @@ message ResetMetricsResponse {}
 message ActionEvent {
   uint64 portal_handle = 1;
   map<string, double> values = 2;
+  uint64 timestamp_us = 3;
 }
 
 message ObservationEvent {
@@ -204,6 +207,7 @@ message ObservationEvent {
 message StateEvent {
   uint64 portal_handle = 1;
   map<string, double> values = 2;
+  uint64 timestamp_us = 3;
 }
 
 message VideoFrameEvent {
