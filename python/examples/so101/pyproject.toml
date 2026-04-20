@@ -1,0 +1,22 @@
+[project]
+name = "livekit-portal-so101-example"
+version = "0.1.0"
+description = "Teleoperate a single-camera SO-101 over a LiveKit Portal session"
+requires-python = ">=3.12"
+dependencies = [
+    "livekit-portal",
+    "lerobot-robot-livekit",
+    "lerobot-teleoperator-livekit",
+    "lerobot[feetech]>=0.5",
+    "livekit-api>=0.7",
+    "python-dotenv>=1",
+    "rerun-sdk>=0.26",
+]
+
+# Relative paths so the example stays self-contained: `uv sync` in this
+# directory links the three sibling packages as editable installs without
+# requiring workspace coordination.
+[tool.uv.sources]
+livekit-portal = { path = "../../packages/livekit-portal", editable = true }
+lerobot-robot-livekit = { path = "../../packages/lerobot-robot-livekit", editable = true }
+lerobot-teleoperator-livekit = { path = "../../packages/lerobot-teleoperator-livekit", editable = true }
