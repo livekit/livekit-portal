@@ -17,6 +17,6 @@ dependencies = [
 # directory links the three sibling packages as editable installs without
 # requiring workspace coordination.
 [tool.uv.sources]
-livekit-portal = { path = "../../packages/livekit-portal", editable = true }
-lerobot-robot-livekit = { path = "../../packages/lerobot-robot-livekit", editable = true }
-lerobot-teleoperator-livekit = { path = "../../packages/lerobot-teleoperator-livekit", editable = true }
+livekit-portal = { path = "../../../python/packages/livekit-portal", editable = true }
+lerobot-robot-livekit = { path = "../../../python/packages/lerobot-robot-livekit", editable = true }
+lerobot-teleoperator-livekit = { path = "../../../python/packages/lerobot-teleoperator-livekit", editable = true }

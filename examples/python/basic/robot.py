@@ -7,8 +7,8 @@ Prints any action it receives from the operator. Runs for
 PORTAL_DURATION_SECONDS (default 30) then cleanly disconnects.
 
 Usage:
-    cp examples/.env.example examples/.env   # fill in API_KEY / API_SECRET
-    python examples/robot.py
+    cp .env.example .env   # fill in API_KEY / API_SECRET
+    uv run robot.py
 """
 from __future__ import annotations
 

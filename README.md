@@ -198,24 +198,27 @@ Callbacks fire on the asyncio loop that was running when you called `on_action` 
 
 ### Python. end-to-end test
 
-`examples/robot.py` and `examples/teleoperator.py` exercise both roles against a LiveKit server. They mint their own JWTs from `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, so you just need the API credentials and a running server.
+`examples/python/basic/` exercises both roles against a LiveKit server. It mints its own JWTs from `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`, so you just need the API credentials and a running server.
 
 ```bash
-cp python/examples/.env.example python/examples/.env
+cp examples/python/basic/.env.example examples/python/basic/.env
 # fill in LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
 ```
 
 Then in two terminals:
 
 ```bash
-cd python
-uv run examples/robot.py             # terminal 1
-uv run examples/teleoperator.py      # terminal 2
+cd examples/python/basic
+uv sync                       # once
+uv run robot.py               # terminal 1
+uv run teleoperator.py        # terminal 2
 ```
 
 `uv run` handles the venv automatically. no `source .venv/bin/activate` needed. The first run resolves dependencies and installs the package; later runs reuse the cached env.
 
-For each directory in `<script_dir>`, `<script_dir>/..`, then `<cwd>`, the loader reads `.env` first and then `.env.local` (local overrides .env). The first directory that contains either file wins, so put credentials in `examples/.env` (committed-template-adjacent) or `examples/.env.local` (gitignored, your real values).
+For each directory in `<script_dir>`, `<script_dir>/..`, then `<cwd>`, the loader reads `.env` first and then `.env.local` (local overrides .env). The first directory that contains either file wins, so put credentials in `.env` (committed-template-adjacent) or `.env.local` (gitignored, your real values).
+
+For a hardware teleop example (physical SO-101 arm driven from a remote leader, synced camera + joint state rendered in [rerun](https://rerun.io)), see `examples/python/so101/`.
 
 ## License
 
