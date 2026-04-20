@@ -130,13 +130,14 @@ impl Drop for DataPublisher {
 
 // --- Receiver (dispatches DataReceived events) ---
 
-pub(crate) type DataCb = Box<dyn Fn(&HashMap<String, f64>) + Send + Sync>;
+pub(crate) type DataCb = Box<dyn Fn(u64, &HashMap<String, f64>) + Send + Sync>;
 
 /// Push callback + latest-wins slot for a single data stream (state or action),
-/// paired so receivers and getters share one allocation.
+/// paired so receivers and getters share one allocation. The `u64` is the
+/// sender's wall-clock timestamp in microseconds, carried on the wire.
 pub(crate) struct DataSlots {
     pub cb: Mutex<Option<DataCb>>,
-    pub latest: Mutex<Option<HashMap<String, f64>>>,
+    pub latest: Mutex<Option<(u64, HashMap<String, f64>)>>,
 }
 
 impl DataSlots {
@@ -146,12 +147,12 @@ impl DataSlots {
 
     /// Build the field map once, fire the callback by reference (no clone),
     /// then hand ownership to the latest slot.
-    fn deliver(&self, fields: &[String], values: &[f64]) {
+    fn deliver(&self, timestamp_us: u64, fields: &[String], values: &[f64]) {
         let map = to_field_map(fields, values);
         if let Some(cb) = self.cb.lock().as_ref() {
-            cb(&map);
+            cb(timestamp_us, &map);
         }
-        *self.latest.lock() = Some(map);
+        *self.latest.lock() = Some((timestamp_us, map));
     }
 
     pub fn clear(&self) {
@@ -183,14 +184,14 @@ pub(crate) fn handle_data_received(
         (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
             Ok((send_ts, values)) => {
                 metrics.record_action_received(send_ts, now_us());
-                action.deliver(action_fields, &values);
+                action.deliver(send_ts, action_fields, &values);
             }
             Err(e) => log::warn!("failed to deserialize action payload: {e}"),
         },
         (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
             Ok((timestamp_us, values)) => {
                 metrics.record_state_received(timestamp_us, now_us());
-                state.deliver(state_fields, &values);
+                state.deliver(timestamp_us, state_fields, &values);
                 if let Some(sb) = sync_buffer {
                     return sb.lock().push_state(timestamp_us, values);
                 }

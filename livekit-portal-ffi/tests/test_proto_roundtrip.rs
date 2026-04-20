@@ -78,6 +78,48 @@ fn connect_callback_with_error_roundtrips() {
 }
 
 #[test]
+fn action_event_carries_timestamp() {
+    let mut values = HashMap::new();
+    values.insert("j1".to_string(), 0.5);
+    let event = proto::FfiEvent {
+        message: Some(proto::ffi_event::Message::Action(proto::ActionEvent {
+            portal_handle: 7,
+            values,
+            timestamp_us: 1_713_300_000_000,
+        })),
+    };
+    roundtrip(&event);
+}
+
+#[test]
+fn state_event_carries_timestamp() {
+    let mut values = HashMap::new();
+    values.insert("j1".to_string(), 1.25);
+    let event = proto::FfiEvent {
+        message: Some(proto::ffi_event::Message::State(proto::StateEvent {
+            portal_handle: 7,
+            values,
+            timestamp_us: 1_713_300_001_000,
+        })),
+    };
+    roundtrip(&event);
+}
+
+#[test]
+fn get_action_response_carries_timestamp() {
+    let mut values = HashMap::new();
+    values.insert("j1".to_string(), -0.25);
+    let resp = proto::FfiResponse {
+        message: Some(proto::ffi_response::Message::GetAction(proto::GetActionResponse {
+            values,
+            present: true,
+            timestamp_us: Some(1_713_300_002_000),
+        })),
+    };
+    roundtrip(&resp);
+}
+
+#[test]
 fn drop_event_roundtrips() {
     let mut values = HashMap::new();
     values.insert("j1".to_string(), 0.0);

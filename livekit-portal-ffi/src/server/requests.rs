@@ -274,8 +274,16 @@ fn on_get_action(
 ) -> FfiResult<proto::GetActionResponse> {
     let ffi = server.retrieve_handle::<FfiPortal>(req.portal_handle)?;
     match ffi.inner.get_action() {
-        Some(map) => Ok(proto::GetActionResponse { values: map, present: true }),
-        None => Ok(proto::GetActionResponse { values: HashMap::new(), present: false }),
+        Some((timestamp_us, map)) => Ok(proto::GetActionResponse {
+            values: map,
+            present: true,
+            timestamp_us: Some(timestamp_us),
+        }),
+        None => Ok(proto::GetActionResponse {
+            values: HashMap::new(),
+            present: false,
+            timestamp_us: None,
+        }),
     }
 }
 
@@ -285,8 +293,16 @@ fn on_get_state(
 ) -> FfiResult<proto::GetStateResponse> {
     let ffi = server.retrieve_handle::<FfiPortal>(req.portal_handle)?;
     match ffi.inner.get_state() {
-        Some(map) => Ok(proto::GetStateResponse { values: map, present: true }),
-        None => Ok(proto::GetStateResponse { values: HashMap::new(), present: false }),
+        Some((timestamp_us, map)) => Ok(proto::GetStateResponse {
+            values: map,
+            present: true,
+            timestamp_us: Some(timestamp_us),
+        }),
+        None => Ok(proto::GetStateResponse {
+            values: HashMap::new(),
+            present: false,
+            timestamp_us: None,
+        }),
     }
 }
 

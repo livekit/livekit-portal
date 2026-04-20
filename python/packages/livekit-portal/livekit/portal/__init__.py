@@ -4,7 +4,8 @@ Public surface:
   - `Role`. enum (ROBOT, OPERATOR)
   - `PortalConfig`. builder; construct, configure, then hand to Portal()
   - `Portal`. main object; `await connect/disconnect`, send/get, on_* callbacks
-  - `Observation`, `VideoFrameData`. dataclasses returned by callbacks and get_*
+  - `Observation`, `Action`, `State`, `VideoFrameData`. dataclasses returned by
+    callbacks and get_*
   - `PortalError`. exception type raised for Rust-side errors
 
 Frame formats: sends take RGB24 (bytes or `np.ndarray(H, W, 3)` uint8);
@@ -53,6 +54,29 @@ class Observation:
     timestamp_us: int
     state: Dict[str, float]
     frames: Dict[str, VideoFrameData] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Action:
+    """An action received from the operator (Robot side).
+
+    `timestamp_us` is the sender's wall-clock time in microseconds.
+    """
+
+    values: Dict[str, float]
+    timestamp_us: int
+
+
+@dataclass(frozen=True)
+class State:
+    """A state received from the robot (Operator side, un-synced path).
+
+    For synchronized state matched with frames, use `Observation` instead.
+    `timestamp_us` is the sender's wall-clock time in microseconds.
+    """
+
+    values: Dict[str, float]
+    timestamp_us: int
 
 
 # --- internal request builders ----------------------------------------------
@@ -306,13 +330,17 @@ class Portal:
             return None
         return _build_observation(resp.observation)
 
-    def get_action(self) -> Optional[Dict[str, float]]:
+    def get_action(self) -> Optional[Action]:
         resp = _call("get_action", portal_pb2.GetActionRequest(portal_handle=self._handle))
-        return dict(resp.values) if resp.present else None
+        if not resp.present:
+            return None
+        return Action(values=dict(resp.values), timestamp_us=resp.timestamp_us)
 
-    def get_state(self) -> Optional[Dict[str, float]]:
+    def get_state(self) -> Optional[State]:
         resp = _call("get_state", portal_pb2.GetStateRequest(portal_handle=self._handle))
-        return dict(resp.values) if resp.present else None
+        if not resp.present:
+            return None
+        return State(values=dict(resp.values), timestamp_us=resp.timestamp_us)
 
     def get_video_frame(self, track_name: str) -> Optional[VideoFrameData]:
         resp = _call(
@@ -325,12 +353,12 @@ class Portal:
 
     # -- push callbacks ------------------------------------------------------
 
-    def on_action(self, callback: Callable[[Dict[str, float]], None]) -> None:
+    def on_action(self, callback: Callable[[Action], None]) -> None:
         _events.register_push(
             self._handle, "action", callback, asyncio.get_event_loop()
         )
 
-    def on_state(self, callback: Callable[[Dict[str, float]], None]) -> None:
+    def on_state(self, callback: Callable[[State], None]) -> None:
         _events.register_push(
             self._handle, "state", callback, asyncio.get_event_loop()
         )
@@ -411,6 +439,8 @@ __all__ = [
     "PortalConfig",
     "Portal",
     "Observation",
+    "Action",
+    "State",
     "VideoFrameData",
     "PortalError",
     "i420_bytes_to_numpy_rgb",

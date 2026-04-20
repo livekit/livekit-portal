@@ -182,11 +182,11 @@ class LiveKitTeleoperator(Teleoperator):
         robot's ``action_features``. Empty dict if nothing has arrived."""
         if self._portal is None:
             return {}
-        values = self._portal.get_action()
-        if not values:
+        action = self._portal.get_action()
+        if action is None:
             return {}
         return {
-            k: float(values.get(m, 0.0))
+            k: float(action.values.get(m, 0.0))
             for k, m in zip(self._action_keys, self._action_motors)
         }
 

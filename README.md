@@ -35,7 +35,8 @@ portal = Portal(config)
 await portal.connect(url, token)
 
 def on_action(action):
-    robot.send_action(action)
+    # action.values is the dict; action.timestamp_us is the sender's clock (µs).
+    robot.send_action(action.values)
 
 portal.on_action(on_action)
 
@@ -182,7 +183,7 @@ async def main():
     cfg.add_action(["j1", "j2", "j3"])
 
     portal = Portal(cfg)
-    portal.on_action(lambda values: print("got action", values))
+    portal.on_action(lambda a: print("got action", a.values, "ts", a.timestamp_us))
 
     await portal.connect(url, token)
     # send RGB bytes or a numpy (H, W, 3) uint8 array

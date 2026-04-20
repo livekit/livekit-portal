@@ -291,13 +291,15 @@ impl Portal {
         self.obs_sink.get()
     }
 
-    /// Clone of the latest action received (Robot side), or `None`.
-    pub fn get_action(&self) -> Option<HashMap<String, f64>> {
+    /// Clone of the latest action received (Robot side), or `None`. The
+    /// `u64` is the sender's wall-clock timestamp in microseconds.
+    pub fn get_action(&self) -> Option<(u64, HashMap<String, f64>)> {
         self.action.latest.lock().clone()
     }
 
-    /// Clone of the latest state received (Operator side), or `None`.
-    pub fn get_state(&self) -> Option<HashMap<String, f64>> {
+    /// Clone of the latest state received (Operator side), or `None`. The
+    /// `u64` is the sender's wall-clock timestamp in microseconds.
+    pub fn get_state(&self) -> Option<(u64, HashMap<String, f64>)> {
         self.state.latest.lock().clone()
     }
 
@@ -308,7 +310,10 @@ impl Portal {
 
     // --- Callback registration (push API) ---
 
-    pub fn on_action(&self, callback: impl Fn(&HashMap<String, f64>) + Send + Sync + 'static) {
+    pub fn on_action(
+        &self,
+        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
+    ) {
         *self.action.cb.lock() = Some(Box::new(callback));
     }
 
@@ -316,7 +321,10 @@ impl Portal {
         self.obs_sink.set_observation_cb(Box::new(callback));
     }
 
-    pub fn on_state(&self, callback: impl Fn(&HashMap<String, f64>) + Send + Sync + 'static) {
+    pub fn on_state(
+        &self,
+        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
+    ) {
         *self.state.cb.lock() = Some(Box::new(callback));
     }
 
