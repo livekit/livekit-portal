@@ -161,9 +161,13 @@ class _RpcHandlerAdapter(_ffi.RpcHandler):
             if asyncio.iscoroutine(result):
                 return await result
             return result  # type: ignore[return-value]
-        except _ffi.RpcError:
+        except (_ffi.RpcError, asyncio.CancelledError):
+            # RpcError: user-signalled application error, propagate verbatim.
+            # CancelledError: the Rust side dropped the future (timeout or
+            # caller cancellation); let asyncio unwind the task cleanly
+            # instead of writing a bogus result on a torn-down handle.
             raise
-        except BaseException as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             raise _ffi.RpcError.Error(
                 code=1500,
