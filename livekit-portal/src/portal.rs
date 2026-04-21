@@ -94,6 +94,12 @@ struct ConnectionState {
 pub struct Portal {
     config: PortalConfig,
 
+    // Serializes connect()/disconnect() so a disconnect() yielding on
+    // room.close().await can't be overtaken by a concurrent connect()
+    // whose newly-populated state would then be clobbered by the
+    // disconnect's cleanup path.
+    lifecycle: tokio::sync::Mutex<()>,
+
     // Lifecycle state (connect/disconnect).
     conn: Mutex<ConnectionState>,
 
@@ -143,6 +149,7 @@ impl Portal {
 
         Self {
             config,
+            lifecycle: tokio::sync::Mutex::new(()),
             conn: Mutex::new(ConnectionState {
                 room: None,
                 local_participant: None,
@@ -165,6 +172,7 @@ impl Portal {
     }
 
     pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if self.conn.lock().room.is_some() {
             return Err(PortalError::AlreadyConnected);
         }
@@ -365,6 +373,7 @@ impl Portal {
     }
 
     pub async fn disconnect(&self) -> PortalResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let room = self.conn.lock().room.take();
         log::info!("disconnecting");
 

@@ -23,9 +23,12 @@ frames for display.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import traceback
 from typing import Any, Callable, Dict, List, Optional
+
+_log = logging.getLogger(__name__)
 
 from . import _frame
 from . import livekit_portal_ffi as _ffi
@@ -124,6 +127,34 @@ class _Dispatcher(_ffi.PortalCallbacks):
 
     def set_video(self, track_name: str, cb: Callable[[str, VideoFrameData], Any]) -> None:
         self._video_cbs[track_name] = cb
+
+
+_uniffi_bound_loop: Optional[asyncio.AbstractEventLoop] = None
+_uniffi_bound_loop_lock = threading.Lock()
+
+
+def _set_uniffi_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Point UniFFI's global async-trait dispatch at `loop`.
+
+    The underlying `uniffi_set_event_loop` is a process-global — multiple
+    Portals on different asyncio loops in the same process will collide.
+    Warn on mismatch so the misuse is at least visible rather than a silent
+    cross-loop dispatch. The normal single-loop case is a no-op on the
+    second call.
+    """
+    global _uniffi_bound_loop
+    with _uniffi_bound_loop_lock:
+        if _uniffi_bound_loop is loop:
+            return
+        if _uniffi_bound_loop is not None and _uniffi_bound_loop.is_running():
+            _log.warning(
+                "livekit-portal: multiple Portals bound to different asyncio "
+                "loops in the same process; RPC handler dispatch will run on "
+                "the most-recently-connected loop. This is a UniFFI "
+                "limitation (uniffi_set_event_loop is process-global)."
+            )
+        _uniffi_bound_loop = loop
+        _ffi.uniffi_set_event_loop(loop)
 
 
 def _safely_call(cb: Callable[..., Any], *args: Any) -> None:
@@ -297,7 +328,7 @@ class Portal:
         # from a tokio worker with no asyncio loop of its own.
         loop = asyncio.get_running_loop()
         self._dispatcher.bind_loop(loop)
-        _ffi.uniffi_set_event_loop(loop)
+        _set_uniffi_event_loop(loop)
         await self._inner.connect(url, token)
 
     async def disconnect(self) -> None:
