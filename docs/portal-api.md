@@ -8,27 +8,28 @@ including the optional lerobot plugins, is built on top of this API.
 
 ## Installation
 
-```bash
-uv pip install livekit-portal
-```
-
-From source:
+Portal is not on PyPI yet. You build from source. See the
+[Quickstart](quickstart.md#1-install) for the full flow. Summary:
 
 ```bash
-cd python/packages/livekit-portal
+git clone https://github.com/livekit/livekit-portal.git
+cd livekit-portal/python/packages/livekit-portal
+
 uv sync
-bash scripts/build_native.sh release
+bash scripts/build_native.sh release       # or `debug` for faster iteration
 ```
 
-`scripts/build_native.sh debug` is faster to iterate on. If the cdylib
-lives elsewhere (e.g. during Rust-side dev), point
+If the cdylib lives elsewhere (e.g. during Rust-side dev), point
 `LIVEKIT_PORTAL_FFI_LIB` at it and skip the copy step.
 
 ### Rust
 
+The core crate is usable directly without going through Python. From
+another Cargo workspace, depend on the path:
+
 ```toml
 [dependencies]
-livekit-portal = { path = "livekit-portal" }
+livekit-portal = { path = "path/to/livekit-portal/livekit-portal" }
 ```
 
 Python bindings ship via the `livekit-portal-ffi` crate (UniFFI + C ABI)

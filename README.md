@@ -17,10 +17,8 @@
 <!--END_DESCRIPTION-->
 
 <p align="center">
-  <a href="#at-a-glance">Show me</a> ·
-  <a href="#install">Install</a> ·
+  <a href="#quickstart">Quickstart</a> ·
   <a href="#examples">Examples</a> ·
-  <a href="docs/quickstart.md">Quickstart</a> ·
   <a href="docs/portal-api.md">Portal API</a> ·
   <a href="docs/concepts.md">Concepts</a> ·
   <a href="docs/synchronization.md">Deep dive</a>
@@ -40,7 +38,38 @@
 
 ---
 
-## At a glance
+## Quickstart
+
+### Install
+
+Portal is not on PyPI yet, and there are no prebuilt native binaries.
+Today you build from source. The flow is one clone, one build, one sync.
+
+**Prerequisites:**
+
+- A [Rust toolchain](https://rustup.rs/) (stable `cargo`)
+- Python 3.10+
+- [`uv`](https://docs.astral.sh/uv/)
+
+```bash
+git clone https://github.com/livekit/livekit-portal.git
+cd livekit-portal/python/packages/livekit-portal
+
+uv sync                                    # install Python deps into .venv
+bash scripts/build_native.sh release       # compile cdylib + generate UniFFI bindings
+```
+
+`build_native.sh` calls `cargo build -p livekit-portal-ffi`, drops the
+resulting `liblivekit_portal_ffi.{dylib,so,dll}` next to the Python
+sources, and runs `uniffi-bindgen` to emit the matching Python module. On
+a cold machine this takes a couple of minutes.
+
+Now `from livekit.portal import Portal` works inside
+`python/packages/livekit-portal/.venv/`. To depend on the package from
+another project, `pip install .` (or `pip install -e .`) from the same
+directory after the native build. Prebuilt wheels are on the roadmap.
+
+### Code
 
 A complete remote-robot session in two files. The robot host publishes
 frames and state, executes actions, and exposes a `home` RPC. The control
@@ -117,9 +146,9 @@ asyncio.run(main())
 
 That is the whole surface at work in one page. Synced observations, an
 action callback, an RPC for one-shots, and a live metrics snapshot. The
-code above is a sketch, not a runnable file. The real one is in
-[`examples/python/basic/`](examples/python/basic) with token minting
-already wired up.
+code above is a sketch. For a runnable version with token minting already
+wired up, see [`examples/python/basic/`](examples/python/basic) or the
+step-by-step [Quickstart doc](docs/quickstart.md).
 
 ## The idea
 
@@ -132,22 +161,6 @@ You use Portal by wrapping whatever code already drives your robot. On the
 robot host, you publish frames and state through a `Portal` object. On the
 control host, you receive them as a bundled `Observation` and publish actions
 back. No framework is assumed.
-
-## Install
-
-```bash
-uv pip install livekit-portal
-# or
-pip install livekit-portal
-```
-
-For local development, build the native library once:
-
-```bash
-cd python/packages/livekit-portal
-uv sync
-bash scripts/build_native.sh release
-```
 
 ## Examples
 

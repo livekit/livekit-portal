@@ -8,6 +8,7 @@ this page that wraps the same code.
 
 ## What you need
 
+- A [Rust toolchain](https://rustup.rs/) (stable `cargo`)
 - Python 3.10+ and [`uv`](https://docs.astral.sh/uv/)
 - A LiveKit server: [LiveKit Cloud](https://cloud.livekit.io) (free tier
   works) or a local `livekit-server --dev`
@@ -18,17 +19,25 @@ a synthetic test pattern.
 
 ## 1. Install
 
-```bash
-uv pip install livekit-portal
-```
-
-For local development from this repo:
+Portal is not on PyPI yet, and there are no prebuilt native binaries. You
+build from source.
 
 ```bash
-cd python/packages/livekit-portal
-uv sync
-bash scripts/build_native.sh release
+git clone https://github.com/livekit/livekit-portal.git
+cd livekit-portal/python/packages/livekit-portal
+
+uv sync                                    # install Python deps into .venv
+bash scripts/build_native.sh release       # compile cdylib + generate UniFFI bindings
 ```
+
+`build_native.sh` runs `cargo build -p livekit-portal-ffi`, drops the
+platform cdylib (`liblivekit_portal_ffi.{dylib,so,dll}`) next to the
+Python package, and emits the matching UniFFI Python module. First build
+takes a couple of minutes. Subsequent builds are incremental.
+
+To use the package from another project, run `pip install .` (or
+`pip install -e .`) from the same directory after the native build.
+Prebuilt wheels are on the roadmap.
 
 ## 2. Mint tokens
 
