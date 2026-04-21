@@ -12,7 +12,7 @@ config.set_tolerance(1.5)     # match window in tick units (default: 1.5)
 config.set_state_reliable(True)   # default: True
 config.set_action_reliable(True)  # default: True
 
-config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
+config.set_ping_ms(1000)      # RTT ping cadence. 0 disables. default: 1000.
 ```
 
 ## The three knobs
@@ -27,8 +27,8 @@ config.set_ping_ms(1000)      # RTT ping cadence; 0 disables (default: 1000)
 
 | Use case | Pick | Why |
 |---|---|---|
-| Real-time inference / control | `0.5` | A misaligned observation is silently wrong; a drop is an explicit signal. |
-| Data collection for VLA training | `1.5` | A ±1-tick misalignment (~16 ms @ 60 fps) is invisible to a trained model; a dropped observation is lost data. |
+| Real-time inference / control | `0.5` | A misaligned observation is silently wrong. A drop is an explicit signal. |
+| Data collection for VLA training | `1.5` | A ±1-tick misalignment (~16 ms @ 60 fps) is invisible to a trained model. A dropped observation is lost data. |
 | Teleop viewer | `1.5` | Visual continuity > frame-perfect alignment. |
 | Clean local network (<1% loss) | either | Drops are already rare. |
 | Lossy / cellular / wireless | `1.5` | Widening materially reduces drop rate under real loss. |
@@ -68,7 +68,7 @@ config.set_action_reliable(True)   # actions typically want ordering
 `portal.metrics()` exposes the live sync and transport counters: RTT
 percentiles, match-delta percentiles, per-track frame jitter, buffer fill,
 observations emitted, states dropped. The examples under `examples/python/`
-print these periodically; adapt `periodic_metrics` from
+print these periodically. Adapt `periodic_metrics` from
 [`examples/python/basic/_common.py`](../examples/python/basic/_common.py) for
 your own scripts.
 

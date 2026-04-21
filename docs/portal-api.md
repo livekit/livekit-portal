@@ -1,9 +1,10 @@
 # Portal API
 
-The primary surface for using livekit-portal from any robotics stack. You
-construct a `PortalConfig`, hand it to a `Portal`, register callbacks, and
-push frames and state or actions. Everything else in this repository
-(including the optional lerobot plugins) is built on top of this API.
+The primary surface for using livekit-portal from any robotics stack.
+
+You construct a `PortalConfig`, hand it to a `Portal`, register callbacks,
+and push frames and state or actions. Everything else in this repository,
+including the optional lerobot plugins, is built on top of this API.
 
 ## Installation
 
@@ -64,7 +65,8 @@ async def main():
     portal = Portal(cfg)
 
     def on_action(action):
-        # action.values is the dict; action.timestamp_us is the sender's clock.
+        # action.values is the dict.
+        # action.timestamp_us is the sender's clock.
         robot.send_action(action.values)
 
     portal.on_action(on_action)
@@ -123,7 +125,7 @@ uint8. Width and height must both be even. Full details in
 - `portal.on_drop(cb)`: states that could not be matched (operator only).
 - `portal.on_action(cb)`: incoming actions (robot only).
 - `portal.on_state(cb)`: raw state firehose (operator only). Every packet
-  fires; if you want paced data, use `on_observation`.
+  fires. Use `on_observation` if you want paced data.
 - `portal.send_action(values, timestamp_us=...)`: operator only.
 - `portal.send_video_frame(name, frame, timestamp_us=...)`: robot only.
 - `portal.send_state(values, timestamp_us=...)`: robot only.
@@ -136,11 +138,11 @@ uint8. Width and height must both be even. Full details in
 
 ## Reference
 
-- [Concepts](concepts.md): roles, observation model, frame format.
-- [Tuning](tuning.md): `fps` / `slack` / `tolerance`, asymmetric rates.
-- [Synchronization deep dive](synchronization.md): the match algorithm.
-- [RPC](rpc.md): imperative commands on top of LiveKit RPC.
-- [`examples/python/basic/`](../examples/python/basic): the smallest
+- [Concepts](concepts.md). Roles, observation model, frame format.
+- [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates.
+- [Synchronization deep dive](synchronization.md). The match algorithm.
+- [RPC](rpc.md). Imperative commands on top of LiveKit RPC.
+- [`examples/python/basic/`](../examples/python/basic). The smallest
   end-to-end script using this API, with synthetic video.
-- [lerobot integration](lerobot.md): the optional convenience plugins that
+- [lerobot integration](lerobot.md). The optional convenience plugins that
   wrap this API for lerobot users.

@@ -9,62 +9,107 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
 
 <!--BEGIN_DESCRIPTION-->
-Teleoperate a robot, or run a policy against it, from anywhere on the internet. Portal is a Rust/Python library that carries cameras, joint state, and actions between a robot host and a control host over LiveKit, and delivers them on the control side as synchronized `(frames, state, timestamp)` observations. Works with any robotics stack; an optional [LeRobot](https://github.com/huggingface/lerobot) plugin adds a one-line wrap for lerobot users.
+Teleoperate a robot, or run a policy against it, from anywhere on the internet. Portal carries cameras, joint state, and actions between a robot host and a control host over LiveKit. On the control side, everything arrives as synchronized `(frames, state, timestamp)` observations. Works with any robotics stack. An optional [LeRobot](https://github.com/huggingface/lerobot) plugin adds a one-line wrap for lerobot users.
 <!--END_DESCRIPTION-->
+
+## Your code does not change
+
+A local lerobot loop looks like this:
+
+```python
+from lerobot.robots.myrobot import MyRobot
+
+robot = MyRobot(config=...)
+robot.connect()
+
+obs = robot.get_observation()
+action = model.select_action(obs)
+robot.send_action(action)
+```
+
+Swap one import and you get the same loop driving a robot on another
+machine, over the internet:
+
+```python
+from lerobot_robot_livekit import LiveKitRobot, LiveKitRobotConfig
+
+robot = LiveKitRobot(LiveKitRobotConfig(url=..., token=..., fps=30,
+                                        camera_names=("cam1",)))
+robot.connect()
+
+obs = robot.get_observation()
+action = model.select_action(obs)
+robot.send_action(action)
+```
+
+Same three lines at the bottom. The robot can be in another room or
+another country. `obs` still arrives as a bundled, timestamp-synced
+observation.
+
+The example above uses the lerobot plugin, because it gives the cleanest
+apples-to-apples comparison. Portal itself is a standalone library. The
+plugin is a thin, optional wrap on top of it. See the
+[30-second sketch](#30-second-sketch) for the same idea in the raw Portal
+API.
 
 ## The idea
 
-Think of your robot as a device that normally plugs into one computer. Portal
-lets it "plug into" a different one over the network, so your teleop
+Think of your robot as a device that normally plugs into one computer.
+Portal lets it plug into a different one over the network. Your teleop
 interface, your training loop, or your policy server can run anywhere and
 still see the robot as if it were local. The physical robot stays in the
-loop; Portal only adds the network tier.
+loop. Portal only adds the network tier.
 
 You use Portal by wrapping whatever code already drives your robot. On the
-robot host you publish frames and state through a `Portal` object; on the
-control host you receive them as a bundled `Observation(frames, state,
+robot host, you publish frames and state through a `Portal` object. On the
+control host, you receive them as a bundled `Observation(frames, state,
 timestamp_us)` and publish actions back. No framework is assumed.
 
 If you happen to be on [lerobot](https://github.com/huggingface/lerobot),
 two optional plugin packages collapse that to a one-line wrap around your
-existing `Robot` or `Teleoperator` (see [lerobot integration](docs/lerobot.md)).
+existing `Robot` or `Teleoperator`. See
+[lerobot integration](docs/lerobot.md).
 
 ## I want to…
 
 | Goal | Start here |
 |---|---|
 | **Wire Portal into my own robotics stack** | [Quickstart](docs/quickstart.md) and [Portal API](docs/portal-api.md) |
-| **Run a policy against a remote robot** | [Quickstart](docs/quickstart.md) (the policy sits on the control side and consumes `Observation`s) |
+| **Run a policy against a remote robot** | [Quickstart](docs/quickstart.md). The policy sits on the control side and consumes `Observation`s. |
 | **See a working end-to-end example with no hardware** | [`examples/python/basic/`](examples/python/basic) |
 | **Shortcut for lerobot users** | [lerobot integration](docs/lerobot.md) |
 
 ## Examples
 
 Running examples is the fastest way to a known-good setup. Both live under
-[`examples/python/`](examples/python):
+[`examples/python/`](examples/python).
 
-- **[`examples/python/basic/`](examples/python/basic)**: no hardware
-  required, uses the Portal API directly. Synthetic video + state on one
-  terminal, subscriber on another. Proves your LiveKit credentials and
-  native build are healthy.
-  ```bash
-  cd examples/python/basic
-  cp .env.example .env            # fill in LIVEKIT_URL / API_KEY / API_SECRET
-  uv sync
-  uv run robot.py                 # terminal 1
-  uv run teleoperator.py          # terminal 2
-  ```
-- **[`examples/python/so101/`](examples/python/so101)**: real hardware, uses
-  the lerobot plugin. Physical **SO-101 follower** driven by a remote
-  **SO-101 leader**, with the camera and joint state rendered in
-  [rerun](https://rerun.io). Full calibration + wiring walkthrough in its
-  [README](examples/python/so101/README.md).
+**[`examples/python/basic/`](examples/python/basic)**
+
+No hardware required. Uses the Portal API directly. Synthetic video and
+state on one terminal, subscriber on another. Proves your LiveKit
+credentials and native build are healthy.
+
+```bash
+cd examples/python/basic
+cp .env.example .env            # fill in LIVEKIT_URL / API_KEY / API_SECRET
+uv sync
+uv run robot.py                 # terminal 1
+uv run teleoperator.py          # terminal 2
+```
+
+**[`examples/python/so101/`](examples/python/so101)**
+
+Real hardware. Uses the lerobot plugin. A physical **SO-101 follower** is
+driven by a remote **SO-101 leader**. Camera and joint state render in
+[rerun](https://rerun.io). Full calibration and wiring walkthrough in its
+[README](examples/python/so101/README.md).
 
 Adapt either to bring up your own setup.
 
 ## 30-second sketch
 
-Robot side (publishes frames and state, receives actions):
+Robot side. Publishes frames and state. Receives actions.
 
 ```python
 from livekit.portal import Portal, PortalConfig, Role
@@ -85,7 +130,7 @@ while running:
     await asyncio.sleep(1 / 30)
 ```
 
-Control side (receives synced observations, publishes actions):
+Control side. Receives synced observations. Publishes actions.
 
 ```python
 from livekit.portal import Portal, PortalConfig, Role
@@ -128,18 +173,18 @@ bash scripts/build_native.sh release
 
 ## Documentation
 
-- [Quickstart](docs/quickstart.md): install, tokens, first run with the
+- [Quickstart](docs/quickstart.md). Install, tokens, first run with the
   Portal API.
-- [Portal API](docs/portal-api.md): the primary surface. `PortalConfig`,
+- [Portal API](docs/portal-api.md). The primary surface. `PortalConfig`,
   callbacks, send methods, role semantics.
-- [Concepts](docs/concepts.md): roles, observation model, frame format.
-- [Tuning](docs/tuning.md): `fps` / `slack` / `tolerance`, asymmetric rates,
+- [Concepts](docs/concepts.md). Roles, observation model, frame format.
+- [Tuning](docs/tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates,
   reliability.
-- [RPC](docs/rpc.md): imperative commands (`home`, `calibrate`, etc.) on top
-  of LiveKit RPC.
-- [Synchronization deep dive](docs/synchronization.md): the full match
+- [RPC](docs/rpc.md). Imperative commands (`home`, `calibrate`, etc.) on
+  top of LiveKit RPC.
+- [Synchronization deep dive](docs/synchronization.md). The full match
   algorithm, cursor bookkeeping, complexity analysis.
-- [lerobot integration](docs/lerobot.md): the optional convenience plugins.
+- [lerobot integration](docs/lerobot.md). The optional convenience plugins.
 
 ## License
 

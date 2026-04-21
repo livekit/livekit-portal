@@ -60,9 +60,11 @@ Identities must be unique within the room (e.g. `"robot"`, `"operator"`).
 
 ## 3. Robot host
 
-Runs next to the hardware. Declares what it will publish (video tracks,
-state fields) and what it will receive (action fields), then pumps frames
-and state at your capture rate.
+Runs next to the hardware.
+
+It declares what it will publish (video tracks, state fields) and what it
+will receive (action fields). Then it pumps frames and state at your
+capture rate.
 
 ```python
 import asyncio, time
@@ -78,7 +80,8 @@ async def main():
     portal = Portal(cfg)
 
     def on_action(a):
-        # a.values is the action dict; a.timestamp_us is the sender's clock
+        # a.values is the action dict.
+        # a.timestamp_us is the sender's clock.
         robot.send_action(a.values)
 
     portal.on_action(on_action)
@@ -98,8 +101,10 @@ asyncio.run(main())
 
 ## 4. Control host
 
-Runs wherever your operator, trainer, or policy lives. Declares the same
-schema, then consumes synchronized observations and publishes actions.
+Runs wherever your operator, trainer, or policy lives.
+
+It declares the same schema as the robot host. Then it consumes
+synchronized observations and publishes actions.
 
 ```python
 import asyncio
@@ -151,10 +156,9 @@ up.
 
 ## Shortcut: lerobot users
 
-If your robot and control code already use the
-[lerobot](https://github.com/huggingface/lerobot) `Robot` / `Teleoperator`
-interfaces, two optional plugin packages wrap the Portal code above so you
-don't have to write it yourself.
+Already using the [lerobot](https://github.com/huggingface/lerobot)
+`Robot` / `Teleoperator` interfaces? Two optional plugin packages wrap
+the Portal code above so you don't have to write it yourself.
 
 ```python
 # robot host: wraps a local lerobot Robot
@@ -186,8 +190,8 @@ and CLI mode: [lerobot integration](lerobot.md).
 
 ## Next steps
 
-- [Portal API](portal-api.md): the full surface. All callbacks, send
+- [Portal API](portal-api.md). The full surface. All callbacks, send
   methods, role semantics.
-- [Concepts](concepts.md): roles, the observation model, frame format.
-- [Tuning](tuning.md): `fps`, `slack`, `tolerance`, asymmetric rates,
+- [Concepts](concepts.md). Roles, the observation model, frame format.
+- [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates,
   reliability.

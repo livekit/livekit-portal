@@ -2,8 +2,8 @@
 
 For imperative commands that don't fit the continuous state/action/observation
 loop (`home`, `start_recording`, `calibrate`, one-off configuration), Portal
-exposes the LiveKit RPC surface directly. Either side can register methods;
-either side can invoke.
+exposes the LiveKit RPC surface directly. Either side can register methods.
+Either side can invoke.
 
 ## Register and call
 
@@ -23,7 +23,7 @@ reply = await portal.perform_rpc("say", payload="hello")
 
 Handlers may be `def` or `async def` and **must return a string**.
 
-Handlers can be registered before or after `connect()`; the stored set is
+Handlers can be registered before or after `connect()`. The stored set is
 reapplied on every reconnect.
 
 ## Errors
@@ -70,5 +70,5 @@ SDK:
 
 Over-limit requests fail with transport error code 1402 (request) or 1504
 (response), not a handler exception. If you need binary, base64-encode it
-yourself; if you're pushing close to the limit continuously, that's a signal
+yourself. If you're pushing close to the limit continuously, that's a signal
 the data belongs on a stream, not in RPC.

@@ -6,7 +6,7 @@ full detail, see [synchronization.md](synchronization.md).
 ## Roles
 
 Portal is a **two-role** system. Each side commits to one role at
-`PortalConfig` construction; calling the wrong send method returns `WrongRole`.
+`PortalConfig` construction. Calling the wrong send method returns `WrongRole`.
 
 | Role | Publishes | Subscribes |
 |------|-----------|------------|
