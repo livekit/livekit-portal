@@ -187,53 +187,6 @@ exactly this, and [LiveKit](https://livekit.io/) wraps it in a
 production-grade SFU with a clean SDK. Portal builds the robotics layer
 on top.
 
-<details>
-<summary><b>Why LiveKit, not raw WebRTC or a custom stack?</b></summary>
-
-&nbsp;
-
-Portal is built on LiveKit, not raw WebRTC and not a custom transport.
-The choice is what lets the codebase stay focused on robotics instead of
-plumbing.
-
-**Production SFU, not a peer-to-peer toy.** A media server routes tracks
-between participants. A robot room with an operator, a policy runner, and
-a passive viewer is the same session as one-to-one. No mesh explosion. No
-re-encoding on the client.
-
-**Signaling, auth, and rooms, already solved.** JWT-based room tokens with
-per-participant permissions. No identity service to design. No handshake
-protocol to write. A robot joins a room. An operator joins the same room.
-They find each other.
-
-**Transport primitives Portal actually needs.** RTP media tracks with
-built-in pacing and bandwidth adaptation. SCTP data channels, reliable or
-unreliable per stream. Typed byte streams layered on top with chunking
-and ordering handled. RPC for one-shots like `home` or `calibrate`.
-Portal maps its observation model onto these directly. On a custom stack,
-the chunked RTC transport and the reconnect logic would be ours to build
-before the robotics work started.
-
-**SDKs in every language the operator might live in.** Rust, Python,
-Swift, Kotlin, JavaScript, Unity. A browser teleop UI speaks the same
-protocol as the robot host. A mobile observer speaks the same protocol.
-
-**Run it anywhere.** [LiveKit Cloud](https://livekit.io/cloud) for zero
-ops, or self-host the open-source server. TURN relays handle NAT
-traversal that a custom UDP stack would have to reimplement.
-
-**Recording and server-side egress.** Session recording lines up with
-dataset capture. Webhooks surface participant events. None of this is
-Portal's problem to solve.
-
-**The honest caveat.** LiveKit is not free. You run a server or pay for
-Cloud. You accept a dependency on another project's release cadence. For
-on-device or LAN-only robots, ROS 2 is the right call. The moment a human
-or a GPU sits across the internet from the robot, LiveKit is what makes
-the robotics layer the interesting part.
-
-</details>
-
 That layer exists because robotics policies want one bundled
 `Observation` per tick: cameras, joint state, and a timestamp arriving
 together. LiveKit's transport primitives do not deliver data that way.
@@ -298,6 +251,27 @@ two optional plugin packages wrap the Portal code above. You pass in your
 existing `Robot` or `Teleoperator` and the remote arm shows up as a local
 lerobot device to any workflow (teleop, dataset recording, policy eval). See
 [lerobot integration](docs/lerobot.md) for the full reference.
+
+## Why LiveKit
+
+Portal sits on LiveKit rather than raw WebRTC or a custom transport. The
+choice keeps the codebase focused on robotics instead of plumbing.
+
+| What LiveKit gives you | Why it matters for Portal |
+|---|---|
+| **Production SFU** | A robot room with an operator, a policy runner, and a passive viewer is the same session as one-to-one. No mesh, no client-side re-encoding. |
+| **Rooms, tokens, auth** | JWT-based permissions per participant. No identity service or handshake protocol to design. |
+| **Transport primitives** | RTP media with pacing and bandwidth adaptation. SCTP data channels, reliable or unreliable. Typed byte streams with chunking. RPC for one-shots. Portal maps observations straight onto these. |
+| **Cross-language SDKs** | Rust, Python, Swift, Kotlin, JavaScript, Unity. A browser teleop UI speaks the same protocol as the robot host. |
+| **Deploy anywhere** | [LiveKit Cloud](https://livekit.io/cloud) for zero ops, or self-host the open-source server. TURN relays handle NAT traversal. |
+| **Recording and egress** | Session recording lines up with dataset capture. Webhooks surface participant events. |
+
+On a raw WebRTC stack you keep the media engine and lose everything
+above. On a custom transport you reimplement all of it before the
+robotics work even starts.
+
+Running on a single machine or a LAN-only robot? You do not need any of
+this. A direct socket is enough.
 
 ## Documentation
 
