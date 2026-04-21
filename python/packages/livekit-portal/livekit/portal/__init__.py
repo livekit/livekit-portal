@@ -1,142 +1,167 @@
 """livekit-portal. Python bindings.
 
-Public surface:
-  - `Role`. enum (ROBOT, OPERATOR)
-  - `PortalConfig`. builder; construct, configure, then hand to Portal()
-  - `Portal`. main object; `await connect/disconnect`, send/get, on_* callbacks
-  - `Observation`, `Action`, `State`, `VideoFrameData`. dataclasses returned by
-    callbacks and get_*
-  - `PortalError`. exception type raised for Rust-side errors
+Thin ergonomic wrapper over the UniFFI-generated `livekit_portal_ffi`
+module. The generated module already exposes `Portal`, `PortalConfig`, the
+record types (`Observation`, `Action`, `State`, `VideoFrame`, `PortalMetrics`
+and nested submetrics), the `PortalError` exception, and the
+`PortalCallbacks` foreign trait. This module:
 
-Frame formats: sends take RGB24 (bytes or `np.ndarray(H, W, 3)` uint8);
-receives deliver I420 (planar Y+U+V concatenated). Use
-`livekit.portal.i420_bytes_to_numpy_rgb` to convert received frames for
-display.
+  * Renames `VideoFrame` to `VideoFrameData` for backwards API parity with
+    the old protobuf-based wrapper (consumers import `VideoFrameData`).
+  * Adds `Portal.on_action / on_state / on_observation / on_video_frame /
+    on_drop` convenience registrations, routed through an internal dispatcher
+    that implements `PortalCallbacks`. Callbacks run on the asyncio event
+    loop of the thread that registered them (not on the tokio worker that
+    fires the event), matching the previous wrapper's semantics.
+  * Adds frame-normalization on `send_video_frame` (accept bytes or
+    `np.ndarray(H, W, 3)` uint8 and infer W/H from the array).
+
+Frame formats on the wire are unchanged: sends take RGB24, receives deliver
+I420 planar. Use `livekit.portal.i420_bytes_to_numpy_rgb` to convert received
+frames for display.
 """
 from __future__ import annotations
 
 import asyncio
-import enum
-import weakref
-from dataclasses import dataclass, field
+import threading
+import traceback
 from typing import Any, Callable, Dict, List, Optional
 
-from . import _events, _ffi, _frame
-from ._events import PortalFfiError as PortalError
+from . import _frame
+from . import livekit_portal_ffi as _ffi
 from ._frame import i420_bytes_to_numpy_rgb
-from ._proto import ffi_pb2, portal_pb2, types_pb2
+
+# Re-export generated types. The UniFFI module is the source of truth for
+# class identity — wrapping them here would force duplicate isinstance checks.
+Role = _ffi.Role
+Observation = _ffi.Observation
+Action = _ffi.Action
+State = _ffi.State
+VideoFrameData = _ffi.VideoFrame
+PortalMetrics = _ffi.PortalMetrics
+SyncMetrics = _ffi.SyncMetrics
+TransportMetrics = _ffi.TransportMetrics
+BufferMetrics = _ffi.BufferMetrics
+RttMetrics = _ffi.RttMetrics
+PortalError = _ffi.PortalError
 
 
-class Role(enum.IntEnum):
-    ROBOT = types_pb2.ROBOT
-    OPERATOR = types_pb2.OPERATOR
+# --- Dispatcher -------------------------------------------------------------
 
+class _Dispatcher(_ffi.PortalCallbacks):
+    """Sits behind a Portal as its `PortalCallbacks` implementation.
 
-@dataclass(frozen=True)
-class VideoFrameData:
-    """A decoded video frame.
-
-    `data` is I420 planar bytes on the receive side. Width/height are in
-    pixels. `timestamp_us` is the sender's system time in microseconds.
+    The foreign-trait methods run on the tokio worker thread that fired the
+    event — we must *not* execute user code there (long work would block the
+    video/state receive path, and reentering the FFI from there would
+    deadlock). Everything is hopped onto the registered asyncio loop via
+    `call_soon_threadsafe`.
     """
 
-    width: int
-    height: int
-    data: bytes
-    timestamp_us: int
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._action_cb: Optional[Callable[[Action], Any]] = None
+        self._state_cb: Optional[Callable[[State], Any]] = None
+        self._observation_cb: Optional[Callable[[Observation], Any]] = None
+        self._drop_cb: Optional[Callable[[List[Dict[str, float]]], Any]] = None
+        # Per-track video callback: track_name → callable(track_name, frame).
+        self._video_cbs: Dict[str, Callable[[str, VideoFrameData], Any]] = {}
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            self._loop = loop
+
+    def _schedule(self, cb: Callable[..., Any], *args: Any) -> None:
+        loop = self._loop
+        if loop is None:
+            _safely_call(cb, *args)
+            return
+        loop.call_soon_threadsafe(_safely_call, cb, *args)
+
+    # --- PortalCallbacks trait impls (called from Rust/tokio thread) --------
+
+    def on_action(self, action: Action) -> None:
+        cb = self._action_cb
+        if cb is not None:
+            self._schedule(cb, action)
+
+    def on_state(self, state: State) -> None:
+        cb = self._state_cb
+        if cb is not None:
+            self._schedule(cb, state)
+
+    def on_observation(self, observation: Observation) -> None:
+        cb = self._observation_cb
+        if cb is not None:
+            self._schedule(cb, observation)
+
+    def on_video_frame(self, track_name: str, frame: VideoFrameData) -> None:
+        cb = self._video_cbs.get(track_name)
+        if cb is not None:
+            self._schedule(cb, track_name, frame)
+
+    def on_drop(self, dropped: List[Dict[str, float]]) -> None:
+        cb = self._drop_cb
+        if cb is not None:
+            self._schedule(cb, dropped)
+
+    # --- Registration (from Python user thread) -----------------------------
+
+    def set_action(self, cb: Callable[[Action], Any]) -> None:
+        self._action_cb = cb
+
+    def set_state(self, cb: Callable[[State], Any]) -> None:
+        self._state_cb = cb
+
+    def set_observation(self, cb: Callable[[Observation], Any]) -> None:
+        self._observation_cb = cb
+
+    def set_drop(self, cb: Callable[[List[Dict[str, float]]], Any]) -> None:
+        self._drop_cb = cb
+
+    def set_video(self, track_name: str, cb: Callable[[str, VideoFrameData], Any]) -> None:
+        self._video_cbs[track_name] = cb
 
 
-@dataclass(frozen=True)
-class Observation:
-    """A synchronized observation: one state matched with one frame from
-    every registered video track, all aligned to `timestamp_us`."""
-
-    timestamp_us: int
-    state: Dict[str, float]
-    frames: Dict[str, VideoFrameData] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Action:
-    """An action received from the operator (Robot side).
-
-    `timestamp_us` is the sender's wall-clock time in microseconds.
-    """
-
-    values: Dict[str, float]
-    timestamp_us: int
+def _safely_call(cb: Callable[..., Any], *args: Any) -> None:
+    try:
+        result = cb(*args)
+        # If the user registered `async def`, schedule the coroutine on the
+        # current event loop. `call_soon_threadsafe` runs the outer callable
+        # inside the loop thread, so `get_event_loop` here is safe.
+        if asyncio.iscoroutine(result):
+            asyncio.ensure_future(result)
+    except BaseException:  # noqa: BLE001
+        traceback.print_exc()
 
 
-@dataclass(frozen=True)
-class State:
-    """A state received from the robot (Operator side, un-synced path).
-
-    For synchronized state matched with frames, use `Observation` instead.
-    `timestamp_us` is the sender's wall-clock time in microseconds.
-    """
-
-    values: Dict[str, float]
-    timestamp_us: int
-
-
-# --- internal request builders ----------------------------------------------
-
-def _call(resp_field: str, message: Any) -> Any:
-    """Send an FfiRequest whose oneof variant is `resp_field`, return the
-    matching FfiResponse variant. Raises if variant mismatch."""
-    req = ffi_pb2.FfiRequest()
-    getattr(req, resp_field).CopyFrom(message)
-    resp = _ffi.request(req)
-    if resp.WhichOneof("message") != resp_field:
-        raise RuntimeError(
-            f"ffi response variant mismatch: expected {resp_field}, got {resp.WhichOneof('message')}"
-        )
-    return getattr(resp, resp_field)
-
-
-def _raise_if_error(inner: Any) -> None:
-    if inner.HasField("error"):
-        e = inner.error
-        raise PortalError(e.variant, e.message)
-
-
-# --- PortalConfig ------------------------------------------------------------
+# --- PortalConfig -----------------------------------------------------------
 
 class PortalConfig:
     """Builder for a Portal session.
 
-    Matches `livekit_portal::PortalConfig`. every setter translates to an FFI
-    request so the Rust-side config reflects the full declared state by the
-    time `Portal(config)` is constructed.
+    Mirrors the old protobuf-wrapper API so existing callers keep working.
+    State (`video_tracks`, `state_fields`, `action_fields`) is mirrored in
+    Python for fast lookup — the Rust side owns the authoritative copy.
     """
 
     __slots__ = (
-        "_handle",
+        "_inner",
         "_session",
         "_role",
         "_video_tracks",
         "_state_fields",
         "_action_fields",
-        "_finalizer",
-        "__weakref__",
     )
 
     def __init__(self, session: str, role: Role) -> None:
-        resp = _call(
-            "new_config",
-            portal_pb2.NewPortalConfigRequest(session=session, role=int(role)),
-        )
-        self._handle: int = resp.handle.id
+        self._inner = _ffi.PortalConfig(session, role)
         self._session = session
         self._role = role
         self._video_tracks: List[str] = []
         self._state_fields: List[str] = []
         self._action_fields: List[str] = []
-        self._finalizer = weakref.finalize(self, _dispose_handle, self._handle)
-
-    @property
-    def handle(self) -> int:
-        return self._handle
 
     @property
     def session(self) -> str:
@@ -159,123 +184,79 @@ class PortalConfig:
         return list(self._action_fields)
 
     def add_video(self, name: str) -> None:
-        _call(
-            "config_add_video",
-            portal_pb2.ConfigAddVideoRequest(config_handle=self._handle, name=name),
-        )
+        self._inner.add_video(name)
         self._video_tracks.append(name)
 
     def add_state(self, fields: List[str]) -> None:
-        _call(
-            "config_add_state",
-            portal_pb2.ConfigAddStateRequest(config_handle=self._handle, fields=fields),
-        )
+        self._inner.add_state(list(fields))
         self._state_fields.extend(fields)
 
     def add_action(self, fields: List[str]) -> None:
-        _call(
-            "config_add_action",
-            portal_pb2.ConfigAddActionRequest(config_handle=self._handle, fields=fields),
-        )
+        self._inner.add_action(list(fields))
         self._action_fields.extend(fields)
 
     def set_fps(self, fps: int) -> None:
-        _call(
-            "config_set_fps",
-            portal_pb2.ConfigSetFpsRequest(config_handle=self._handle, fps=fps),
-        )
+        self._inner.set_fps(fps)
 
     def set_slack(self, ticks: int) -> None:
-        _call(
-            "config_set_slack",
-            portal_pb2.ConfigSetSlackRequest(config_handle=self._handle, ticks=ticks),
-        )
+        self._inner.set_slack(ticks)
 
     def set_tolerance(self, ticks: float) -> None:
-        _call(
-            "config_set_tolerance",
-            portal_pb2.ConfigSetToleranceRequest(config_handle=self._handle, ticks=ticks),
-        )
+        self._inner.set_tolerance(ticks)
 
     def set_state_reliable(self, reliable: bool) -> None:
-        _call(
-            "config_set_state_reliable",
-            portal_pb2.ConfigSetStateReliableRequest(
-                config_handle=self._handle, reliable=reliable
-            ),
-        )
+        self._inner.set_state_reliable(reliable)
 
     def set_action_reliable(self, reliable: bool) -> None:
-        _call(
-            "config_set_action_reliable",
-            portal_pb2.ConfigSetActionReliableRequest(
-                config_handle=self._handle, reliable=reliable
-            ),
-        )
+        self._inner.set_action_reliable(reliable)
 
     def set_ping_ms(self, ms: int) -> None:
-        _call(
-            "config_set_ping_ms",
-            portal_pb2.ConfigSetPingMsRequest(config_handle=self._handle, ms=ms),
-        )
+        self._inner.set_ping_ms(ms)
 
     def close(self) -> None:
-        """Release the Rust-side config handle. Normally called by GC; call
-        explicitly if you need deterministic release."""
-        if self._finalizer.alive:
-            self._finalizer()
+        """No-op: UniFFI releases the Rust-side handle when Python GC drops
+        the last reference. Kept for backwards compatibility with callers
+        that explicitly `close()`.
+        """
+        # Drop our reference so the underlying Arc can be released.
+        self._inner = None  # type: ignore[assignment]
 
 
-# --- Portal ------------------------------------------------------------------
+# --- Portal -----------------------------------------------------------------
 
 class Portal:
     """Main session object.
 
-    Construct with a `PortalConfig`, then `await connect(url, token)`. The
-    config's state_fields / action_fields / video_tracks are captured at
-    construction and used to decode events.
+    Construct with a `PortalConfig`, then `await connect(url, token)`.
+    Register push callbacks with `on_action / on_state / on_observation /
+    on_video_frame / on_drop`.
     """
 
     __slots__ = (
-        "_handle",
+        "_inner",
+        "_dispatcher",
         "_state_fields",
         "_action_fields",
         "_video_tracks",
-        "_finalizer",
-        "__weakref__",
     )
 
     def __init__(self, config: PortalConfig) -> None:
-        resp = _call(
-            "new_portal",
-            portal_pb2.NewPortalRequest(config_handle=config.handle),
-        )
-        self._handle: int = resp.handle.id
-        self._state_fields: List[str] = list(resp.state_fields)
-        self._action_fields: List[str] = list(resp.action_fields)
-        self._video_tracks: List[str] = list(resp.video_tracks)
-        self._finalizer = weakref.finalize(self, _finalize_portal, self._handle)
-
-    @property
-    def handle(self) -> int:
-        return self._handle
+        self._dispatcher = _Dispatcher()
+        self._inner = _ffi.Portal(config._inner, self._dispatcher)
+        # Snapshot what the Rust side confirmed it was built with.
+        self._state_fields: List[str] = list(self._inner.state_fields())
+        self._action_fields: List[str] = list(self._inner.action_fields())
+        self._video_tracks: List[str] = list(self._inner.video_tracks())
 
     # -- async lifecycle -----------------------------------------------------
 
     async def connect(self, url: str, token: str) -> None:
-        loop = asyncio.get_running_loop()
-        resp = _call(
-            "connect",
-            portal_pb2.ConnectRequest(portal_handle=self._handle, url=url, token=token),
-        )
-        fut = _events.register_async(resp.async_id, loop)
-        await fut
+        # Callbacks fire on tokio workers; hop them onto this loop.
+        self._dispatcher.bind_loop(asyncio.get_running_loop())
+        await self._inner.connect(url, token)
 
     async def disconnect(self) -> None:
-        loop = asyncio.get_running_loop()
-        resp = _call("disconnect", portal_pb2.DisconnectRequest(portal_handle=self._handle))
-        fut = _events.register_async(resp.async_id, loop)
-        await fut
+        await self._inner.disconnect()
 
     # -- send (sync, fire-and-forget) ----------------------------------------
 
@@ -288,150 +269,74 @@ class Portal:
         timestamp_us: Optional[int] = None,
     ) -> None:
         rgb, w, h = _frame.normalize_rgb(frame, width, height)
-        req = portal_pb2.SendVideoFrameRequest(
-            portal_handle=self._handle,
-            track_name=track_name,
-            rgb_data=rgb,
-            width=w,
-            height=h,
-        )
-        if timestamp_us is not None:
-            req.timestamp_us = timestamp_us
-        resp = _call("send_video_frame", req)
-        _raise_if_error(resp)
+        self._inner.send_video_frame(track_name, rgb, w, h, timestamp_us)
 
     def send_state(
         self,
         values: Dict[str, float],
         timestamp_us: Optional[int] = None,
     ) -> None:
-        req = portal_pb2.SendStateRequest(portal_handle=self._handle, values=values)
-        if timestamp_us is not None:
-            req.timestamp_us = timestamp_us
-        resp = _call("send_state", req)
-        _raise_if_error(resp)
+        self._inner.send_state(values, timestamp_us)
 
     def send_action(
         self,
         values: Dict[str, float],
         timestamp_us: Optional[int] = None,
     ) -> None:
-        req = portal_pb2.SendActionRequest(portal_handle=self._handle, values=values)
-        if timestamp_us is not None:
-            req.timestamp_us = timestamp_us
-        resp = _call("send_action", req)
-        _raise_if_error(resp)
+        self._inner.send_action(values, timestamp_us)
 
     # -- pull (sync, latest-wins) --------------------------------------------
 
     def get_observation(self) -> Optional[Observation]:
-        resp = _call("get_observation", portal_pb2.GetObservationRequest(portal_handle=self._handle))
-        if not resp.HasField("observation"):
-            return None
-        return _build_observation(resp.observation)
+        return self._inner.get_observation()
 
     def get_action(self) -> Optional[Action]:
-        resp = _call("get_action", portal_pb2.GetActionRequest(portal_handle=self._handle))
-        if not resp.present:
-            return None
-        return Action(values=dict(resp.values), timestamp_us=resp.timestamp_us)
+        return self._inner.get_action()
 
     def get_state(self) -> Optional[State]:
-        resp = _call("get_state", portal_pb2.GetStateRequest(portal_handle=self._handle))
-        if not resp.present:
-            return None
-        return State(values=dict(resp.values), timestamp_us=resp.timestamp_us)
+        return self._inner.get_state()
 
     def get_video_frame(self, track_name: str) -> Optional[VideoFrameData]:
-        resp = _call(
-            "get_video_frame",
-            portal_pb2.GetVideoFrameRequest(portal_handle=self._handle, track_name=track_name),
-        )
-        if not resp.HasField("frame"):
-            return None
-        return _build_video_frame(resp.frame)
+        return self._inner.get_video_frame(track_name)
 
     # -- push callbacks ------------------------------------------------------
 
-    def on_action(self, callback: Callable[[Action], None]) -> None:
-        _events.register_push(
-            self._handle, "action", callback, asyncio.get_event_loop()
-        )
+    def on_action(self, callback: Callable[[Action], Any]) -> None:
+        self._dispatcher.set_action(callback)
 
-    def on_state(self, callback: Callable[[State], None]) -> None:
-        _events.register_push(
-            self._handle, "state", callback, asyncio.get_event_loop()
-        )
+    def on_state(self, callback: Callable[[State], Any]) -> None:
+        self._dispatcher.set_state(callback)
 
-    def on_observation(self, callback: Callable[[Observation], None]) -> None:
-        _events.register_push(
-            self._handle, "observation", callback, asyncio.get_event_loop()
-        )
+    def on_observation(self, callback: Callable[[Observation], Any]) -> None:
+        self._dispatcher.set_observation(callback)
 
     def on_video_frame(
         self,
         track_name: str,
-        callback: Callable[[str, VideoFrameData], None],
+        callback: Callable[[str, VideoFrameData], Any],
     ) -> None:
-        _events.register_push(
-            self._handle, ("video", track_name), callback, asyncio.get_event_loop()
-        )
+        self._dispatcher.set_video(track_name, callback)
 
-    def on_drop(self, callback: Callable[[List[Dict[str, float]]], None]) -> None:
-        _events.register_push(
-            self._handle, "drop", callback, asyncio.get_event_loop()
-        )
+    def on_drop(
+        self,
+        callback: Callable[[List[Dict[str, float]]], Any],
+    ) -> None:
+        self._dispatcher.set_drop(callback)
 
     # -- metrics -------------------------------------------------------------
 
-    def metrics(self) -> types_pb2.PortalMetrics:
-        resp = _call("metrics", portal_pb2.MetricsRequest(portal_handle=self._handle))
-        return resp.metrics
+    def metrics(self) -> PortalMetrics:
+        return self._inner.metrics()
 
     def reset_metrics(self) -> None:
-        _call("reset_metrics", portal_pb2.ResetMetricsRequest(portal_handle=self._handle))
+        self._inner.reset_metrics()
 
     # -- cleanup -------------------------------------------------------------
 
     def close(self) -> None:
-        if self._finalizer.alive:
-            self._finalizer()
-
-
-# --- helpers ----------------------------------------------------------------
-
-def _build_video_frame(proto_frame: Any) -> VideoFrameData:
-    return VideoFrameData(
-        width=proto_frame.width,
-        height=proto_frame.height,
-        data=proto_frame.data,
-        timestamp_us=proto_frame.timestamp_us,
-    )
-
-
-def _build_observation(proto_obs: Any) -> Observation:
-    frames = {
-        name: _build_video_frame(f) for name, f in proto_obs.frames.items()
-    }
-    return Observation(
-        timestamp_us=proto_obs.timestamp_us,
-        state=dict(proto_obs.state),
-        frames=frames,
-    )
-
-
-def _dispose_handle(handle: int) -> None:
-    try:
-        req = ffi_pb2.FfiRequest()
-        req.dispose_handle.handle = handle
-        _ffi.request(req)
-    except Exception:
-        pass
-
-
-def _finalize_portal(handle: int) -> None:
-    _events.unregister_all(handle)
-    _dispose_handle(handle)
+        """No-op: UniFFI releases the Rust-side handle when Python GC drops
+        the last reference. Kept for backwards compatibility."""
+        self._inner = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -442,6 +347,11 @@ __all__ = [
     "Action",
     "State",
     "VideoFrameData",
+    "PortalMetrics",
+    "SyncMetrics",
+    "TransportMetrics",
+    "BufferMetrics",
+    "RttMetrics",
     "PortalError",
     "i420_bytes_to_numpy_rgb",
 ]

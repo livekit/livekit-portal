@@ -51,15 +51,15 @@ def _us_to_ms(us: int | None) -> float | None:
 def log_metrics(m) -> str:
     """Log Portal metrics under `metrics/` and return a one-line summary.
 
-    Only logs fields that are actually present — Portal's metrics proto marks
-    warm-up values (RTT / sync delta p50/p95) as optional so we don't pollute
-    plots with zeros before enough samples have accumulated.
+    Only logs fields that are actually present — Portal marks warm-up values
+    (RTT / sync delta p50/p95) as `Optional[int]` in the UniFFI dataclass,
+    so `None` means "no sample yet" and we skip those plots until they land.
     """
     parts: list[str] = []
 
-    rtt_last = _us_to_ms(m.rtt.rtt_us_last if m.rtt.HasField("rtt_us_last") else None)
-    rtt_mean = _us_to_ms(m.rtt.rtt_us_mean if m.rtt.HasField("rtt_us_mean") else None)
-    rtt_p95 = _us_to_ms(m.rtt.rtt_us_p95 if m.rtt.HasField("rtt_us_p95") else None)
+    rtt_last = _us_to_ms(m.rtt.rtt_us_last)
+    rtt_mean = _us_to_ms(m.rtt.rtt_us_mean)
+    rtt_p95 = _us_to_ms(m.rtt.rtt_us_p95)
     if rtt_last is not None:
         rr.log("metrics/rtt_last_ms", rr.Scalars(rtt_last))
     if rtt_mean is not None:
@@ -70,12 +70,8 @@ def log_metrics(m) -> str:
         else "rtt=-"
     )
 
-    sync_p50 = _us_to_ms(
-        m.sync.match_delta_us_p50 if m.sync.HasField("match_delta_us_p50") else None
-    )
-    sync_p95 = _us_to_ms(
-        m.sync.match_delta_us_p95 if m.sync.HasField("match_delta_us_p95") else None
-    )
+    sync_p50 = _us_to_ms(m.sync.match_delta_us_p50)
+    sync_p95 = _us_to_ms(m.sync.match_delta_us_p95)
     if sync_p50 is not None:
         rr.log("metrics/sync_delta_p50_ms", rr.Scalars(sync_p50))
     if sync_p95 is not None:

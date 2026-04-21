@@ -5,18 +5,18 @@ edition = "2021"
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# `cdylib` is what foreign bindings load at runtime; `lib` is what the
+# `uniffi-bindgen` binary imports to walk the exported metadata.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
 
 [dependencies]
 livekit-portal = { path = "../livekit-portal" }
+uniffi = { version = "0.29", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
-prost = "0.13"
-parking_lot = "0.12"
-dashmap = "6"
 thiserror = "2"
-lazy_static = "1"
+parking_lot = "0.12"
 log = "0.4"
-downcast-rs = "1"
-
-[build-dependencies]
-prost-build = "0.13"

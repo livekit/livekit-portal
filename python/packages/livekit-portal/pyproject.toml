@@ -9,11 +9,6 @@ description = "Python bindings for livekit-portal. robot ↔ operator sync over 
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    # protobuf>=5,<6: we regenerate the _pb2.py files with a gencode that
-    # works with the protobuf 5 runtime so lerobot (transitive constraints
-    # cap protobuf <6 on Linux) and livekit.portal can coexist in one venv.
-    # Bump this ceiling only after regenerating with a matching protoc.
-    "protobuf>=5,<6",
     "numpy>=1.24",
 ]
 
@@ -27,9 +22,9 @@ examples = [
     "python-dotenv>=1",
 ]
 
-# The Rust cdylib is built out-of-band via `scripts/build_native.sh` and
-# copied into `livekit_portal/`. For local dev, `LIVEKIT_PORTAL_FFI_LIB` can
-# point at the cdylib directly (e.g. in target/release/).
+# The Rust cdylib and generated UniFFI module are built out-of-band via
+# `scripts/build_native.sh` and dropped into `livekit/portal/`. Both must
+# live next to each other for UniFFI's runtime CDLL lookup to resolve.
 
 # PEP 420 implicit namespace package: `livekit` has no __init__.py so it can
 # coexist with livekit-api (`livekit.api`), livekit-protocol (`livekit.protocol`),
@@ -41,6 +36,7 @@ artifacts = [
     "livekit/portal/liblivekit_portal_ffi.dylib",
     "livekit/portal/liblivekit_portal_ffi.so",
     "livekit/portal/livekit_portal_ffi.dll",
+    "livekit/portal/livekit_portal_ffi.py",
 ]
 
 [tool.hatch.build]

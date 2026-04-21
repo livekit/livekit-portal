@@ -1,24 +1,8 @@
 use std::env;
 
 fn main() {
-    let proto_dir = "protocol";
-    let protos = [
-        "protocol/handle.proto",
-        "protocol/types.proto",
-        "protocol/portal.proto",
-        "protocol/ffi.proto",
-    ];
-
-    for p in &protos {
-        println!("cargo:rerun-if-changed={p}");
-    }
     println!("cargo:rerun-if-changed=build.rs");
-
     configure_linker();
-
-    prost_build::Config::new()
-        .compile_protos(&protos, &[proto_dir])
-        .expect("failed to compile protos");
 }
 
 // WebRTC from the LiveKit rust-sdks links in Objective-C categories for the
