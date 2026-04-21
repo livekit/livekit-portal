@@ -23,9 +23,12 @@ frames for display.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import traceback
 from typing import Any, Callable, Dict, List, Optional
+
+_log = logging.getLogger(__name__)
 
 from . import _frame
 from . import livekit_portal_ffi as _ffi
@@ -44,6 +47,8 @@ TransportMetrics = _ffi.TransportMetrics
 BufferMetrics = _ffi.BufferMetrics
 RttMetrics = _ffi.RttMetrics
 PortalError = _ffi.PortalError
+RpcInvocationData = _ffi.RpcInvocationData
+RpcError = _ffi.RpcError
 
 
 # --- Dispatcher -------------------------------------------------------------
@@ -124,6 +129,34 @@ class _Dispatcher(_ffi.PortalCallbacks):
         self._video_cbs[track_name] = cb
 
 
+_uniffi_bound_loop: Optional[asyncio.AbstractEventLoop] = None
+_uniffi_bound_loop_lock = threading.Lock()
+
+
+def _set_uniffi_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Point UniFFI's global async-trait dispatch at `loop`.
+
+    The underlying `uniffi_set_event_loop` is a process-global — multiple
+    Portals on different asyncio loops in the same process will collide.
+    Warn on mismatch so the misuse is at least visible rather than a silent
+    cross-loop dispatch. The normal single-loop case is a no-op on the
+    second call.
+    """
+    global _uniffi_bound_loop
+    with _uniffi_bound_loop_lock:
+        if _uniffi_bound_loop is loop:
+            return
+        if _uniffi_bound_loop is not None and _uniffi_bound_loop.is_running():
+            _log.warning(
+                "livekit-portal: multiple Portals bound to different asyncio "
+                "loops in the same process; RPC handler dispatch will run on "
+                "the most-recently-connected loop. This is a UniFFI "
+                "limitation (uniffi_set_event_loop is process-global)."
+            )
+        _uniffi_bound_loop = loop
+        _ffi.uniffi_set_event_loop(loop)
+
+
 def _safely_call(cb: Callable[..., Any], *args: Any) -> None:
     try:
         result = cb(*args)
@@ -134,6 +167,44 @@ def _safely_call(cb: Callable[..., Any], *args: Any) -> None:
             asyncio.ensure_future(result)
     except BaseException:  # noqa: BLE001
         traceback.print_exc()
+
+
+# --- RPC handler adapter ----------------------------------------------------
+
+
+class _RpcHandlerAdapter(_ffi.RpcHandler):
+    """Wrap a user callable so it satisfies the UniFFI async trait.
+
+    Accepts either `async def handle(data) -> str` or sync `def handle(data) -> str`.
+    Sync callables run inline on the asyncio loop, so handlers doing blocking
+    work should use `async def` and `await asyncio.to_thread(...)` themselves.
+    Raising `RpcError.Error` propagates to the caller; any other exception
+    becomes a generic application error (code 1500).
+    """
+
+    def __init__(self, callback: Callable[[RpcInvocationData], Any]) -> None:
+        super().__init__()
+        self._callback = callback
+
+    async def handle(self, data: RpcInvocationData) -> str:
+        try:
+            result = self._callback(data)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result  # type: ignore[return-value]
+        except (_ffi.RpcError, asyncio.CancelledError):
+            # RpcError: user-signalled application error, propagate verbatim.
+            # CancelledError: the Rust side dropped the future (timeout or
+            # caller cancellation); let asyncio unwind the task cleanly
+            # instead of writing a bogus result on a torn-down handle.
+            raise
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            raise _ffi.RpcError.Error(
+                code=1500,
+                message=f"handler raised {type(e).__name__}: {e}",
+                data=None,
+            ) from e
 
 
 # --- PortalConfig -----------------------------------------------------------
@@ -251,8 +322,13 @@ class Portal:
     # -- async lifecycle -----------------------------------------------------
 
     async def connect(self, url: str, token: str) -> None:
-        # Callbacks fire on tokio workers; hop them onto this loop.
-        self._dispatcher.bind_loop(asyncio.get_running_loop())
+        # Callbacks fire on tokio workers; hop them onto this loop. The
+        # UniFFI-generated RPC handler dispatch also needs to know which
+        # loop to run async foreign-trait methods on, since it's invoked
+        # from a tokio worker with no asyncio loop of its own.
+        loop = asyncio.get_running_loop()
+        self._dispatcher.bind_loop(loop)
+        _set_uniffi_event_loop(loop)
         await self._inner.connect(url, token)
 
     async def disconnect(self) -> None:
@@ -323,6 +399,54 @@ class Portal:
     ) -> None:
         self._dispatcher.set_drop(callback)
 
+    # -- rpc -----------------------------------------------------------------
+
+    def peer_identity(self) -> Optional[str]:
+        """Identity of the peer once Portal has seen any traffic from them.
+
+        `None` before the peer has published any Portal-topic data packet
+        or a subscribed video track (whichever happens first).
+        """
+        return self._inner.peer_identity()
+
+    def register_rpc_method(
+        self,
+        method: str,
+        handler: Callable[[RpcInvocationData], Any],
+    ) -> None:
+        """Register a handler for `method`. The handler is invoked on this
+        Portal's asyncio loop whenever a peer calls `perform_rpc(method, ...)`.
+
+        `handler` may be a regular `def` returning `str`, or an `async def`
+        returning `str`. To signal an application error, `raise
+        RpcError.Error(code=..., message=..., data=...)` — that will be
+        serialized back to the caller.
+        """
+        wrapper = _RpcHandlerAdapter(handler)
+        self._inner.register_rpc_method(method, wrapper)
+
+    def unregister_rpc_method(self, method: str) -> None:
+        self._inner.unregister_rpc_method(method)
+
+    async def perform_rpc(
+        self,
+        method: str,
+        payload: str = "",
+        destination: Optional[str] = None,
+        response_timeout_ms: Optional[int] = None,
+    ) -> str:
+        """Invoke `method` on the peer. When `destination` is omitted,
+        Portal routes to the identified peer (see `peer_identity`),
+        falling back to the single remote participant if none is
+        identified yet. Returns the handler's string payload.
+        """
+        return await self._inner.perform_rpc(
+            destination,
+            method,
+            payload,
+            response_timeout_ms,
+        )
+
     # -- metrics -------------------------------------------------------------
 
     def metrics(self) -> PortalMetrics:
@@ -353,5 +477,7 @@ __all__ = [
     "BufferMetrics",
     "RttMetrics",
     "PortalError",
+    "RpcInvocationData",
+    "RpcError",
     "i420_bytes_to_numpy_rgb",
 ]

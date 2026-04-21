@@ -69,6 +69,8 @@ async def main() -> None:
 
     metrics_task = asyncio.create_task(periodic_metrics(portal, "[operator]", interval=2.0))
 
+    await portal.perform_rpc("say", payload="hello from the operator")
+
     try:
         # Echo a synthetic action back to the robot at the configured rate.
         interval = 1.0 / fps
