@@ -1,14 +1,14 @@
 # RPC
 
 For imperative commands that don't fit the continuous state/action/observation
-loop — `home`, `start_recording`, `calibrate`, one-off configuration — Portal
+loop (`home`, `start_recording`, `calibrate`, one-off configuration), Portal
 exposes the LiveKit RPC surface directly. Either side can register methods;
 either side can invoke.
 
 ## Register and call
 
 ```python
-# Robot side — register a handler
+# Robot side: register a handler
 def say(data):
     print(f"operator says: {data.payload}")
     return "ok"
@@ -17,19 +17,19 @@ portal.register_rpc_method("say", say)
 ```
 
 ```python
-# Operator side — invoke it
+# Operator side: invoke it
 reply = await portal.perform_rpc("say", payload="hello")
 ```
 
 Handlers may be `def` or `async def` and **must return a string**.
 
-Handlers can be registered before or after `connect()` — the stored set is
+Handlers can be registered before or after `connect()`; the stored set is
 reapplied on every reconnect.
 
 ## Errors
 
 To signal an application error from a handler, raise
-`RpcError.Error(code, message, data)` — it's serialized and re-raised as
+`RpcError.Error(code, message, data)`. It is serialized and re-raised as
 `PortalError.Rpc` on the caller's side.
 
 ```python

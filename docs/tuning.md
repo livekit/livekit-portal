@@ -1,6 +1,6 @@
 # Tuning
 
-Portal assumes **unified sampling** — the robot captures state and frames at
+Portal assumes **unified sampling**: the robot captures state and frames at
 the same tick. All sync parameters derive from a single `fps`, and all
 internal buffers share a single `slack` size.
 
@@ -65,7 +65,7 @@ config.set_action_reliable(True)   # actions typically want ordering
 
 ## Inspecting real behavior
 
-`portal.metrics()` exposes the live sync and transport counters — RTT
+`portal.metrics()` exposes the live sync and transport counters: RTT
 percentiles, match-delta percentiles, per-track frame jitter, buffer fill,
 observations emitted, states dropped. The examples under `examples/python/`
 print these periodically; adapt `periodic_metrics` from
