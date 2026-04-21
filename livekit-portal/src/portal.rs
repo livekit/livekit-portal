@@ -597,18 +597,17 @@ fn latch_peer(
     peer_identity: &Mutex<Option<ParticipantIdentity>>,
     session: &str,
     identity: ParticipantIdentity,
-    via: &str,
 ) {
     let mut slot = peer_identity.lock();
     if slot.is_none() {
-        log::info!("[{session}] identified peer '{}' via {via}", identity.as_str());
+        log::info!("[{session}] identified peer '{}'", identity.as_str());
         *slot = Some(identity);
     }
 }
 
 fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
     match event {
-        RoomEvent::TrackSubscribed { track, publication, participant } => {
+        RoomEvent::TrackSubscribed { track, publication, .. } => {
             if ctx.config.role != Role::Operator {
                 return;
             }
@@ -618,12 +617,6 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                     log::info!(
                         "[{}] subscribed to video track '{track_name}'",
                         ctx.config.session
-                    );
-                    latch_peer(
-                        &ctx.peer_identity,
-                        &ctx.config.session,
-                        participant.identity(),
-                        "video track",
                     );
                     if let Some(sync_buffer) = &ctx.sync_buffer {
                         let slots = ctx
@@ -660,12 +653,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                         | (Role::Operator, "portal_state")
                         | (_, "portal_rtt")
                 ) {
-                    latch_peer(
-                        &ctx.peer_identity,
-                        &ctx.config.session,
-                        p.identity(),
-                        "data topic",
-                    );
+                    latch_peer(&ctx.peer_identity, &ctx.config.session, p.identity());
                 }
             }
             let output = handle_data_received(
