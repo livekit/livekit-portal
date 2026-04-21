@@ -117,24 +117,21 @@ def env_float(name: str, default: float) -> float:
 
 
 def _dump_metrics(prefix: str, metrics) -> None:
-    """Pretty-print the full PortalMetrics snapshot. Uses MessageToDict so
-    map<> fields render as plain dicts and optional fields show up only when
-    set."""
-    from google.protobuf.json_format import MessageToDict
-
-    snap = MessageToDict(
-        metrics,
-        always_print_fields_with_no_presence=True,
-        preserving_proto_field_name=True,
-    )
+    """Pretty-print the full PortalMetrics snapshot. Walks the UniFFI
+    dataclasses directly — no protobuf `MessageToDict` anymore."""
+    sections = {
+        "sync": metrics.sync,
+        "transport": metrics.transport,
+        "buffers": metrics.buffers,
+        "rtt": metrics.rtt,
+    }
     print(f"{prefix} metrics:")
-    for section, values in snap.items():
+    for section, record in sections.items():
         print(f"  {section}:")
-        if isinstance(values, dict):
-            for k, v in values.items():
-                print(f"    {k}: {v}")
-        else:
-            print(f"    {values}")
+        # UniFFI records expose fields via dataclass attributes; we walk
+        # `__dict__` to stay agnostic to naming.
+        for k, v in record.__dict__.items():
+            print(f"    {k}: {v}")
 
 
 def _format_us(value) -> str:
@@ -156,19 +153,11 @@ async def periodic_metrics(portal, prefix: str, interval: float = 2.0):
         while True:
             await asyncio.sleep(interval)
             m = portal.metrics()
-            rtt_last = _format_us(m.rtt.rtt_us_last) if m.rtt.HasField("rtt_us_last") else "-"
-            rtt_mean = _format_us(m.rtt.rtt_us_mean) if m.rtt.HasField("rtt_us_mean") else "-"
-            rtt_p95 = _format_us(m.rtt.rtt_us_p95) if m.rtt.HasField("rtt_us_p95") else "-"
-            sync_p50 = (
-                _format_us(m.sync.match_delta_us_p50)
-                if m.sync.HasField("match_delta_us_p50")
-                else "-"
-            )
-            sync_p95 = (
-                _format_us(m.sync.match_delta_us_p95)
-                if m.sync.HasField("match_delta_us_p95")
-                else "-"
-            )
+            rtt_last = _format_us(m.rtt.rtt_us_last)
+            rtt_mean = _format_us(m.rtt.rtt_us_mean)
+            rtt_p95 = _format_us(m.rtt.rtt_us_p95)
+            sync_p50 = _format_us(m.sync.match_delta_us_p50)
+            sync_p95 = _format_us(m.sync.match_delta_us_p95)
             frame_jitter = {k: _format_us(v) for k, v in m.transport.frame_jitter_us.items()}
             video_fill = dict(m.buffers.video_fill)
             print(

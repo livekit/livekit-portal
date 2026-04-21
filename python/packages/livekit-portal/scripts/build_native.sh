@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build the livekit-portal-ffi cdylib and copy it into the Python package.
-# Run from anywhere; paths are resolved relative to this script.
+# Build the livekit-portal-ffi cdylib and regenerate the UniFFI Python
+# bindings. The cdylib and generated module both land next to the package
+# source (livekit/portal/) so the wheel ships them together.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,9 +23,10 @@ if [[ "$MODE" == "release" ]]; then
     target_subdir="release"
 fi
 
-(cd "$REPO_ROOT" && cargo build -p livekit-portal-ffi "${cargo_flags[@]}")
+# Build the cdylib.
+(cd "$REPO_ROOT" && cargo build -p livekit-portal-ffi ${cargo_flags[@]+"${cargo_flags[@]}"})
 
-# Copy the freshly built cdylib into the package. Locate by platform extension.
+# Locate the freshly built cdylib by platform extension.
 case "$(uname -s)" in
     Darwin)  ext=".dylib"; base="liblivekit_portal_ffi" ;;
     Linux)   ext=".so";    base="liblivekit_portal_ffi" ;;
@@ -40,3 +42,15 @@ if [[ ! -f "$src" ]]; then
 fi
 cp "$src" "$dst"
 echo "copied $src -> $dst"
+
+# Generate the Python module from the cdylib (library mode — no UDL file).
+# The generated `livekit_portal_ffi.py` lives next to the shared library so
+# its relative-path `CDLL` lookup resolves.
+(cd "$REPO_ROOT" && cargo run --bin uniffi-bindgen ${cargo_flags[@]+"${cargo_flags[@]}"} -- \
+    generate \
+    --library "$src" \
+    --language python \
+    --out-dir "$PKG_DIR" \
+    --no-format)
+
+echo "generated UniFFI Python module at $PKG_DIR/livekit_portal_ffi.py"

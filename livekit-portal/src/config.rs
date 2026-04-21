@@ -94,6 +94,18 @@ impl PortalConfig {
         self.ping_ms = ms;
     }
 
+    pub fn video_tracks(&self) -> &[String] {
+        &self.video_tracks
+    }
+
+    pub fn state_fields(&self) -> &[String] {
+        &self.state_fields
+    }
+
+    pub fn action_fields(&self) -> &[String] {
+        &self.action_fields
+    }
+
     /// Derived sync config used internally by the sync buffer. Not public.
     pub(crate) fn sync_config(&self) -> SyncConfig {
         let search_range_us = (self.tolerance * 1_000_000.0 / self.fps as f32) as u64;
