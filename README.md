@@ -12,6 +12,10 @@
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"></a>
 </p>
 
+<p align="center">
+  <img src=".github/assets/portal-demo.gif" alt="Portal demo: synced camera and joint state between a remote robot and a local operator" width="720">
+</p>
+
 <!--BEGIN_DESCRIPTION-->
 <p align="center"><b>Teleoperate a robot, or run a policy against it, from anywhere on the internet.</b> Portal carries cameras, joint state, and actions between a robot host and a control host over LiveKit. On the control side, everything arrives as synchronized <code>(frames, state, timestamp)</code> observations. Works with any robotics stack. An optional <a href="https://github.com/huggingface/lerobot">LeRobot</a> plugin adds a one-line drop-in for lerobot users.</p>
 <!--END_DESCRIPTION-->
@@ -27,10 +31,6 @@
 ---
 
 ## Features
-
-<p align="center">
-  <img src=".github/assets/portal-demo.gif" alt="Portal demo: synced camera and joint state between a remote robot and a local operator" width="720">
-</p>
 
 **Remote robot, same code.** Your robot loop keeps its shape. Portal moves the hardware to another machine. Your policy or teleop code still sees a local-looking `Robot` object.
 
