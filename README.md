@@ -180,11 +180,19 @@ step-by-step [Quickstart doc](docs/quickstart.md).
 
 ## Behind the project
 
-Robotics policies want one bundled `Observation` per tick: cameras, joint
-state, and a timestamp arriving together. LiveKit's transport primitives do
-not deliver data that way. Video tracks and data streams each have their
-own pacing, codec path, and retransmission. On the receiver they surface
-as independent event streams arriving out of phase.
+Teleoperation over WAN is a networking problem before it is a robotics
+problem. Low-latency video and control data have to traverse NAT,
+asymmetric bandwidth, jitter, and packet loss. WebRTC was built for
+exactly this, and [LiveKit](https://livekit.io/) wraps it in a
+production-grade SFU with a clean SDK. Portal builds the robotics layer
+on top.
+
+That layer exists because robotics policies want one bundled
+`Observation` per tick: cameras, joint state, and a timestamp arriving
+together. LiveKit's transport primitives do not deliver data that way.
+Video tracks and data streams each have their own pacing, codec path,
+and retransmission. On the receiver they surface as independent event
+streams arriving out of phase.
 
 Portal closes that gap. Every outgoing frame and state packet carries the
 sender's monotonic clock (packet-trailer metadata for video, a `u64`
