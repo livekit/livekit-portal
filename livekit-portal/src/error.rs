@@ -1,3 +1,4 @@
+use crate::rpc::RpcError;
 use crate::types::Role;
 use thiserror::Error;
 
@@ -10,6 +11,15 @@ pub enum PortalError {
 
     #[error("portal is already connected")]
     AlreadyConnected,
+
+    #[error("portal is not connected")]
+    NotConnected,
+
+    #[error("no peer in the room")]
+    NoPeer,
+
+    #[error("room has multiple remote participants and no peer has been identified yet; pass destination explicitly")]
+    AmbiguousPeer,
 
     #[error("unknown video track: {name}")]
     UnknownVideoTrack { name: String },
@@ -25,4 +35,7 @@ pub enum PortalError {
 
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
+
+    #[error("{0}")]
+    Rpc(RpcError),
 }

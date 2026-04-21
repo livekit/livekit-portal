@@ -140,6 +140,15 @@ pub enum PortalError {
     #[error("portal is already connected")]
     AlreadyConnected,
 
+    #[error("portal is not connected")]
+    NotConnected,
+
+    #[error("no peer in the room")]
+    NoPeer,
+
+    #[error("room has multiple remote participants; pass destination explicitly")]
+    AmbiguousPeer,
+
     #[error("unknown video track: {0}")]
     UnknownVideoTrack(String),
 
@@ -154,6 +163,9 @@ pub enum PortalError {
 
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
+
+    #[error("rpc error {code}: {message}")]
+    Rpc { code: u32, message: String, data: Option<String> },
 }
 
 impl From<core::PortalError> for PortalError {
@@ -161,6 +173,9 @@ impl From<core::PortalError> for PortalError {
         match e {
             core::PortalError::Room(s) => PortalError::Room(s),
             core::PortalError::AlreadyConnected => PortalError::AlreadyConnected,
+            core::PortalError::NotConnected => PortalError::NotConnected,
+            core::PortalError::NoPeer => PortalError::NoPeer,
+            core::PortalError::AmbiguousPeer => PortalError::AmbiguousPeer,
             core::PortalError::UnknownVideoTrack { name } => PortalError::UnknownVideoTrack(name),
             core::PortalError::WrongFrameSize { expected, got } => {
                 PortalError::WrongFrameSize { expected: expected as u64, got: got as u64 }
@@ -170,11 +185,69 @@ impl From<core::PortalError> for PortalError {
             }
             core::PortalError::Deserialization(s) => PortalError::Deserialization(s),
             core::PortalError::WrongRole(r) => PortalError::WrongRole(r.into()),
+            core::PortalError::Rpc(e) => {
+                PortalError::Rpc { code: e.code, message: e.message, data: e.data }
+            }
         }
     }
 }
 
 pub type PortalResult<T> = Result<T, PortalError>;
+
+// ---------------------------------------------------------------------------
+// RPC types
+// ---------------------------------------------------------------------------
+
+/// Handler-side view of an incoming RPC invocation.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RpcInvocationData {
+    pub request_id: String,
+    pub caller_identity: String,
+    pub payload: String,
+    pub response_timeout_ms: u64,
+}
+
+impl From<core::RpcInvocationData> for RpcInvocationData {
+    fn from(d: core::RpcInvocationData) -> Self {
+        Self {
+            request_id: d.request_id,
+            caller_identity: d.caller_identity,
+            payload: d.payload,
+            response_timeout_ms: d.response_timeout.as_millis() as u64,
+        }
+    }
+}
+
+/// Error raised by an RPC handler or returned from `perform_rpc`. A
+/// single-variant enum to satisfy UniFFI (which requires errors to be
+/// enums); foreign handlers raise `RpcError.Error(code=..., message=...,
+/// data=...)` to signal failure.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum RpcError {
+    #[error("rpc error {code}: {message}")]
+    Error { code: u32, message: String, data: Option<String> },
+}
+
+impl From<core::RpcError> for RpcError {
+    fn from(e: core::RpcError) -> Self {
+        RpcError::Error { code: e.code, message: e.message, data: e.data }
+    }
+}
+
+impl From<RpcError> for core::RpcError {
+    fn from(e: RpcError) -> Self {
+        match e {
+            RpcError::Error { code, message, data } => core::RpcError::new(code, message, data),
+        }
+    }
+}
+
+/// Foreign-implemented handler for a single RPC method.
+#[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
+pub trait RpcHandler: Send + Sync {
+    async fn handle(&self, data: RpcInvocationData) -> Result<String, RpcError>;
+}
 
 // ---------------------------------------------------------------------------
 // Foreign callback trait — the five push events plus the drop notification.
@@ -379,6 +452,42 @@ impl Portal {
     pub fn video_tracks(&self) -> Vec<String> {
         self.video_tracks.clone()
     }
+
+    // --- RPC ---
+
+    /// Identity of the identified peer, or `None` if Portal has not yet
+    /// seen any Portal-topic traffic from a remote participant.
+    pub fn peer_identity(&self) -> Option<String> {
+        self.inner.peer_identity()
+    }
+
+    /// Register a method handler. Handlers may be registered before or
+    /// after `connect()`; reconnects reapply the stored set.
+    pub fn register_rpc_method(&self, method: String, handler: Arc<dyn RpcHandler>) {
+        self.inner.register_rpc_method(&method, wrap_foreign_handler(handler));
+    }
+
+    pub fn unregister_rpc_method(&self, method: String) {
+        self.inner.unregister_rpc_method(&method);
+    }
+
+    /// Invoke a method on the peer. When `destination` is `None`, the call
+    /// is routed to the identified peer, falling back to the single remote
+    /// participant in the room. Timeout defaults to the SDK's 15s if
+    /// `response_timeout_ms` is `None`.
+    pub async fn perform_rpc(
+        &self,
+        destination: Option<String>,
+        method: String,
+        payload: String,
+        response_timeout_ms: Option<u64>,
+    ) -> PortalResult<String> {
+        let timeout = response_timeout_ms.map(std::time::Duration::from_millis);
+        self.inner
+            .perform_rpc(destination.as_deref(), &method, payload, timeout)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +510,20 @@ fn observation_from_core(o: &core::Observation) -> Observation {
         state: o.state.clone(),
         frames: o.frames.iter().map(|(k, v)| (k.clone(), frame_from_core(v))).collect(),
     }
+}
+
+/// Adapt a foreign `RpcHandler` trait object to the core handler type.
+/// The outer `Fn` closure is invoked once per incoming RPC; the Arc clone
+/// moves an owned handle into the returned future so the closure can be
+/// called again without consuming its capture.
+fn wrap_foreign_handler(handler: Arc<dyn RpcHandler>) -> core::RpcHandler {
+    Arc::new(move |data: core::RpcInvocationData| {
+        let handler = handler.clone();
+        Box::pin(async move {
+            let ffi_data = RpcInvocationData::from(data);
+            handler.handle(ffi_data).await.map_err(Into::into)
+        })
+    })
 }
 
 fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {

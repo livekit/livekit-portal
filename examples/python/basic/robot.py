@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from livekit.portal import Action, Portal, PortalConfig, Role
+from livekit.portal import Action, Portal, PortalConfig, Role, RpcInvocationData
 from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
 
 IDENTITY = "robot"
@@ -92,6 +92,12 @@ async def main() -> None:
             )
 
     portal.on_action(on_action)
+
+    def say(data: RpcInvocationData) -> str:
+        print(f"[robot] operator says: {data.payload}")
+        return "ok"
+
+    portal.register_rpc_method("say", say)
 
     print(f"[robot] connecting to {url} as '{IDENTITY}' in room '{room}' ...")
     await portal.connect(url, token)
