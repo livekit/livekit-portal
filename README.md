@@ -28,6 +28,10 @@
 
 ## Features
 
+<p align="center">
+  <img src=".github/assets/portal-demo.gif" alt="Portal demo: synced camera and joint state between a remote robot and a local operator" width="720">
+</p>
+
 **Remote robot, same code.** Your robot loop keeps its shape. Portal moves the hardware to another machine. Your policy or teleop code still sees a local-looking `Robot` object.
 
 **Synced observations out of the box.** Cameras and joint state arrive fused into `Observation(frames, state, timestamp_us)`. That is the shape robotics policies already consume. No matching logic on your side.
