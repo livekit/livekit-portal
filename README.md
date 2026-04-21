@@ -192,6 +192,30 @@ State and video frames are tagged with the sender's clock. The receiver matches 
 
 Video frame timestamps ride on LiveKit's **packet trailer**, which survives the full WebRTC encode/decode pipeline.
 
+### Why sync is non-trivial
+
+LiveKit gives you monotonic sender timestamps but **not** monotonic arrival: every track has its own encoder path, pacer, and retransmission behavior. Video typically lags a same-tick state packet by 30–80 ms; stalls happen; there is no global receiver clock to normalize against. Naive "grab the latest frame for the latest state" produces misaligned observations on every jitter event.
+
+### The match rule
+
+For a head state with timestamp `S`, a frame at timestamp `F` on track `k` is a **candidate** iff `|S − F| < search_range`. Per state, we pick the *nearest* candidate per track. The state resolves one of three ways:
+
+- **Match** — every registered track has an in-range frame → emit `Observation` on `on_observation`.
+- **Wait** — at least one track has no candidate *yet*, but its newest frame is still below the horizon (`buf.back().ts < S + R`). Newer frames may still land in range.
+- **Drop** — some track's newest frame is already past the horizon (`buf.back().ts ≥ S + R`). No future frame can match (timestamps are monotonic), so the state is fired on `on_drop`.
+
+Drop wins over wait across tracks: if `cam1` is waiting but `cam2` is already unmatchable, we drop immediately instead of stalling the head.
+
+### Why it's cheap
+
+A naive scan is O(states × tracks × frames) per push. Portal is **amortized O(N+M)** via three tricks:
+
+1. **Two-pointer cursors** — per-track indices advance forward with the head state (and rewind for out-of-order packets on unreliable transports). Each frame is inspected a constant number of times over its lifetime.
+2. **Blocker-gated sync** — if the last `try_sync` stalled on track `k`, a push to any other track can't unblock the head. We skip the whole match pass. At steady state, ~80% of frame pushes become no-ops.
+3. **O(1) drop detection** — one compare against `buf.back().ts` decides unmatchability, instead of scanning the whole buffer.
+
+> **Sender requirement:** every received video frame must carry `user_timestamp` in its packet-trailer metadata. Portal enables this automatically on tracks it publishes (`PacketTrailerFeatures.user_timestamp = true`). A subscribed track produced by anything that does *not* set this field is unsupported — either republish the source through Portal or enable user-timestamp trailers on the upstream publisher.
+
 ```mermaid
 flowchart TB
     subgraph In["Incoming streams (out of phase)"]
@@ -215,9 +239,7 @@ flowchart TB
     Drop --> DC[on_drop]
 ```
 
-> **Sender requirement:** every received video frame must carry `user_timestamp` in its packet-trailer metadata. Portal enables this automatically on tracks it publishes (`PacketTrailerFeatures.user_timestamp = true`). A subscribed track produced by anything that does *not* set this field is unsupported — either republish the source through Portal or enable user-timestamp trailers on the upstream publisher.
-
-For the full algorithm — two-pointer cursors, blocker-gated sync, O(1) drop detection, eager cross-track drop — see **[docs/synchronization.md](docs/synchronization.md)**.
+For the full algorithm — cursor rewind, eviction escape hatch, eager cross-track drop, dispatch decoupling — see **[docs/synchronization.md](docs/synchronization.md)**.
 
 ## Video Frame Format
 
