@@ -9,33 +9,30 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org/)
 
 <!--BEGIN_DESCRIPTION-->
-A drop-in link between robots and their teleoperators or agents. Portal handles video streams, data streams, and **timestamp-synced observations** over LiveKit, so a VLA model on the operator side sees the same bundled `(frames, state, t)` tuple it would see from a local robot. Works with [LeRobot](https://github.com/huggingface/lerobot) out of the box.
+Teleoperate a robot, or run a policy against it, from anywhere on the internet. Portal carries cameras, joint state, and actions over LiveKit and delivers synchronized `(frames, state, timestamp)` observations on the control side — the shape robotics policies already expect. Drop-in for [LeRobot](https://github.com/huggingface/lerobot); a direct API covers other stacks.
 <!--END_DESCRIPTION-->
 
-## What it is
+## The idea
 
-If you have a robot *here* and you want to **teleoperate it** or **run a
-policy against it** from *somewhere else*, Portal is the network tier. The
-physical robot stays in the loop; Portal bundles synchronized
-`(frames, state, timestamp)` observations and routes actions back — over
-LiveKit, so it works across WAN.
+Think of your robot as a device that normally plugs into one computer. Portal
+lets it "plug into" a different one over the network — so your teleop
+interface, your training loop, or your policy server can run anywhere and
+still see the robot as if it were local. The physical robot stays in the
+loop; Portal only adds the network tier.
 
-Three concrete things you get:
-
-- **Synchronized observations** — video frames and state arrive bundled by
-  sender timestamp, in the shape VLA policies expect.
-- **Drop-in for lerobot** — two plugins wrap your existing `Robot` or
-  `Teleoperator`; the remote arm appears as a local device to any lerobot
-  workflow (teleop, dataset recording, policy eval).
-- **Works with or without it** — Rust core, Python via UniFFI. If you're not
-  on lerobot, there's a direct `Portal` API.
+Two plugins make this drop-in for
+[lerobot](https://github.com/huggingface/lerobot): wrap your existing `Robot`
+on the robot-side machine and your `Teleoperator` (or policy output) on the
+control-side machine, and the remote arm shows up as a local lerobot device
+to any workflow — teleoperation, dataset recording, policy eval. If you're
+not on lerobot, a direct `Portal` API covers the same ground.
 
 ## I want to…
 
 | Goal | Start here |
 |---|---|
 | **Teleoperate a lerobot-compatible robot over the network** | [Quickstart](docs/quickstart.md) |
-| **Run a VLA policy against a remote robot** | [Quickstart](docs/quickstart.md) (same setup, policy replaces the leader on the operator side) |
+| **Run a policy against a remote robot** | [Quickstart](docs/quickstart.md) (same setup — the policy replaces the leader on the control side) |
 | **Use Portal directly from a non-lerobot stack** | [Portal API](docs/portal-api.md) |
 | **See a working end-to-end example** | [Examples](#examples) below |
 
