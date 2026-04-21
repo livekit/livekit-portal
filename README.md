@@ -178,17 +178,37 @@ code above is a sketch. For a runnable version with token minting already
 wired up, see [`examples/python/basic/`](examples/python/basic) or the
 step-by-step [Quickstart doc](docs/quickstart.md).
 
-## The idea
+## Behind the project
 
-Think of your robot as a device that normally plugs into one computer.
-Portal lets it plug into a different one over the network. Your teleop
-interface, your training loop, or your policy server can run anywhere and
-still see the robot as if it were local.
+Robotics policies want one bundled `Observation` per tick: cameras, joint
+state, and a timestamp arriving together. LiveKit's transport primitives do
+not deliver data that way. Video tracks and data streams each have their
+own pacing, codec path, and retransmission. On the receiver they surface
+as independent event streams arriving out of phase.
 
-You use Portal by wrapping whatever code already drives your robot. On the
-robot host, you publish frames and state through a `Portal` object. On the
-control host, you receive them as a bundled `Observation` and publish actions
-back. No framework is assumed.
+Portal closes that gap. Every outgoing frame and state packet carries the
+sender's monotonic clock (packet-trailer metadata for video, a `u64`
+prefix for data). On the control side, a per-session `SyncBuffer` matches
+them by sender timestamp:
+
+```text
+for each head state S:
+    for each registered video track k:
+        F = nearest pending frame in track k to S
+        if |S - F| < search_range:                   track k matches
+        elif track k's newest frame is past S + R:   drop the state
+        else:                                        wait for a newer frame
+
+if every track matched:
+    emit Observation { frames, state, timestamp_us: S }
+```
+
+The real implementation is amortized `O(N + M)` through two-pointer
+cursors and blocker-gated short-circuiting, with `O(1)` unmatchability
+detection. Full walkthrough in
+[docs/synchronization.md](docs/synchronization.md). The
+[Concepts](docs/concepts.md) page covers roles and the observation model.
+[Tuning](docs/tuning.md) covers `fps`, `slack`, and `tolerance`.
 
 ## Examples
 
