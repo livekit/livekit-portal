@@ -17,7 +17,7 @@
 <!--END_DESCRIPTION-->
 
 <p align="center">
-  <a href="#your-code-does-not-change">Show me</a> ·
+  <a href="#at-a-glance">Show me</a> ·
   <a href="#install">Install</a> ·
   <a href="#examples">Examples</a> ·
   <a href="docs/quickstart.md">Quickstart</a> ·
@@ -40,70 +40,86 @@
 
 ---
 
-## Your code does not change
+## At a glance
 
-A classical lerobot loop runs on the same machine as the robot:
+A complete remote-robot session in two files. The robot host publishes
+frames and state, executes actions, and exposes a `home` RPC. The control
+host receives synced observations, runs a policy, and calls `home` before
+the control loop starts.
 
-```python
-# all on one machine, robot plugged in
-from lerobot.robots.myrobot import MyRobot
-
-robot = MyRobot(config=...)
-robot.connect()
-
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
-
-With Portal, the same loop splits into two small files. One lives next to the
-robot. The other lives wherever your policy or teleop runs.
-
-**`robot_host.py`** runs on the machine the robot is plugged into.
+**`robot.py`** runs on the machine the robot is plugged into.
 
 ```python
-from lerobot.robots.myrobot import MyRobot
-from lerobot_teleoperator_livekit import (
-    LiveKitTeleoperator, LiveKitTeleoperatorConfig,
-)
+import asyncio, time
+from livekit.portal import Portal, PortalConfig, Role
 
-robot = MyRobot(config=...)
-robot.connect()
+async def main():
+    cfg = PortalConfig("session-1", Role.ROBOT)
+    cfg.add_video("front")                       # add more tracks for multi-camera
+    cfg.add_state(["j1", "j2", "j3"])
+    cfg.add_action(["j1", "j2", "j3"])
+    cfg.set_fps(30)
 
-teleop = LiveKitTeleoperator(
-    LiveKitTeleoperatorConfig(url=..., token=..., session="session-1", fps=30),
-    robot=robot,
-)
-teleop.connect()
+    portal = Portal(cfg)
 
-while running:
-    teleop.send_feedback(robot.get_observation())     # upstream to operator
-    if action := teleop.get_action():                 # action from operator
-        robot.send_action(action)
+    # One-shot commands. Either side can register. Either side can invoke.
+    def on_home(_):
+        robot.home()
+        return "ok"
+    portal.register_rpc_method("home", on_home)
+
+    # Actions arrive here as the operator produces them.
+    portal.on_action(lambda a: robot.send_action(a.values))
+
+    await portal.connect(url, token)
+
+    while running:
+        obs = robot.get_observation()
+        ts = int(time.time() * 1_000_000)
+        portal.send_video_frame("front", obs.image, 640, 480, timestamp_us=ts)
+        portal.send_state(obs.state, timestamp_us=ts)
+        await asyncio.sleep(1 / 30)
+
+asyncio.run(main())
 ```
 
-**`control_host.py`** runs wherever you drive the robot from.
+**`operator.py`** runs wherever your policy or teleop UI lives.
 
 ```python
-from lerobot_robot_livekit import LiveKitRobot, LiveKitRobotConfig
+import asyncio
+from livekit.portal import Portal, PortalConfig, Role
 
-robot = LiveKitRobot(LiveKitRobotConfig(
-    url=..., token=..., session="session-1", fps=30,
-    camera_names=("cam1",),
-))
-robot.connect()
+async def main():
+    cfg = PortalConfig("session-1", Role.OPERATOR)
+    cfg.add_video("front")
+    cfg.add_state(["j1", "j2", "j3"])
+    cfg.add_action(["j1", "j2", "j3"])
+    cfg.set_fps(30)
 
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+    portal = Portal(cfg)
+
+    # Cameras, state, and a sender timestamp arrive fused as one tuple.
+    def on_observation(obs):
+        # obs.frames["front"], obs.state, obs.timestamp_us
+        portal.send_action(policy(obs))
+
+    portal.on_observation(on_observation)
+    await portal.connect(url, token)
+
+    await portal.perform_rpc("home")             # imperative commands, not a loop
+    print(portal.metrics())                      # RTT, sync delta, jitter, drops
+
+    while running:
+        await asyncio.sleep(1)
+
+asyncio.run(main())
 ```
 
-The last three lines of `control_host.py` are the same three lines as the
-classical loop. The robot just lives on another machine now.
-
-The example above uses the lerobot plugin because it makes the diff a single
-import. Portal itself is a standalone library. The plugin is a thin wrap on
-top. See the [30-second sketch](#30-second-sketch) for the raw Portal API.
+That is the whole surface at work in one page. Synced observations, an
+action callback, an RPC for one-shots, and a live metrics snapshot. The
+code above is a sketch, not a runnable file. The real one is in
+[`examples/python/basic/`](examples/python/basic) with token minting
+already wired up.
 
 ## The idea
 
@@ -159,56 +175,13 @@ driven by a remote **SO-101 leader**. Camera and joint state render in
 [rerun](https://rerun.io). Full calibration and wiring walkthrough in its
 [README](examples/python/so101/README.md).
 
-## 30-second sketch
+## Using with lerobot
 
-The raw Portal API, no plugin. This is what the lerobot wrappers use
-internally.
-
-Robot side. Publishes frames and state. Receives actions.
-
-```python
-from livekit.portal import Portal, PortalConfig, Role
-
-cfg = PortalConfig("session-1", Role.ROBOT)
-cfg.add_video("cam1")
-cfg.add_state(["j1", "j2", "j3"])
-cfg.add_action(["j1", "j2", "j3"])
-
-portal = Portal(cfg)
-portal.on_action(lambda a: robot.send_action(a.values))
-await portal.connect(url, token)
-
-while running:
-    obs = robot.get_observation()
-    portal.send_video_frame("cam1", obs.image, width, height)
-    portal.send_state(obs.state)
-    await asyncio.sleep(1 / 30)
-```
-
-Control side. Receives synced observations. Publishes actions.
-
-```python
-from livekit.portal import Portal, PortalConfig, Role
-
-cfg = PortalConfig("session-1", Role.OPERATOR)
-cfg.add_video("cam1")
-cfg.add_state(["j1", "j2", "j3"])
-cfg.add_action(["j1", "j2", "j3"])
-
-portal = Portal(cfg)
-
-def on_observation(obs):
-    # obs.frames:       dict[str, np.ndarray]
-    # obs.state:        dict[str, float]
-    # obs.timestamp_us: int
-    portal.send_action(policy(obs))     # or teleop.get_action()
-
-portal.on_observation(on_observation)
-await portal.connect(url, token)
-```
-
-Full runnable version, including token minting, in the
-[Quickstart](docs/quickstart.md).
+If your stack is already on [lerobot](https://github.com/huggingface/lerobot),
+two optional plugin packages wrap the Portal code above. You pass in your
+existing `Robot` or `Teleoperator` and the remote arm shows up as a local
+lerobot device to any workflow (teleop, dataset recording, policy eval). See
+[lerobot integration](docs/lerobot.md) for the full reference.
 
 ## Documentation
 
