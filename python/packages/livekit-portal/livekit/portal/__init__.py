@@ -287,8 +287,13 @@ class Portal:
     # -- async lifecycle -----------------------------------------------------
 
     async def connect(self, url: str, token: str) -> None:
-        # Callbacks fire on tokio workers; hop them onto this loop.
-        self._dispatcher.bind_loop(asyncio.get_running_loop())
+        # Callbacks fire on tokio workers; hop them onto this loop. The
+        # UniFFI-generated RPC handler dispatch also needs to know which
+        # loop to run async foreign-trait methods on, since it's invoked
+        # from a tokio worker with no asyncio loop of its own.
+        loop = asyncio.get_running_loop()
+        self._dispatcher.bind_loop(loop)
+        _ffi.uniffi_set_event_loop(loop)
         await self._inner.connect(url, token)
 
     async def disconnect(self) -> None:
