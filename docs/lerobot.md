@@ -186,7 +186,7 @@ Robot-only (for `observation_features` shape metadata, since Portal doesn't know
 | `camera_height` | `480` |
 | `camera_width` | `640` |
 
-See [the README tuning section](../README.md#tuning) for the math behind `fps`, `slack`, and `tolerance`.
+See [tuning.md](tuning.md) for the math behind `fps`, `slack`, and `tolerance`.
 
 ## Frame formats
 
