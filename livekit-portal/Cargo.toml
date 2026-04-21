@@ -9,8 +9,8 @@ license = "Apache-2.0"
 # TLS backend (its comment: "By default ws TLS is not enabled"). Without this
 # the signal client's HTTPS requests (/settings/regions, the WSS upgrade) fail
 # against LiveKit Cloud. Matches livekit-ffi's default.
-livekit = { git = "https://github.com/livekit/rust-sdks.git", branch = "dc/feature/user_timestamp", features = ["rustls-tls-native-roots"] }
-yuv-sys = { git = "https://github.com/livekit/rust-sdks.git", branch = "dc/feature/user_timestamp" }
+livekit = { git = "https://github.com/livekit/rust-sdks.git", features = ["rustls-tls-native-roots"] }
+yuv-sys = { git = "https://github.com/livekit/rust-sdks.git" }
 thiserror = "2"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }

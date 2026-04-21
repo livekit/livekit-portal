@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use livekit::prelude::*;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
@@ -10,6 +11,7 @@ use crate::config::PortalConfig;
 use crate::data::{handle_data_received, DataPublisher, DataSlots};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
+use crate::rpc::RpcHandler;
 use crate::rtt::RttService;
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
@@ -84,12 +86,19 @@ impl ObservationSink {
 
 struct ConnectionState {
     room: Option<Room>,
+    local_participant: Option<LocalParticipant>,
     event_task: Option<JoinHandle<()>>,
     rtt: Option<Arc<RttService>>,
 }
 
 pub struct Portal {
     config: PortalConfig,
+
+    // Serializes connect()/disconnect() so a disconnect() yielding on
+    // room.close().await can't be overtaken by a concurrent connect()
+    // whose newly-populated state would then be clobbered by the
+    // disconnect's cleanup path.
+    lifecycle: tokio::sync::Mutex<()>,
 
     // Lifecycle state (connect/disconnect).
     conn: Mutex<ConnectionState>,
@@ -115,6 +124,16 @@ pub struct Portal {
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
 
     metrics: Arc<MetricsRegistry>,
+
+    // The opposite-role participant, if one has been observed via Portal
+    // traffic (data topic or video subscription). Set lazily on the first
+    // matching event; cleared on disconnect, reconnect, and when that
+    // participant leaves the room.
+    peer_identity: Arc<Mutex<Option<ParticipantIdentity>>>,
+
+    // RPC methods the caller has registered. Applied to the LocalParticipant
+    // on connect(); survives disconnect so reconnects reapply them.
+    rpc_handlers: Arc<Mutex<HashMap<String, RpcHandler>>>,
 }
 
 impl Portal {
@@ -130,7 +149,13 @@ impl Portal {
 
         Self {
             config,
-            conn: Mutex::new(ConnectionState { room: None, event_task: None, rtt: None }),
+            lifecycle: tokio::sync::Mutex::new(()),
+            conn: Mutex::new(ConnectionState {
+                room: None,
+                local_participant: None,
+                event_task: None,
+                rtt: None,
+            }),
             video_receivers: Arc::new(Mutex::new(HashMap::new())),
             video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
@@ -141,10 +166,13 @@ impl Portal {
             state: Arc::new(DataSlots::new()),
             video_tracks,
             metrics,
+            peer_identity: Arc::new(Mutex::new(None)),
+            rpc_handlers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn connect(&self, url: &str, token: &str) -> PortalResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if self.conn.lock().room.is_some() {
             return Err(PortalError::AlreadyConnected);
         }
@@ -158,13 +186,22 @@ impl Portal {
             .await
             .map_err(|e| PortalError::Room(e.to_string()))?;
 
+        // Store the LocalParticipant before applying handlers so a concurrent
+        // `register_rpc_method` either (a) inserts before we iterate and gets
+        // picked up, or (b) inserts after we've stored LP and forwards the
+        // handler itself. Overlap is idempotent — the SDK's rpc handler map
+        // is last-writer-wins.
+        let local_participant = room.local_participant();
+        self.conn.lock().local_participant = Some(local_participant.clone());
+        self.apply_rpc_handlers(&local_participant);
+
         match self.config.role {
             Role::Robot => self.setup_robot(&room).await?,
             Role::Operator => self.setup_operator(&room),
         }
 
         let rtt = Arc::new(RttService::spawn(
-            room.local_participant(),
+            local_participant.clone(),
             self.config.ping_ms,
             self.metrics.clone(),
         ));
@@ -183,6 +220,7 @@ impl Portal {
             video_receivers: self.video_receivers.clone(),
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
+            peer_identity: self.peer_identity.clone(),
         };
         let event_handle = tokio::spawn(async move {
             let mut events = events;
@@ -193,6 +231,7 @@ impl Portal {
 
         let mut state = self.conn.lock();
         state.room = Some(room);
+        // local_participant was set earlier (before apply_rpc_handlers).
         state.event_task = Some(event_handle);
         state.rtt = Some(rtt);
         Ok(())
@@ -238,7 +277,103 @@ impl Portal {
         publisher.send_map(values, timestamp_us)
     }
 
+    // --- RPC ---
+
+    /// Identity of the opposite-role participant Portal has identified, if
+    /// any. Latches on the first Portal-topic data packet or video track
+    /// subscription from a remote. `None` before the peer has spoken.
+    pub fn peer_identity(&self) -> Option<String> {
+        self.peer_identity.lock().as_ref().map(|p| p.as_str().to_string())
+    }
+
+    /// Register an RPC method handler. Handlers can be registered before or
+    /// after `connect()`; stored handlers are (re)applied to the
+    /// `LocalParticipant` on each connect.
+    pub fn register_rpc_method(&self, method: &str, handler: RpcHandler) {
+        {
+            let mut map = self.rpc_handlers.lock();
+            map.insert(method.to_string(), handler.clone());
+        }
+        if let Some(lp) = self.conn.lock().local_participant.clone() {
+            register_handler_on(&lp, method.to_string(), handler);
+        }
+    }
+
+    /// Remove a previously registered RPC method handler.
+    pub fn unregister_rpc_method(&self, method: &str) {
+        self.rpc_handlers.lock().remove(method);
+        if let Some(lp) = self.conn.lock().local_participant.clone() {
+            lp.unregister_rpc_method(method.to_string());
+        }
+    }
+
+    /// Invoke a registered method on the peer. `destination` is optional;
+    /// when omitted, the call is routed to Portal's identified peer (see
+    /// `peer_identity`), falling back to the single remote participant if
+    /// no peer has been identified yet. Errors with `NoPeer` or
+    /// `AmbiguousPeer` when neither resolves to a unique destination.
+    pub async fn perform_rpc(
+        &self,
+        destination: Option<&str>,
+        method: &str,
+        payload: String,
+        response_timeout: Option<Duration>,
+    ) -> PortalResult<String> {
+        let destination = match destination {
+            Some(id) => id.to_string(),
+            None => self.resolve_peer()?,
+        };
+        let lp = self
+            .conn
+            .lock()
+            .local_participant
+            .clone()
+            .ok_or(PortalError::NotConnected)?;
+
+        let mut data = PerformRpcData {
+            destination_identity: destination,
+            method: method.to_string(),
+            payload,
+            ..Default::default()
+        };
+        if let Some(t) = response_timeout {
+            data.response_timeout = t;
+        }
+
+        lp.perform_rpc(data).await.map_err(|e| PortalError::Rpc(e.into()))
+    }
+
+    /// Pick a destination identity from `peer_identity` if latched, else fall
+    /// back to the room's remote-participant snapshot (single-peer → use it,
+    /// empty → NoPeer, multiple → AmbiguousPeer).
+    fn resolve_peer(&self) -> PortalResult<String> {
+        if let Some(id) = self.peer_identity.lock().as_ref() {
+            return Ok(id.as_str().to_string());
+        }
+        let conn = self.conn.lock();
+        let room = conn.room.as_ref().ok_or(PortalError::NotConnected)?;
+        let remotes = room.remote_participants();
+        match remotes.len() {
+            0 => Err(PortalError::NoPeer),
+            1 => {
+                let (id, _) = remotes.into_iter().next().expect("remotes has one entry");
+                Ok(id.as_str().to_string())
+            }
+            _ => Err(PortalError::AmbiguousPeer),
+        }
+    }
+
+    /// Apply every stored handler to a freshly-connected LocalParticipant.
+    /// Called once from `connect()` after the Room is up.
+    fn apply_rpc_handlers(&self, lp: &LocalParticipant) {
+        let handlers = self.rpc_handlers.lock().clone();
+        for (method, handler) in handlers {
+            register_handler_on(lp, method, handler);
+        }
+    }
+
     pub async fn disconnect(&self) -> PortalResult<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let room = self.conn.lock().room.take();
         log::info!("disconnecting");
 
@@ -256,7 +391,9 @@ impl Portal {
                 task.abort();
             }
             state.rtt = None;
+            state.local_participant = None;
         }
+        *self.peer_identity.lock() = None;
         {
             let mut receivers = self.video_receivers.lock();
             for receiver in receivers.values() {
@@ -434,6 +571,20 @@ impl Portal {
     }
 }
 
+/// Wrap a Portal `RpcHandler` in the signature the SDK expects and install
+/// it on the given LocalParticipant. Payload types are converted at the
+/// boundary — the SDK's `RpcInvocationData` / `RpcError` never leak into
+/// caller-facing code.
+fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandler) {
+    lp.register_rpc_method(method, move |data| {
+        let handler = handler.clone();
+        Box::pin(async move {
+            let core_data: crate::rpc::RpcInvocationData = data.into();
+            handler(core_data).await.map_err(Into::into)
+        })
+    });
+}
+
 /// Snapshot of the fields the room event loop needs, so it doesn't take any
 /// Portal-level lock on the hot path.
 struct EventContext {
@@ -446,6 +597,21 @@ struct EventContext {
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
     metrics: Arc<MetricsRegistry>,
     rtt: Arc<RttService>,
+    peer_identity: Arc<Mutex<Option<ParticipantIdentity>>>,
+}
+
+/// Latch `identity` as the peer if we haven't identified one yet. Logged once
+/// per connection — subsequent calls are cheap no-ops.
+fn latch_peer(
+    peer_identity: &Mutex<Option<ParticipantIdentity>>,
+    session: &str,
+    identity: ParticipantIdentity,
+) {
+    let mut slot = peer_identity.lock();
+    if slot.is_none() {
+        log::info!("[{session}] identified peer '{}'", identity.as_str());
+        *slot = Some(identity);
+    }
 }
 
 fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
@@ -486,7 +652,19 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 }
             }
         }
-        RoomEvent::DataReceived { payload, topic: Some(topic), .. } => {
+        RoomEvent::DataReceived { payload, topic: Some(topic), participant, .. } => {
+            // Latch peer on the first Portal-topic packet from a remote.
+            // RTT packets count too — they originate from the same peer.
+            if let Some(p) = &participant {
+                if matches!(
+                    (ctx.config.role, topic.as_str()),
+                    (Role::Robot, "portal_action")
+                        | (Role::Operator, "portal_state")
+                        | (_, "portal_rtt")
+                ) {
+                    latch_peer(&ctx.peer_identity, &ctx.config.session, p.identity());
+                }
+            }
             let output = handle_data_received(
                 &payload,
                 &topic,
@@ -501,6 +679,17 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             );
             if !output.is_empty() {
                 ctx.obs_sink.dispatch(output);
+            }
+        }
+        RoomEvent::ParticipantDisconnected(participant) => {
+            let mut slot = ctx.peer_identity.lock();
+            if slot.as_ref() == Some(&participant.identity()) {
+                log::info!(
+                    "[{}] peer '{}' disconnected",
+                    ctx.config.session,
+                    participant.identity().as_str()
+                );
+                *slot = None;
             }
         }
         RoomEvent::Reconnected => {
@@ -520,6 +709,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             for slots in ctx.video_tracks.values() {
                 slots.clear();
             }
+            *ctx.peer_identity.lock() = None;
         }
         _ => {}
     }
