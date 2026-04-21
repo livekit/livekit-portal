@@ -35,9 +35,34 @@ platform cdylib (`liblivekit_portal_ffi.{dylib,so,dll}`) next to the
 Python package, and emits the matching UniFFI Python module. First build
 takes a couple of minutes. Subsequent builds are incremental.
 
-To use the package from another project, run `pip install .` (or
-`pip install -e .`) from the same directory after the native build.
-Prebuilt wheels are on the roadmap.
+### Use from another project
+
+After the native build, depend on the package by path. The
+[shipped examples](../examples/python/basic/pyproject.toml) do this with
+relative paths because they sit inside the repo. From another project,
+use an absolute path:
+
+```bash
+# uv
+uv add --editable /absolute/path/to/livekit-portal/python/packages/livekit-portal
+
+# pip
+pip install -e /absolute/path/to/livekit-portal/python/packages/livekit-portal
+```
+
+Or wire it directly into your `pyproject.toml`:
+
+```toml
+[project]
+dependencies = ["livekit-portal"]
+
+[tool.uv.sources]
+livekit-portal = { path = "/absolute/path/to/livekit-portal/python/packages/livekit-portal", editable = true }
+```
+
+Rerun `bash scripts/build_native.sh release` (in the Portal repo) whenever
+the Rust code changes. The editable install picks up the new cdylib on
+next import. Prebuilt wheels are on the roadmap.
 
 ## 2. Mint tokens
 
