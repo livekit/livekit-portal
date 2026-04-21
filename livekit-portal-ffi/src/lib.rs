@@ -81,6 +81,74 @@ pub struct State {
     pub timestamp_us: u64,
 }
 
+/// Dtype of an `ActionChunk` payload. `F32` is the straight choice for most
+/// policies; `F16` halves wire size for wide action spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ChunkDtype {
+    F32,
+    F16,
+}
+
+impl From<ChunkDtype> for core::ChunkDtype {
+    fn from(d: ChunkDtype) -> Self {
+        match d {
+            ChunkDtype::F32 => core::ChunkDtype::F32,
+            ChunkDtype::F16 => core::ChunkDtype::F16,
+        }
+    }
+}
+
+impl From<core::ChunkDtype> for ChunkDtype {
+    fn from(d: core::ChunkDtype) -> Self {
+        match d {
+            core::ChunkDtype::F32 => ChunkDtype::F32,
+            core::ChunkDtype::F16 => ChunkDtype::F16,
+        }
+    }
+}
+
+/// Policy-emitted action chunk. `payload` is `horizon * action_dim *
+/// sizeof(dtype)` little-endian bytes; callers on both sides pack/unpack
+/// (e.g. via numpy).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ActionChunk {
+    pub horizon: u32,
+    pub action_dim: u32,
+    pub dtype: ChunkDtype,
+    pub captured_at_us: u64,
+    pub payload: Vec<u8>,
+}
+
+impl From<core::ActionChunk> for ActionChunk {
+    fn from(c: core::ActionChunk) -> Self {
+        Self {
+            horizon: c.horizon as u32,
+            action_dim: c.action_dim as u32,
+            dtype: c.dtype.into(),
+            captured_at_us: c.captured_at_us,
+            payload: c.payload,
+        }
+    }
+}
+
+impl ActionChunk {
+    fn into_core(self) -> PortalResult<core::ActionChunk> {
+        let horizon: u16 = self.horizon.try_into().map_err(|_| {
+            PortalError::Deserialization(format!("horizon {} exceeds u16", self.horizon))
+        })?;
+        let action_dim: u16 = self.action_dim.try_into().map_err(|_| {
+            PortalError::Deserialization(format!("action_dim {} exceeds u16", self.action_dim))
+        })?;
+        Ok(core::ActionChunk {
+            horizon,
+            action_dim,
+            dtype: self.dtype.into(),
+            captured_at_us: self.captured_at_us,
+            payload: self.payload,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct SyncMetrics {
     pub observations_emitted: u64,
@@ -261,6 +329,15 @@ pub trait PortalCallbacks: Send + Sync {
     fn on_observation(&self, observation: Observation);
     fn on_video_frame(&self, track_name: String, frame: VideoFrame);
     fn on_drop(&self, dropped: Vec<HashMap<String, f64>>);
+    fn on_action_chunk(&self, chunk: ActionChunk);
+}
+
+/// Foreign-implemented handler for incoming byte streams on a registered
+/// topic. Receives the sender's participant identity and the assembled
+/// payload.
+#[uniffi::export(with_foreign)]
+pub trait ByteStreamHandler: Send + Sync {
+    fn handle(&self, sender: String, data: Vec<u8>);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +440,10 @@ impl Portal {
         inner.on_drop(move |dropped| {
             cb.on_drop(dropped);
         });
+        let cb = callbacks.clone();
+        inner.on_action_chunk(move |chunk| {
+            cb.on_action_chunk(chunk.clone().into());
+        });
         for track in &video_tracks {
             let cb = callbacks.clone();
             let track_name = track.clone();
@@ -415,6 +496,46 @@ impl Portal {
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         self.inner.send_action(&values, timestamp_us).map_err(Into::into)
+    }
+
+    pub async fn send_bytes(
+        &self,
+        topic: String,
+        data: Vec<u8>,
+        destination: Option<String>,
+    ) -> PortalResult<()> {
+        self.inner
+            .send_bytes(&topic, &data, destination.as_deref())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn register_byte_stream_handler(
+        &self,
+        topic: String,
+        handler: Arc<dyn ByteStreamHandler>,
+    ) {
+        self.inner.register_byte_stream_handler(&topic, wrap_foreign_byte_handler(handler));
+    }
+
+    pub fn unregister_byte_stream_handler(&self, topic: String) {
+        self.inner.unregister_byte_stream_handler(&topic);
+    }
+
+    pub async fn send_action_chunk(
+        &self,
+        chunk: ActionChunk,
+        destination: Option<String>,
+    ) -> PortalResult<()> {
+        let core_chunk = chunk.into_core()?;
+        self.inner
+            .send_action_chunk(&core_chunk, destination.as_deref())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn get_action_chunk(&self) -> Option<ActionChunk> {
+        self.inner.get_action_chunk().map(Into::into)
     }
 
     pub fn get_observation(&self) -> Option<Observation> {
@@ -523,6 +644,12 @@ fn wrap_foreign_handler(handler: Arc<dyn RpcHandler>) -> core::RpcHandler {
             let ffi_data = RpcInvocationData::from(data);
             handler.handle(ffi_data).await.map_err(Into::into)
         })
+    })
+}
+
+fn wrap_foreign_byte_handler(handler: Arc<dyn ByteStreamHandler>) -> core::ByteStreamHandler {
+    Arc::new(move |sender: String, data: Vec<u8>| {
+        handler.handle(sender, data);
     })
 }
 

@@ -7,6 +7,8 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::bytes::{self, ByteStreamHandler, ByteStreamRegistry};
+use crate::chunk::{deserialize_chunk, serialize_chunk, ActionChunk, CHUNK_TOPIC};
 use crate::config::PortalConfig;
 use crate::data::{handle_data_received, DataPublisher, DataSlots};
 use crate::error::{PortalError, PortalResult};
@@ -19,6 +21,31 @@ use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
 
 type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
 type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
+type ChunkCb = Box<dyn Fn(&ActionChunk) + Send + Sync>;
+
+/// Push callback + latest-wins slot for incoming action chunks. Mirrors
+/// `DataSlots` but carries a typed `ActionChunk` instead of a field map.
+pub(crate) struct ChunkSlots {
+    pub cb: Mutex<Option<ChunkCb>>,
+    pub latest: Mutex<Option<ActionChunk>>,
+}
+
+impl ChunkSlots {
+    fn new() -> Self {
+        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
+    }
+
+    fn deliver(&self, chunk: ActionChunk) {
+        if let Some(cb) = self.cb.lock().as_ref() {
+            cb(&chunk);
+        }
+        *self.latest.lock() = Some(chunk);
+    }
+
+    fn clear(&self) {
+        *self.latest.lock() = None;
+    }
+}
 
 /// Drains the buffers returned by `SyncBuffer::push_*` and dispatches them to
 /// the user — callback first (by reference, no clone), then into the pull-based
@@ -134,6 +161,17 @@ pub struct Portal {
     // RPC methods the caller has registered. Applied to the LocalParticipant
     // on connect(); survives disconnect so reconnects reapply them.
     rpc_handlers: Arc<Mutex<HashMap<String, RpcHandler>>>,
+
+    // Byte-stream handlers keyed by topic. Unlike RPC handlers, byte-stream
+    // dispatch happens inside Portal's room event loop (not on the SDK's
+    // LocalParticipant), so the registry survives reconnect without needing
+    // to reapply anything to the SDK.
+    byte_stream_handlers: Arc<ByteStreamRegistry>,
+
+    // Typed action-chunk slots (parallel to `action` for scalar actions).
+    // Populated by an internal byte-stream handler registered on
+    // `CHUNK_TOPIC`.
+    chunk: Arc<ChunkSlots>,
 }
 
 impl Portal {
@@ -146,6 +184,22 @@ impl Portal {
 
         let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
         let obs_sink = Arc::new(ObservationSink::new());
+        let chunk = Arc::new(ChunkSlots::new());
+        let byte_stream_handlers = ByteStreamRegistry::new();
+
+        // Install Portal's own action-chunk handler on the reserved topic.
+        // Decoding lives here so foreign bindings see typed `ActionChunk`s,
+        // not raw bytes — leaving the chunk wire format internal to Portal.
+        {
+            let chunk = chunk.clone();
+            byte_stream_handlers.insert(
+                CHUNK_TOPIC,
+                Arc::new(move |_sender, data| match deserialize_chunk(&data) {
+                    Ok(c) => chunk.deliver(c),
+                    Err(e) => log::warn!("failed to deserialize action chunk: {e}"),
+                }),
+            );
+        }
 
         Self {
             config,
@@ -168,6 +222,8 @@ impl Portal {
             metrics,
             peer_identity: Arc::new(Mutex::new(None)),
             rpc_handlers: Arc::new(Mutex::new(HashMap::new())),
+            byte_stream_handlers,
+            chunk,
         }
     }
 
@@ -221,6 +277,8 @@ impl Portal {
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
             peer_identity: self.peer_identity.clone(),
+            byte_stream_handlers: self.byte_stream_handlers.clone(),
+            chunk: self.chunk.clone(),
         };
         let event_handle = tokio::spawn(async move {
             let mut events = events;
@@ -275,6 +333,73 @@ impl Portal {
         let publisher =
             self.action_publisher.lock().clone().ok_or(PortalError::WrongRole(Role::Robot))?;
         publisher.send_map(values, timestamp_us)
+    }
+
+    // --- Byte streams (generic reliable binary passthrough) ---
+
+    /// Send a one-shot binary payload on `topic`. When `destination` is
+    /// `Some`, the stream is targeted at that participant identity only;
+    /// when `None`, it broadcasts to the room.
+    ///
+    /// Byte streams are reliable and ordered, and have no 15KB cap. Use
+    /// this for payloads that would overflow RPC, or when you want
+    /// topic-based fan-out without a round-trip.
+    pub async fn send_bytes(
+        &self,
+        topic: &str,
+        data: &[u8],
+        destination: Option<&str>,
+    ) -> PortalResult<()> {
+        let lp = self
+            .conn
+            .lock()
+            .local_participant
+            .clone()
+            .ok_or(PortalError::NotConnected)?;
+        bytes::send_bytes(&lp, topic, data, destination).await
+    }
+
+    /// Register a handler for byte streams opened on `topic`. The handler
+    /// receives the sender's participant identity and the assembled
+    /// payload. Replacing an existing handler on the same topic is allowed.
+    ///
+    /// The reserved topic [`CHUNK_TOPIC`] is occupied by Portal's internal
+    /// action-chunk dispatcher; registering user handlers there will
+    /// override chunk dispatch and is not supported.
+    pub fn register_byte_stream_handler(&self, topic: &str, handler: ByteStreamHandler) {
+        self.byte_stream_handlers.insert(topic, handler);
+    }
+
+    pub fn unregister_byte_stream_handler(&self, topic: &str) {
+        self.byte_stream_handlers.remove(topic);
+    }
+
+    // --- Action chunks (typed binary on a reserved byte-stream topic) ---
+
+    /// Send a policy-emitted action chunk. Serialized with Portal's
+    /// internal binary framing and delivered on the reserved byte-stream
+    /// topic. `destination` routes to a specific participant when `Some`.
+    ///
+    /// Chunks self-describe (horizon, action_dim, dtype, timestamp). Portal
+    /// does not negotiate a chunk schema — semantic agreement on joint
+    /// layout is the caller's responsibility.
+    pub async fn send_action_chunk(
+        &self,
+        chunk: &ActionChunk,
+        destination: Option<&str>,
+    ) -> PortalResult<()> {
+        let frame = serialize_chunk(chunk)?;
+        self.send_bytes(CHUNK_TOPIC, &frame, destination).await
+    }
+
+    /// Clone of the most-recently-received action chunk, or `None` if none
+    /// have arrived this session. Use `on_action_chunk` for the push path.
+    pub fn get_action_chunk(&self) -> Option<ActionChunk> {
+        self.chunk.latest.lock().clone()
+    }
+
+    pub fn on_action_chunk(&self, callback: impl Fn(&ActionChunk) + Send + Sync + 'static) {
+        *self.chunk.cb.lock() = Some(Box::new(callback));
     }
 
     // --- RPC ---
@@ -412,6 +537,7 @@ impl Portal {
         self.obs_sink.clear();
         self.action.clear();
         self.state.clear();
+        self.chunk.clear();
         for slots in self.video_tracks.values() {
             slots.clear();
         }
@@ -598,6 +724,8 @@ struct EventContext {
     metrics: Arc<MetricsRegistry>,
     rtt: Arc<RttService>,
     peer_identity: Arc<Mutex<Option<ParticipantIdentity>>>,
+    byte_stream_handlers: Arc<ByteStreamRegistry>,
+    chunk: Arc<ChunkSlots>,
 }
 
 /// Latch `identity` as the peer if we haven't identified one yet. Logged once
@@ -681,6 +809,19 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 ctx.obs_sink.dispatch(output);
             }
         }
+        RoomEvent::ByteStreamOpened { reader, topic, participant_identity } => {
+            // Latch peer on byte-stream arrival too — it's Portal-initiated
+            // traffic from a remote, same as action/state data packets.
+            latch_peer(&ctx.peer_identity, &ctx.config.session, participant_identity.clone());
+            if let Some(reader) = reader.take() {
+                bytes::dispatch_byte_stream_opened(
+                    &ctx.byte_stream_handlers,
+                    reader,
+                    topic,
+                    participant_identity,
+                );
+            }
+        }
         RoomEvent::ParticipantDisconnected(participant) => {
             let mut slot = ctx.peer_identity.lock();
             if slot.as_ref() == Some(&participant.identity()) {
@@ -706,6 +847,7 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             ctx.obs_sink.clear();
             ctx.action.clear();
             ctx.state.clear();
+            ctx.chunk.clear();
             for slots in ctx.video_tracks.values() {
                 slots.clear();
             }

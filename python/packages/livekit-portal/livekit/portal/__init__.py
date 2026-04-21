@@ -41,6 +41,8 @@ Observation = _ffi.Observation
 Action = _ffi.Action
 State = _ffi.State
 VideoFrameData = _ffi.VideoFrame
+ActionChunk = _ffi.ActionChunk
+ChunkDtype = _ffi.ChunkDtype
 PortalMetrics = _ffi.PortalMetrics
 SyncMetrics = _ffi.SyncMetrics
 TransportMetrics = _ffi.TransportMetrics
@@ -70,8 +72,11 @@ class _Dispatcher(_ffi.PortalCallbacks):
         self._state_cb: Optional[Callable[[State], Any]] = None
         self._observation_cb: Optional[Callable[[Observation], Any]] = None
         self._drop_cb: Optional[Callable[[List[Dict[str, float]]], Any]] = None
+        self._action_chunk_cb: Optional[Callable[[ActionChunk], Any]] = None
         # Per-track video callback: track_name → callable(track_name, frame).
         self._video_cbs: Dict[str, Callable[[str, VideoFrameData], Any]] = {}
+        # Per-topic byte-stream callback: topic → callable(sender, data).
+        self._byte_stream_cbs: Dict[str, Callable[[str, bytes], Any]] = {}
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         with self._lock:
@@ -111,6 +116,11 @@ class _Dispatcher(_ffi.PortalCallbacks):
         if cb is not None:
             self._schedule(cb, dropped)
 
+    def on_action_chunk(self, chunk: ActionChunk) -> None:
+        cb = self._action_chunk_cb
+        if cb is not None:
+            self._schedule(cb, chunk)
+
     # --- Registration (from Python user thread) -----------------------------
 
     def set_action(self, cb: Callable[[Action], Any]) -> None:
@@ -124,6 +134,9 @@ class _Dispatcher(_ffi.PortalCallbacks):
 
     def set_drop(self, cb: Callable[[List[Dict[str, float]]], Any]) -> None:
         self._drop_cb = cb
+
+    def set_action_chunk(self, cb: Callable[[ActionChunk], Any]) -> None:
+        self._action_chunk_cb = cb
 
     def set_video(self, track_name: str, cb: Callable[[str, VideoFrameData], Any]) -> None:
         self._video_cbs[track_name] = cb
@@ -205,6 +218,30 @@ class _RpcHandlerAdapter(_ffi.RpcHandler):
                 message=f"handler raised {type(e).__name__}: {e}",
                 data=None,
             ) from e
+
+
+# --- Byte stream handler adapter -------------------------------------------
+
+
+class _ByteStreamHandlerAdapter(_ffi.ByteStreamHandler):
+    """Wrap a user callable so it satisfies the UniFFI byte-stream trait.
+
+    The handler is invoked on a tokio worker when a matching byte stream
+    finishes reading; we hop onto the registered asyncio loop for user code.
+    Accepts `def handle(sender, data)` or `async def`.
+    """
+
+    def __init__(
+        self,
+        callback: Callable[[str, bytes], Any],
+        dispatcher: "_Dispatcher",
+    ) -> None:
+        super().__init__()
+        self._callback = callback
+        self._dispatcher = dispatcher
+
+    def handle(self, sender: str, data: bytes) -> None:
+        self._dispatcher._schedule(self._callback, sender, data)
 
 
 # --- PortalConfig -----------------------------------------------------------
@@ -361,6 +398,54 @@ class Portal:
     ) -> None:
         self._inner.send_action(values, timestamp_us)
 
+    # -- byte streams (generic reliable binary) ------------------------------
+
+    async def send_bytes(
+        self,
+        topic: str,
+        data: bytes,
+        destination: Optional[str] = None,
+    ) -> None:
+        """Send a one-shot binary payload on `topic`. Reliable and ordered,
+        no 15 KB cap. `destination` is a participant identity; `None`
+        broadcasts to the room.
+        """
+        await self._inner.send_bytes(topic, data, destination)
+
+    def register_byte_stream_handler(
+        self,
+        topic: str,
+        handler: Callable[[str, bytes], Any],
+    ) -> None:
+        """Register a handler for byte streams on `topic`. `handler(sender,
+        data)` fires once per incoming stream, with the sender's participant
+        identity and the assembled payload. May be `def` or `async def`.
+
+        The topic `portal_action_chunk` is reserved for `send_action_chunk`;
+        register a handler there at your own risk (it replaces Portal's
+        built-in chunk dispatcher).
+        """
+        wrapper = _ByteStreamHandlerAdapter(handler, self._dispatcher)
+        self._inner.register_byte_stream_handler(topic, wrapper)
+
+    def unregister_byte_stream_handler(self, topic: str) -> None:
+        self._inner.unregister_byte_stream_handler(topic)
+
+    # -- action chunks -------------------------------------------------------
+
+    async def send_action_chunk(
+        self,
+        chunk: ActionChunk,
+        destination: Optional[str] = None,
+    ) -> None:
+        """Send an action chunk. `chunk.payload` must be `horizon * action_dim
+        * sizeof(dtype)` little-endian bytes.
+        """
+        await self._inner.send_action_chunk(chunk, destination)
+
+    def get_action_chunk(self) -> Optional[ActionChunk]:
+        return self._inner.get_action_chunk()
+
     # -- pull (sync, latest-wins) --------------------------------------------
 
     def get_observation(self) -> Optional[Observation]:
@@ -398,6 +483,13 @@ class Portal:
         callback: Callable[[List[Dict[str, float]]], Any],
     ) -> None:
         self._dispatcher.set_drop(callback)
+
+    def on_action_chunk(self, callback: Callable[[ActionChunk], Any]) -> None:
+        """Register a callback fired once per received `ActionChunk`. The
+        callback can be `def` or `async def`; it runs on this Portal's
+        asyncio loop.
+        """
+        self._dispatcher.set_action_chunk(callback)
 
     # -- rpc -----------------------------------------------------------------
 
@@ -471,6 +563,8 @@ __all__ = [
     "Action",
     "State",
     "VideoFrameData",
+    "ActionChunk",
+    "ChunkDtype",
     "PortalMetrics",
     "SyncMetrics",
     "TransportMetrics",

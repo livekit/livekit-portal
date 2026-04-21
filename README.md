@@ -261,6 +261,7 @@ lerobot device to any workflow (teleop, dataset recording, policy eval). See
 | [Concepts](docs/concepts.md) | Roles, the observation model, frame format |
 | [Tuning](docs/tuning.md) | `fps`, `slack`, `tolerance`, asymmetric rates, reliability |
 | [RPC](docs/rpc.md) | Imperative commands (`home`, `calibrate`, ...) on top of LiveKit RPC |
+| [Real-time chunking](docs/rtc.md) | `ActionChunk` and byte streams for chunked policies (ACT, pi0, RTC) |
 | [Synchronization deep dive](docs/synchronization.md) | The full match algorithm, cursor bookkeeping, complexity |
 | [lerobot integration](docs/lerobot.md) | The optional convenience plugins |
 
