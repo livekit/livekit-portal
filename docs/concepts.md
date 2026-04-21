@@ -6,7 +6,7 @@ full detail, see [synchronization.md](synchronization.md).
 ## Roles
 
 Portal is a **two-role** system. Each side commits to one role at
-`PortalConfig` construction; calling the wrong send method returns `WrongRole`.
+`PortalConfig` construction. Calling the wrong send method returns `WrongRole`.
 
 | Role | Publishes | Subscribes |
 |------|-----------|------------|
@@ -31,7 +31,7 @@ streams each have their own pacing, codec path, and retransmission. On the
 wire you see four or more independent event streams arriving out of phase.
 
 Portal tags every outgoing frame and state packet with the **sender's clock**,
-then — on the operator side — matches them locally into `Observation`s. An
+then (on the operator side) matches them locally into `Observation`s. An
 observation fires only when every registered video track has a frame within
 the match window for a given state. Unmatched states are reported separately
 via `on_drop`.
@@ -95,26 +95,26 @@ sequenceDiagram
     R->>R: robot.send_action(...)
 ```
 
-## Synchronization — the short version
+## Synchronization in short
 
 For a head state with timestamp `S`, a frame at timestamp `F` on track `k` is a
 **candidate** iff `|S − F| < search_range`. Per state, Portal picks the
 *nearest* candidate per track and resolves the state one of three ways:
 
-- **Match** — every registered track has an in-range frame → emit
-  `Observation` via `on_observation`.
-- **Wait** — at least one track has no candidate yet, but its newest frame is
+- **Match**: every registered track has an in-range frame, so the
+  `Observation` is emitted via `on_observation`.
+- **Wait**: at least one track has no candidate yet, but its newest frame is
   still below the horizon (`buf.back().ts < S + R`). Newer frames may still
   land in range.
-- **Drop** — some track's newest frame is already past the horizon
+- **Drop**: some track's newest frame is already past the horizon
   (`buf.back().ts ≥ S + R`). No future frame can match (timestamps are
   monotonic), so the state is fired on `on_drop`.
 
 The search range and buffer sizes derive from a single `fps` knob plus a
-`slack` and `tolerance` — see [tuning.md](tuning.md).
+`slack` and `tolerance`. See [tuning.md](tuning.md).
 
-For the full algorithm — cursor rewind, blocker-gated sync, O(1) drop
-detection, eager cross-track drop — see
+For the full algorithm (cursor rewind, blocker-gated sync, O(1) drop
+detection, eager cross-track drop), see
 [synchronization.md](synchronization.md).
 
 ### Sender requirement
@@ -122,7 +122,7 @@ detection, eager cross-track drop — see
 Every received video frame must carry `user_timestamp` in its LiveKit
 packet-trailer metadata. Portal enables this automatically on tracks it
 publishes (`PacketTrailerFeatures.user_timestamp = true`). A subscribed track
-produced by anything that does *not* set this field is unsupported — either
+produced by anything that does *not* set this field is unsupported: either
 republish the source through Portal, or enable user-timestamp trailers on the
 upstream publisher.
 
@@ -133,9 +133,9 @@ per channel, no alpha. Layout is row-major and tightly packed
 (`stride = width * 3`), so an exact buffer is `width * height * 3` bytes.
 `width` and `height` must both be **even** (I420 chroma subsampling).
 
-This matches NumPy `uint8` arrays of shape `(H, W, 3)` in RGB order — the
-output of `PIL.Image.convert("RGB")` or OpenCV's
-`cvtColor(frame, COLOR_BGR2RGB)`.
+This matches NumPy `uint8` arrays of shape `(H, W, 3)` in RGB order, which is
+what `PIL.Image.convert("RGB")` or OpenCV's `cvtColor(frame, COLOR_BGR2RGB)`
+produces.
 
 Portal converts to I420 internally via libyuv's SIMD-optimized `RAWToI420`
 before handing the frame to WebRTC. Approximate cost on modern ARM64 (NEON)

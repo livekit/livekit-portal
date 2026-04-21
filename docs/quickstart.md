@@ -1,34 +1,68 @@
 # Quickstart
 
-Get a robot and an operator talking over LiveKit in ~5 minutes.
+Get a robot host and a control host talking over LiveKit in about 5 minutes
+using the Portal API directly.
 
-This page uses the **lerobot plugin path** — the shortest route. If your stack
-isn't lerobot-based, jump to the raw [Portal API reference](portal-api.md) once
-you're through this page.
+If you are already on lerobot, there is a one-line shortcut at the bottom of
+this page that wraps the same code.
 
 ## What you need
 
-- Python 3.12+ and [`uv`](https://docs.astral.sh/uv/)
-- A LiveKit server: [LiveKit Cloud](https://cloud.livekit.io) (free tier works) or
-  a local `livekit-server --dev`
+- A [Rust toolchain](https://rustup.rs/) (stable `cargo`)
+- Python 3.10+ and [`uv`](https://docs.astral.sh/uv/)
+- A LiveKit server: [LiveKit Cloud](https://cloud.livekit.io) (free tier
+  works) or a local `livekit-server --dev`
 - Your `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
 
-You do **not** need a physical robot to try this — the first example below
-publishes a synthetic test pattern.
+You do **not** need a physical robot to try this. The first example publishes
+a synthetic test pattern.
 
 ## 1. Install
 
-```bash
-uv pip install livekit-portal
-```
-
-For local development from this repo:
+Portal is not on PyPI yet, and there are no prebuilt native binaries. You
+build from source.
 
 ```bash
-cd python/packages/livekit-portal
-uv sync
-bash scripts/build_native.sh release
+git clone https://github.com/livekit/livekit-portal.git
+cd livekit-portal/python/packages/livekit-portal
+
+uv sync                                    # install Python deps into .venv
+bash scripts/build_native.sh release       # compile cdylib + generate UniFFI bindings
 ```
+
+`build_native.sh` runs `cargo build -p livekit-portal-ffi`, drops the
+platform cdylib (`liblivekit_portal_ffi.{dylib,so,dll}`) next to the
+Python package, and emits the matching UniFFI Python module. First build
+takes a couple of minutes. Subsequent builds are incremental.
+
+### Use from another project
+
+After the native build, depend on the package by path. The
+[shipped examples](../examples/python/basic/pyproject.toml) do this with
+relative paths because they sit inside the repo. From another project,
+use an absolute path:
+
+```bash
+# uv
+uv add --editable /absolute/path/to/livekit-portal/python/packages/livekit-portal
+
+# pip
+pip install -e /absolute/path/to/livekit-portal/python/packages/livekit-portal
+```
+
+Or wire it directly into your `pyproject.toml`:
+
+```toml
+[project]
+dependencies = ["livekit-portal"]
+
+[tool.uv.sources]
+livekit-portal = { path = "/absolute/path/to/livekit-portal/python/packages/livekit-portal", editable = true }
+```
+
+Rerun `bash scripts/build_native.sh release` (in the Portal repo) whenever
+the Rust code changes. The editable install picks up the new cdylib on
+next import. Prebuilt wheels are on the roadmap.
 
 ## 2. Mint tokens
 
@@ -58,115 +92,140 @@ def mint(identity: str, room: str, key: str, secret: str) -> str:
 
 Identities must be unique within the room (e.g. `"robot"`, `"operator"`).
 
-## 3. Run it — lerobot plugin path
+## 3. Robot host
 
-Two scripts, one per machine. Both connect to the same room name.
+Runs next to the hardware.
 
-### Robot side (next to the hardware)
-
-Wrap your existing lerobot `Robot`:
+It declares what it will publish (video tracks, state fields) and what it
+will receive (action fields). Then it pumps frames and state at your
+capture rate.
 
 ```python
-from lerobot.robots.so100 import SO100Robot, SO100RobotConfig   # or your class
-from lerobot_teleoperator_livekit import (
-    LiveKitTeleoperator, LiveKitTeleoperatorConfig,
-)
+import asyncio, time
+from livekit.portal import Portal, PortalConfig, Role
 
-robot = SO100Robot(SO100RobotConfig(...))
-robot.connect()
+async def main():
+    cfg = PortalConfig("session-1", Role.ROBOT)
+    cfg.add_video("cam1")
+    cfg.add_state(["j1", "j2", "j3"])
+    cfg.add_action(["j1", "j2", "j3"])
+    cfg.set_fps(30)
 
-teleop = LiveKitTeleoperator(
-    LiveKitTeleoperatorConfig(
-        url="wss://your-project.livekit.cloud",
-        token=mint("robot", "session-1", API_KEY, API_SECRET),
-        session="session-1",
-        fps=30,
-    ),
-    robot=robot,                     # schema inferred from the robot
-)
-teleop.connect()
+    portal = Portal(cfg)
 
-try:
+    def on_action(a):
+        # a.values is the action dict.
+        # a.timestamp_us is the sender's clock.
+        robot.send_action(a.values)
+
+    portal.on_action(on_action)
+    await portal.connect(URL, mint("robot", "session-1", API_KEY, API_SECRET))
+
     while running:
         obs = robot.get_observation()
-        teleop.send_feedback(obs)    # goes over the wire
-        action = teleop.get_action() # latest action from operator (may be {})
-        if action:
-            robot.send_action(action)
-        sleep(1 / 30)
-finally:
-    teleop.disconnect()
-    robot.disconnect()
+        ts = int(time.time() * 1_000_000)
+        portal.send_video_frame("cam1", obs.image, width, height, timestamp_us=ts)
+        portal.send_state(obs.state, timestamp_us=ts)
+        await asyncio.sleep(1 / 30)
+
+asyncio.run(main())
 ```
 
-### Operator side (workstation, trainer, policy host)
+`obs.image` must be a NumPy `uint8` array of shape `(H, W, 3)` in RGB.
 
-Wrap your local `Teleoperator` (leader arm, gamepad, or policy output):
+## 4. Control host
+
+Runs wherever your operator, trainer, or policy lives.
+
+It declares the same schema as the robot host. Then it consumes
+synchronized observations and publishes actions.
 
 ```python
-from lerobot.teleoperators.leader import LeaderArmTeleop, LeaderArmTeleopConfig
-from lerobot_robot_livekit import LiveKitRobot, LiveKitRobotConfig
+import asyncio
+from livekit.portal import Portal, PortalConfig, Role
 
-leader = LeaderArmTeleop(LeaderArmTeleopConfig(...))
-leader.connect()
+async def main():
+    cfg = PortalConfig("session-1", Role.OPERATOR)
+    cfg.add_video("cam1")
+    cfg.add_state(["j1", "j2", "j3"])
+    cfg.add_action(["j1", "j2", "j3"])
+    cfg.set_fps(30)
+
+    portal = Portal(cfg)
+
+    def on_observation(obs):
+        # obs.frames: dict[str, np.ndarray]      # one per registered video track
+        # obs.state:  dict[str, float]
+        # obs.timestamp_us: int                  # sender clock
+        action = policy(obs)                     # or teleop.get_action(), etc.
+        portal.send_action(action)
+
+    portal.on_observation(on_observation)
+    await portal.connect(URL, mint("operator", "session-1", API_KEY, API_SECRET))
+
+    while running:
+        await asyncio.sleep(1)
+
+asyncio.run(main())
+```
+
+`policy(obs)` here is any function that turns an observation into an
+action dict. Teleoperation, imitation learning, VLA inference, a hand-written
+P controller: Portal does not care.
+
+## 5. Try the shipped examples
+
+Before wiring Portal into your real stack, run the basic example. It uses
+the exact API above, with synthetic video and a token minter already wired
+up.
+
+- [`examples/python/basic/`](../examples/python/basic): no hardware needed.
+  Ten-minute sanity check that your LiveKit credentials and native build
+  work.
+- [`examples/python/so101/`](../examples/python/so101): real hardware. Drive
+  a physical SO-101 follower from a remote SO-101 leader, with the camera
+  and joint state rendered in [rerun](https://rerun.io). Uses the lerobot
+  plugin shortcut (see below). Full calibration + wiring walkthrough in its
+  [README](../examples/python/so101/README.md).
+
+## Shortcut: lerobot users
+
+Already using the [lerobot](https://github.com/huggingface/lerobot)
+`Robot` / `Teleoperator` interfaces? Two optional plugin packages wrap
+the Portal code above so you don't have to write it yourself.
+
+```python
+# robot host: wraps a local lerobot Robot
+from lerobot_teleoperator_livekit import LiveKitTeleoperator, LiveKitTeleoperatorConfig
+
+teleop = LiveKitTeleoperator(
+    LiveKitTeleoperatorConfig(url=URL, token=token, session="session-1", fps=30),
+    robot=my_robot,
+)
+teleop.connect()
+```
+
+```python
+# control host: wraps a local lerobot Teleoperator (or a policy)
+from lerobot_robot_livekit import LiveKitRobot, LiveKitRobotConfig
 
 robot = LiveKitRobot(
     LiveKitRobotConfig(
-        url="wss://your-project.livekit.cloud",
-        token=mint("operator", "session-1", API_KEY, API_SECRET),
-        session="session-1",
-        fps=30,
-        camera_names=("cam1",),
-        camera_height=480, camera_width=640,
+        url=URL, token=token, session="session-1", fps=30,
+        camera_names=("cam1",), camera_height=480, camera_width=640,
     ),
-    teleop=leader,                   # schema inferred from leader
+    teleop=my_leader,
 )
 robot.connect()
-
-try:
-    while running:
-        obs = robot.get_observation()   # synced {cameras, state, timestamp}
-        action = leader.get_action()    # or: policy(obs)
-        robot.send_action(action)
-        sleep(1 / 30)
-finally:
-    robot.disconnect()
-    leader.disconnect()
 ```
 
-The remote physical robot is now a local lerobot `Robot` to any downstream
-workflow — teleoperation, dataset recording, policy eval — none of it needs to
-know it's remote.
-
-## 4. Try the runnable examples first
-
-Before wiring Portal into your real stack, run the shipped examples:
-
-- [`examples/python/basic/`](../examples/python/basic) — no hardware needed.
-  Synthetic video + state on one terminal, subscriber on another. Ten-minute
-  sanity check that your LiveKit credentials and native build are good.
-- [`examples/python/so101/`](../examples/python/so101) — real hardware. Drive a
-  physical SO-101 follower from a remote SO-101 leader, with the camera and
-  joint state rendered in [rerun](https://rerun.io). Full calibration + wiring
-  walkthrough in its [README](../examples/python/so101/README.md).
-
-The examples are the fastest path to a known-good setup you can adapt.
-
-## Running a VLA policy instead of teleop
-
-Same setup — the operator side doesn't care *what* produces the action:
-
-```python
-while running:
-    obs = robot.get_observation()
-    action = policy(obs.frames, obs.state)   # or policy.select_action(obs)
-    robot.send_action(action)
-```
+The plugins are syntactic sugar over the Portal API above. Full reference
+and CLI mode: [lerobot integration](lerobot.md).
 
 ## Next steps
 
-- [Concepts](concepts.md) — roles, the observation model, frame format.
-- [Tuning](tuning.md) — `fps`, `slack`, `tolerance`, asymmetric rates, reliability.
-- [lerobot integration](lerobot.md) — full plugin config reference, CLI mode,
-  schema inference rules, troubleshooting.
-- [Portal API](portal-api.md) — the raw API, for stacks that aren't lerobot.
+- [Portal API](portal-api.md). The full surface. All callbacks, send
+  methods, role semantics.
+- [Concepts](concepts.md). Roles, the observation model, frame format.
+- [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates,
+  reliability.

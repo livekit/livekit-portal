@@ -1,51 +1,50 @@
 # Portal API
 
-The raw `Portal` API is what the lerobot plugins wrap. Use it directly when
-your robotics stack isn't lerobot, when you need finer control than the
-plugins expose, or when you're binding Portal into a language other than
-Python.
+The primary surface for using livekit-portal from any robotics stack.
 
-If you can use the plugins, prefer [lerobot integration](lerobot.md) — the
-plugin wraps exactly the code below.
+You construct a `PortalConfig`, hand it to a `Portal`, register callbacks,
+and push frames and state or actions. Everything else in this repository,
+including the optional lerobot plugins, is built on top of this API.
 
 ## Installation
 
-```bash
-uv pip install livekit-portal
-```
-
-From source:
+Portal is not on PyPI yet. You build from source. See the
+[Quickstart](quickstart.md#1-install) for the full flow. Summary:
 
 ```bash
-cd python/packages/livekit-portal
+git clone https://github.com/livekit/livekit-portal.git
+cd livekit-portal/python/packages/livekit-portal
+
 uv sync
-bash scripts/build_native.sh release
+bash scripts/build_native.sh release       # or `debug` for faster iteration
 ```
 
-`scripts/build_native.sh debug` is faster to iterate on. If the cdylib lives
-elsewhere (e.g. during Rust-side dev), point `LIVEKIT_PORTAL_FFI_LIB` at it
-and skip the copy step.
+If the cdylib lives elsewhere (e.g. during Rust-side dev), point
+`LIVEKIT_PORTAL_FFI_LIB` at it and skip the copy step.
 
 ### Rust
 
+The core crate is usable directly without going through Python. From
+another Cargo workspace, depend on the path:
+
 ```toml
 [dependencies]
-livekit-portal = { path = "livekit-portal" }
+livekit-portal = { path = "path/to/livekit-portal/livekit-portal" }
 ```
 
-Python bindings ship via the `livekit-portal-ffi` crate (UniFFI + C ABI) and
-a pure-Python package in `python/packages/livekit-portal/`.
+Python bindings ship via the `livekit-portal-ffi` crate (UniFFI + C ABI)
+and a pure-Python package in `python/packages/livekit-portal/`.
 
 ## Role semantics
 
 Portal has two roles: `Role.ROBOT` and `Role.OPERATOR`. The role is fixed at
-`PortalConfig` construction. Calling a send method the role doesn't own
+`PortalConfig` construction. Calling a send method the role does not own
 returns `WrongRole`.
 
 | Role | Publishes | Subscribes |
 |------|-----------|------------|
 | `Role.ROBOT` | video frames, state | actions |
-| `Role.OPERATOR` | actions | video frames + state → synced observations |
+| `Role.OPERATOR` | actions | video frames + state, merged into synced observations |
 
 Both sides must register the same schema via `add_video` / `add_state` /
 `add_action`. Camera names and state/action field names must match across
@@ -67,7 +66,8 @@ async def main():
     portal = Portal(cfg)
 
     def on_action(action):
-        # action.values is the dict; action.timestamp_us is the sender's clock.
+        # action.values is the dict.
+        # action.timestamp_us is the sender's clock.
         robot.send_action(action.values)
 
     portal.on_action(on_action)
@@ -111,8 +111,8 @@ async def main():
 asyncio.run(main())
 ```
 
-Callbacks fire on the asyncio loop that was running when you registered them —
-user code never runs on the tokio worker thread.
+Callbacks fire on the asyncio loop that was running when you registered
+them. User code never runs on the tokio worker thread.
 
 ## Frame format
 
@@ -122,25 +122,28 @@ uint8. Width and height must both be even. Full details in
 
 ## What else is on `Portal`
 
-- `portal.on_observation(cb)` — synced observations (operator only).
-- `portal.on_drop(cb)` — states that couldn't be matched (operator only).
-- `portal.on_action(cb)` — incoming actions (robot only).
-- `portal.on_state(cb)` — raw state firehose (operator only). Every packet
-  fires; if you want paced, use `on_observation`.
-- `portal.send_action(values, timestamp_us=...)` — operator only.
-- `portal.send_video_frame(name, frame, timestamp_us=...)` — robot only.
-- `portal.send_state(values, timestamp_us=...)` — robot only.
-- `portal.metrics()` — `PortalMetrics` snapshot (sync, transport, buffers, rtt).
-- `portal.register_rpc_method(name, handler)` / `portal.perform_rpc(name, ...)`
-  — see [rpc.md](rpc.md).
+- `portal.on_observation(cb)`: synced observations (operator only).
+- `portal.on_drop(cb)`: states that could not be matched (operator only).
+- `portal.on_action(cb)`: incoming actions (robot only).
+- `portal.on_state(cb)`: raw state firehose (operator only). Every packet
+  fires. Use `on_observation` if you want paced data.
+- `portal.send_action(values, timestamp_us=...)`: operator only.
+- `portal.send_video_frame(name, frame, timestamp_us=...)`: robot only.
+- `portal.send_state(values, timestamp_us=...)`: robot only.
+- `portal.metrics()`: `PortalMetrics` snapshot (sync, transport, buffers,
+  rtt).
+- `portal.register_rpc_method(name, handler)` /
+  `portal.perform_rpc(name, ...)`: see [rpc.md](rpc.md).
 - `await portal.connect(url, token)` / `await portal.disconnect()`.
-- `portal.close()` / `cfg.close()` — release native handles.
+- `portal.close()` / `cfg.close()`: release native handles.
 
 ## Reference
 
-- [Concepts](concepts.md) — roles, observation model, frame format.
-- [Tuning](tuning.md) — `fps` / `slack` / `tolerance`, asymmetric rates.
-- [Synchronization deep dive](synchronization.md) — the match algorithm.
-- [RPC](rpc.md) — imperative commands on top of LiveKit RPC.
-- [`examples/python/basic/`](../examples/python/basic) — the smallest
+- [Concepts](concepts.md). Roles, observation model, frame format.
+- [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates.
+- [Synchronization deep dive](synchronization.md). The match algorithm.
+- [RPC](rpc.md). Imperative commands on top of LiveKit RPC.
+- [`examples/python/basic/`](../examples/python/basic). The smallest
   end-to-end script using this API, with synthetic video.
+- [lerobot integration](lerobot.md). The optional convenience plugins that
+  wrap this API for lerobot users.
