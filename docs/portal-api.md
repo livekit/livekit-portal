@@ -140,23 +140,27 @@ them. User code never runs on the tokio worker thread.
 
 ## Typed values on receive
 
-`action.values` and `state.values` always arrive as `Dict[str, float]`. That
-is what the FFI boundary delivers. To reconstruct Python `bool` and `int`
-per the declared schema, use `portal.typed_action(action)` or
-`portal.typed_state(state)`:
+`Action`, `State`, and `Observation` are typed by default. `.values`
+(and `observation.state`) hold Python-native types per the declared
+schema: `DType.BOOL` fields are `bool`, integer dtypes are `int`, float
+dtypes are `float`. `.raw_values` (and `observation.raw_state`) keep
+the lossless `f64` view if you want to write into a numpy buffer
+without a per-field cast.
 
 ```python
 def on_action(action):
-    values = portal.typed_action(action)
-    # values["gripper"] is bool
-    # values["mode"] is int
-    # values["shoulder"] is float
+    # action.values["gripper"] is True (bool)
+    # action.values["mode"] is 3 (int)
+    # action.values["shoulder"] is 0.5 (float)
+    # action.raw_values is the underlying Dict[str, float]
+    ...
 ```
 
-Both helpers accept either the FFI record or a raw `dict` (handy for
-`observation.state`, which arrives as `dict[str, float]`). Fields not in the
-schema are dropped; schema fields not in the payload are omitted from the
-result.
+The Rust SDK mirrors this: `Action` / `State` / `Observation` carry
+`values: HashMap<String, TypedValue>` alongside `raw_values:
+HashMap<String, f64>`. The mental model is identical across languages:
+declare a dtype, send whatever you want, receive back as the declared
+type.
 
 ## Gotchas
 
@@ -193,8 +197,6 @@ uint8. Width and height must both be even. Full details in
 - `portal.on_action(cb)`: incoming actions (robot only).
 - `portal.on_state(cb)`: raw state firehose (operator only). Every packet
   fires. Use `on_observation` if you want paced data.
-- `portal.typed_action(action)` / `portal.typed_state(state)`: cast to
-  native Python types (`bool`, `int`, `float`) per the declared dtype.
 - `portal.send_action(values, timestamp_us=...)`: operator only.
 - `portal.send_video_frame(name, frame, timestamp_us=...)`: robot only.
 - `portal.send_state(values, timestamp_us=...)`: robot only.

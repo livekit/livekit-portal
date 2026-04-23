@@ -17,4 +17,4 @@ pub use error::{PortalError, PortalResult};
 pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};
 pub use portal::Portal;
 pub use rpc::{RpcError, RpcHandler, RpcInvocationData};
-pub use types::{Observation, Role, SyncConfig, VideoFrameData};
+pub use types::{Action, Observation, Role, State, SyncConfig, TypedValue, VideoFrameData};

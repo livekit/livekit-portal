@@ -372,6 +372,11 @@ pub struct Portal {
     state_fields: Vec<String>,
     action_fields: Vec<String>,
     video_tracks: Vec<String>,
+    // Schemas are mirrored from the config so `send_*` can convert the
+    // incoming `HashMap<String, f64>` (from Python) into the core's
+    // `HashMap<String, TypedValue>` without another FFI call.
+    state_schema: Vec<(String, core::DType)>,
+    action_schema: Vec<(String, core::DType)>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -385,16 +390,27 @@ impl Portal {
         let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
         let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
+        let state_schema: Vec<(String, core::DType)> = cfg.state_schema().to_vec();
+        let action_schema: Vec<(String, core::DType)> = cfg.action_schema().to_vec();
 
         let inner = core::Portal::new(cfg);
 
         let cb = callbacks.clone();
-        inner.on_action(move |ts, values| {
-            cb.on_action(Action { values: values.clone(), timestamp_us: ts });
+        inner.on_action(move |action| {
+            // Cross the FFI boundary with `raw_values` — the lossless f64
+            // view. Foreign bindings (Python) re-cast to typed values in
+            // their own record using the schema they mirror.
+            cb.on_action(Action {
+                values: action.raw_values.clone(),
+                timestamp_us: action.timestamp_us,
+            });
         });
         let cb = callbacks.clone();
-        inner.on_state(move |ts, values| {
-            cb.on_state(State { values: values.clone(), timestamp_us: ts });
+        inner.on_state(move |state| {
+            cb.on_state(State {
+                values: state.raw_values.clone(),
+                timestamp_us: state.timestamp_us,
+            });
         });
         let cb = callbacks.clone();
         inner.on_observation(move |obs| {
@@ -402,7 +418,14 @@ impl Portal {
         });
         let cb = callbacks.clone();
         inner.on_drop(move |dropped| {
-            cb.on_drop(dropped);
+            // Cross with raw f64 maps. Python wraps to typed on receipt.
+            let raw: Vec<HashMap<String, f64>> = dropped
+                .into_iter()
+                .map(|m| {
+                    m.into_iter().map(|(k, v)| (k, v.as_f64())).collect()
+                })
+                .collect();
+            cb.on_drop(raw);
         });
         for track in &video_tracks {
             let cb = callbacks.clone();
@@ -418,6 +441,8 @@ impl Portal {
             state_fields,
             action_fields,
             video_tracks,
+            state_schema,
+            action_schema,
         })
     }
 
@@ -447,7 +472,8 @@ impl Portal {
         values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        self.inner.send_state(&values, timestamp_us).map_err(Into::into)
+        let typed = f64_to_typed(&values, &self.state_schema);
+        self.inner.send_state(&typed, timestamp_us).map_err(Into::into)
     }
 
     pub fn send_action(
@@ -455,7 +481,8 @@ impl Portal {
         values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        self.inner.send_action(&values, timestamp_us).map_err(Into::into)
+        let typed = f64_to_typed(&values, &self.action_schema);
+        self.inner.send_action(&typed, timestamp_us).map_err(Into::into)
     }
 
     pub fn get_observation(&self) -> Option<Observation> {
@@ -463,11 +490,17 @@ impl Portal {
     }
 
     pub fn get_action(&self) -> Option<Action> {
-        self.inner.get_action().map(|(ts, values)| Action { values, timestamp_us: ts })
+        self.inner.get_action().map(|a| Action {
+            values: a.raw_values,
+            timestamp_us: a.timestamp_us,
+        })
     }
 
     pub fn get_state(&self) -> Option<State> {
-        self.inner.get_state().map(|(ts, values)| State { values, timestamp_us: ts })
+        self.inner.get_state().map(|s| State {
+            values: s.raw_values,
+            timestamp_us: s.timestamp_us,
+        })
     }
 
     pub fn get_video_frame(&self, track_name: String) -> Option<VideoFrame> {
@@ -546,11 +579,34 @@ fn frame_from_core(f: &core::VideoFrameData) -> VideoFrame {
 }
 
 fn observation_from_core(o: &core::Observation) -> Observation {
+    // FFI carries the raw f64 state map across the boundary; foreign
+    // bindings (Python) re-cast to typed values in their own record.
     Observation {
         timestamp_us: o.timestamp_us,
-        state: o.state.clone(),
+        state: o.raw_state.clone(),
         frames: o.frames.iter().map(|(k, v)| (k.clone(), frame_from_core(v))).collect(),
     }
+}
+
+/// Convert the foreign `HashMap<String, f64>` (what UniFFI accepts for
+/// Python dicts) into the core's `HashMap<String, TypedValue>` using the
+/// declared schema. Keys absent from the schema are passed through as
+/// `F64` so the core's unknown-key warn path still fires.
+fn f64_to_typed(
+    values: &HashMap<String, f64>,
+    schema: &[(String, core::DType)],
+) -> HashMap<String, core::TypedValue> {
+    values
+        .iter()
+        .map(|(name, &v)| {
+            let dtype = schema
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| *d)
+                .unwrap_or(core::DType::F64);
+            (name.clone(), core::TypedValue::from_f64(v, dtype))
+        })
+        .collect()
 }
 
 /// Adapt a foreign `RpcHandler` trait object to the core handler type.

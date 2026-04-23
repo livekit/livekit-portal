@@ -12,7 +12,7 @@ use crate::metrics::{DataStream, MetricsRegistry};
 use crate::rtt::{RttService, RTT_TOPIC};
 use crate::serialization::{deserialize_values, schema_fingerprint, serialize_values, DecodeError};
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
-use crate::types::Role;
+use crate::types::{to_value_maps, Action, Role, State, TypedValue};
 use crate::video::now_us;
 
 // --- Publisher ---
@@ -87,13 +87,17 @@ impl DataPublisher {
         }
     }
 
-    /// Send from a HashMap, reordering to declared field order. Missing fields
-    /// inherit their last sent value (0.0 if never sent) — partial updates
-    /// carry forward prior state instead of silently zeroing it. Keys absent
-    /// from the schema are logged once per key, then ignored.
+    /// Send from a map of typed values, reordering to declared field
+    /// order. Missing fields inherit their last sent value (0.0 if never
+    /// sent) — partial updates carry forward prior state instead of
+    /// silently zeroing it. Keys absent from the schema are logged once
+    /// per key, then ignored.
+    ///
+    /// Typed values are widened to `f64` via `TypedValue::as_f64` before
+    /// carry-forward; the widening is lossless for every supported dtype.
     pub fn send_map(
         &self,
-        map: &HashMap<String, f64>,
+        map: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         self.warn_unknown_keys(map);
@@ -132,7 +136,7 @@ impl DataPublisher {
         Ok(())
     }
 
-    fn warn_unknown_keys(&self, map: &HashMap<String, f64>) {
+    fn warn_unknown_keys(&self, map: &HashMap<String, TypedValue>) {
         // Small schemas make a linear scan faster than a HashSet lookup.
         for key in map.keys() {
             if self.schema.iter().any(|(n, _)| n == key) {
@@ -166,15 +170,16 @@ impl DataPublisher {
 }
 
 /// Update `last` in place with values from `map` for each declared field,
-/// leaving other slots untouched (carry-forward).
+/// leaving other slots untouched (carry-forward). Typed values are
+/// lossless-widened to `f64` on the way in.
 fn apply_carry_forward(
     schema: &[(String, DType)],
     last: &mut [f64],
-    map: &HashMap<String, f64>,
+    map: &HashMap<String, TypedValue>,
 ) {
     for (i, (name, _)) in schema.iter().enumerate() {
-        if let Some(&v) = map.get(name) {
-            last[i] = v;
+        if let Some(v) = map.get(name) {
+            last[i] = v.as_f64();
         }
     }
 }
@@ -189,20 +194,17 @@ impl Drop for DataPublisher {
 
 // --- Receiver (dispatches DataReceived events) ---
 
-pub(crate) type DataCb = Box<dyn Fn(u64, &HashMap<String, f64>) + Send + Sync>;
-
-/// Push callback + latest-wins slot for a single data stream (state or action),
-/// paired so receivers and getters share one allocation. The `u64` is the
-/// sender's wall-clock timestamp in microseconds, carried on the wire.
-pub(crate) struct DataSlots {
-    pub cb: Mutex<Option<DataCb>>,
-    pub latest: Mutex<Option<(u64, HashMap<String, f64>)>>,
+/// Push-callback + latest-wins slot for a single typed record (Action or
+/// State). Paired so receivers and getters share one allocation.
+pub(crate) struct DataSlot<R: Clone> {
+    pub cb: Mutex<Option<Box<dyn Fn(&R) + Send + Sync>>>,
+    pub latest: Mutex<Option<R>>,
     /// Peer fingerprints already reported as mismatched. Logged once per
     /// unique offender to surface schema drift without spamming.
     warned_mismatches: Mutex<HashSet<u32>>,
 }
 
-impl DataSlots {
+impl<R: Clone> DataSlot<R> {
     pub fn new() -> Self {
         Self {
             cb: Mutex::new(None),
@@ -211,18 +213,17 @@ impl DataSlots {
         }
     }
 
-    /// Build the field map from the schema once, fire the callback by
-    /// reference, then hand ownership to the latest slot.
-    fn deliver(&self, timestamp_us: u64, schema: &[(String, DType)], values: &[f64]) {
-        let map: HashMap<String, f64> = schema
-            .iter()
-            .zip(values.iter())
-            .map(|((n, _), v)| (n.clone(), *v))
-            .collect();
+    /// Fire the callback by reference, then hand ownership to the
+    /// latest-wins slot.
+    fn deliver(&self, record: R) {
         if let Some(cb) = self.cb.lock().as_ref() {
-            cb(timestamp_us, &map);
+            cb(&record);
         }
-        *self.latest.lock() = Some((timestamp_us, map));
+        *self.latest.lock() = Some(record);
+    }
+
+    pub fn get(&self) -> Option<R> {
+        self.latest.lock().clone()
     }
 
     pub fn clear(&self) {
@@ -239,6 +240,30 @@ impl DataSlots {
     }
 }
 
+pub(crate) type ActionSlot = DataSlot<Action>;
+pub(crate) type StateSlot = DataSlot<State>;
+
+/// Build an `Action` from the schema and the decoded f64 values. Kept
+/// here so `handle_data_received` and any test helpers share the same
+/// path.
+fn build_action(
+    timestamp_us: u64,
+    schema: &[(String, DType)],
+    values: &[f64],
+) -> Action {
+    let (typed, raw) = to_value_maps(schema, values);
+    Action { values: typed, raw_values: raw, timestamp_us }
+}
+
+fn build_state(
+    timestamp_us: u64,
+    schema: &[(String, DType)],
+    values: &[f64],
+) -> State {
+    let (typed, raw) = to_value_maps(schema, values);
+    State { values: typed, raw_values: raw, timestamp_us }
+}
+
 /// Handle a `DataReceived` event. Pushes into the sync buffer if applicable and
 /// returns any observations/drops that resulted, for the caller to dispatch
 /// outside any locks.
@@ -251,8 +276,8 @@ pub(crate) fn handle_data_received(
     action_fp: u32,
     state_schema: &[(String, DType)],
     state_fp: u32,
-    action: &DataSlots,
-    state: &DataSlots,
+    action: &ActionSlot,
+    state: &StateSlot,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
     metrics: &MetricsRegistry,
     rtt: &RttService,
@@ -266,7 +291,7 @@ pub(crate) fn handle_data_received(
             match deserialize_values(payload, action_fp, action_schema) {
                 Ok((send_ts, values)) => {
                     metrics.record_action_received(send_ts, now_us());
-                    action.deliver(send_ts, action_schema, &values);
+                    action.deliver(build_action(send_ts, action_schema, &values));
                 }
                 Err(DecodeError::SchemaMismatch { expected, got }) => {
                     action.warn_mismatch(topic, expected, got);
@@ -280,7 +305,7 @@ pub(crate) fn handle_data_received(
             match deserialize_values(payload, state_fp, state_schema) {
                 Ok((timestamp_us, values)) => {
                     metrics.record_state_received(timestamp_us, now_us());
-                    state.deliver(timestamp_us, state_schema, &values);
+                    state.deliver(build_state(timestamp_us, state_schema, &values));
                     if let Some(sb) = sync_buffer {
                         return sb.lock().push_state(timestamp_us, values);
                     }
@@ -311,17 +336,43 @@ mod tests {
         ];
         let mut last = vec![0.0; 3];
 
-        let m: HashMap<_, _> = [("j1".to_string(), 1.0)].into_iter().collect();
+        let m: HashMap<String, TypedValue> =
+            [("j1".to_string(), TypedValue::F64(1.0))].into_iter().collect();
         apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![1.0, 0.0, 0.0], "unsent fields start at seed (0.0)");
 
-        let m: HashMap<_, _> = [("j2".to_string(), 2.5)].into_iter().collect();
+        let m: HashMap<String, TypedValue> =
+            [("j2".to_string(), TypedValue::F64(2.5))].into_iter().collect();
         apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![1.0, 2.5, 0.0], "j1 carries forward; j2 updates; j3 still at seed");
 
-        let m: HashMap<_, _> =
-            [("j1".to_string(), -1.0), ("j3".to_string(), 7.0)].into_iter().collect();
+        let m: HashMap<String, TypedValue> = [
+            ("j1".to_string(), TypedValue::F64(-1.0)),
+            ("j3".to_string(), TypedValue::F64(7.0)),
+        ]
+        .into_iter()
+        .collect();
         apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![-1.0, 2.5, 7.0], "j2 carries forward when omitted; others update");
+    }
+
+    #[test]
+    fn typed_inputs_widen_to_f64_losslessly() {
+        let schema = vec![
+            ("joint".to_string(), DType::F32),
+            ("gripper".to_string(), DType::Bool),
+            ("mode".to_string(), DType::I8),
+        ];
+        let mut last = vec![0.0; 3];
+
+        let m: HashMap<String, TypedValue> = [
+            ("joint".to_string(), 0.5f32.into()),
+            ("gripper".to_string(), true.into()),
+            ("mode".to_string(), 3i8.into()),
+        ]
+        .into_iter()
+        .collect();
+        apply_carry_forward(&schema, &mut last, &m);
+        assert_eq!(last, vec![0.5, 1.0, 3.0]);
     }
 }

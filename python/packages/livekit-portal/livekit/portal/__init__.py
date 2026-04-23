@@ -26,6 +26,7 @@ import asyncio
 import logging
 import threading
 import traceback
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 _log = logging.getLogger(__name__)
@@ -34,14 +35,11 @@ from . import _frame
 from . import livekit_portal_ffi as _ffi
 from ._frame import i420_bytes_to_numpy_rgb
 
-# Re-export generated types. The UniFFI module is the source of truth for
-# class identity — wrapping them here would force duplicate isinstance checks.
+# Re-export generated types that don't carry dtype-sensitive payload. The
+# UniFFI module is the source of truth for these.
 Role = _ffi.Role
 DType = _ffi.DType
 FieldSpec = _ffi.FieldSpec
-Observation = _ffi.Observation
-Action = _ffi.Action
-State = _ffi.State
 VideoFrameData = _ffi.VideoFrame
 PortalMetrics = _ffi.PortalMetrics
 SyncMetrics = _ffi.SyncMetrics
@@ -80,6 +78,11 @@ def _cast_values(
     """Map each value to its declared Python type: `BOOL` → `bool`, integer
     dtypes → `int`, float dtypes → `float`. Keys missing from `schema` are
     dropped; absent schema fields are omitted from the result.
+
+    The core pipeline widens every dtype to `f64` for carry-forward and
+    buffering; because every supported integer dtype (I32/I16/I8 and
+    U32/U16/U8) fits in the 53-bit mantissa of f64, the round trip through
+    the pipeline is lossless and this cast is exact.
     """
     out: Dict[str, Any] = {}
     for name, dtype in schema:
@@ -95,6 +98,91 @@ def _cast_values(
     return out
 
 
+# --- Delivery records -------------------------------------------------------
+#
+# The FFI delivers Action / State / Observation with `values` as
+# `Dict[str, float]` because the core pipeline is f64 throughout (see
+# rationale on `_cast_values`). The records below wrap the FFI payload,
+# re-cast `values` per the declared schema, and expose `raw_values` as an
+# escape hatch for callers that want the f64 dict (e.g. writing into a
+# numpy buffer without a per-field Python cast).
+#
+# These replace the FFI Observation/Action/State in the public API. They
+# are duck-compatible on the attributes user code reads (`values`,
+# `state`, `frames`, `timestamp_us`).
+
+@dataclass(frozen=True, slots=True)
+class Action:
+    """An action received from the operator.
+
+    `values` holds Python-native types per the declared action schema.
+    `raw_values` is the original `Dict[str, float]` with every dtype
+    widened to `f64`, for callers that want to skip the per-field cast.
+    """
+
+    values: Dict[str, Any]
+    raw_values: Dict[str, float]
+    timestamp_us: int
+
+
+@dataclass(frozen=True, slots=True)
+class State:
+    """A state sample received from the robot.
+
+    Semantics for `values` / `raw_values` match `Action`.
+    """
+
+    values: Dict[str, Any]
+    raw_values: Dict[str, float]
+    timestamp_us: int
+
+
+@dataclass(frozen=True, slots=True)
+class Observation:
+    """A synchronized observation: matched video frames + state sample.
+
+    `state` holds Python-native types per the declared state schema;
+    `raw_state` keeps the f64 dict. `frames` is unchanged from the FFI
+    layer — one entry per registered video track.
+    """
+
+    state: Dict[str, Any]
+    raw_state: Dict[str, float]
+    frames: Dict[str, VideoFrameData]
+    timestamp_us: int
+
+
+def _wrap_action(
+    action: _ffi.Action, schema: List[Tuple[str, DType]]
+) -> Action:
+    return Action(
+        values=_cast_values(action.values, schema),
+        raw_values=dict(action.values),
+        timestamp_us=action.timestamp_us,
+    )
+
+
+def _wrap_state(
+    state: _ffi.State, schema: List[Tuple[str, DType]]
+) -> State:
+    return State(
+        values=_cast_values(state.values, schema),
+        raw_values=dict(state.values),
+        timestamp_us=state.timestamp_us,
+    )
+
+
+def _wrap_observation(
+    obs: _ffi.Observation, state_schema: List[Tuple[str, DType]]
+) -> Observation:
+    return Observation(
+        state=_cast_values(obs.state, state_schema),
+        raw_state=dict(obs.state),
+        frames=dict(obs.frames),
+        timestamp_us=obs.timestamp_us,
+    )
+
+
 # --- Dispatcher -------------------------------------------------------------
 
 class _Dispatcher(_ffi.PortalCallbacks):
@@ -107,15 +195,23 @@ class _Dispatcher(_ffi.PortalCallbacks):
     `call_soon_threadsafe`.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        action_schema: List[Tuple[str, DType]],
+        state_schema: List[Tuple[str, DType]],
+    ) -> None:
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._action_cb: Optional[Callable[[Action], Any]] = None
         self._state_cb: Optional[Callable[[State], Any]] = None
         self._observation_cb: Optional[Callable[[Observation], Any]] = None
-        self._drop_cb: Optional[Callable[[List[Dict[str, float]]], Any]] = None
+        self._drop_cb: Optional[Callable[[List[Dict[str, Any]]], Any]] = None
         # Per-track video callback: track_name → callable(track_name, frame).
         self._video_cbs: Dict[str, Callable[[str, VideoFrameData], Any]] = {}
+        # Schemas are frozen at Portal construction and read by the wrap
+        # helpers below on every delivery.
+        self._action_schema = action_schema
+        self._state_schema = state_schema
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         with self._lock:
@@ -130,20 +226,22 @@ class _Dispatcher(_ffi.PortalCallbacks):
 
     # --- PortalCallbacks trait impls (called from Rust/tokio thread) --------
 
-    def on_action(self, action: Action) -> None:
+    def on_action(self, action: _ffi.Action) -> None:
         cb = self._action_cb
         if cb is not None:
-            self._schedule(cb, action)
+            self._schedule(cb, _wrap_action(action, self._action_schema))
 
-    def on_state(self, state: State) -> None:
+    def on_state(self, state: _ffi.State) -> None:
         cb = self._state_cb
         if cb is not None:
-            self._schedule(cb, state)
+            self._schedule(cb, _wrap_state(state, self._state_schema))
 
-    def on_observation(self, observation: Observation) -> None:
+    def on_observation(self, observation: _ffi.Observation) -> None:
         cb = self._observation_cb
         if cb is not None:
-            self._schedule(cb, observation)
+            self._schedule(
+                cb, _wrap_observation(observation, self._state_schema)
+            )
 
     def on_video_frame(self, track_name: str, frame: VideoFrameData) -> None:
         cb = self._video_cbs.get(track_name)
@@ -153,7 +251,11 @@ class _Dispatcher(_ffi.PortalCallbacks):
     def on_drop(self, dropped: List[Dict[str, float]]) -> None:
         cb = self._drop_cb
         if cb is not None:
-            self._schedule(cb, dropped)
+            # Drops are the state values that couldn't be matched to a
+            # frame. Cast each to typed values so the callback sees the
+            # same shape it gets from `on_state` / `on_observation`.
+            typed = [_cast_values(d, self._state_schema) for d in dropped]
+            self._schedule(cb, typed)
 
     # --- Registration (from Python user thread) -----------------------------
 
@@ -166,7 +268,7 @@ class _Dispatcher(_ffi.PortalCallbacks):
     def set_observation(self, cb: Callable[[Observation], Any]) -> None:
         self._observation_cb = cb
 
-    def set_drop(self, cb: Callable[[List[Dict[str, float]]], Any]) -> None:
+    def set_drop(self, cb: Callable[[List[Dict[str, Any]]], Any]) -> None:
         self._drop_cb = cb
 
     def set_video(self, track_name: str, cb: Callable[[str, VideoFrameData], Any]) -> None:
@@ -379,17 +481,17 @@ class Portal:
     )
 
     def __init__(self, config: PortalConfig) -> None:
-        self._dispatcher = _Dispatcher()
+        # Schema snapshots let delivery records reconstruct Python types
+        # per declared dtype — the FFI boundary delivers everything as
+        # `Dict[str, float]` (the core pipeline is f64 throughout).
+        self._state_schema: List[Tuple[str, DType]] = list(config.state_schema)
+        self._action_schema: List[Tuple[str, DType]] = list(config.action_schema)
+        self._dispatcher = _Dispatcher(self._action_schema, self._state_schema)
         self._inner = _ffi.Portal(config._inner, self._dispatcher)
         # Snapshot what the Rust side confirmed it was built with.
         self._state_fields: List[str] = list(self._inner.state_fields())
         self._action_fields: List[str] = list(self._inner.action_fields())
         self._video_tracks: List[str] = list(self._inner.video_tracks())
-        # The FFI does not surface dtype back, so mirror from the config.
-        # Needed to reconstruct native Python types on receive via
-        # `typed_action` / `typed_state`.
-        self._state_schema: List[Tuple[str, DType]] = list(config.state_schema)
-        self._action_schema: List[Tuple[str, DType]] = list(config.action_schema)
 
     # -- async lifecycle -----------------------------------------------------
 
@@ -436,40 +538,19 @@ class Portal:
     # -- pull (sync, latest-wins) --------------------------------------------
 
     def get_observation(self) -> Optional[Observation]:
-        return self._inner.get_observation()
+        raw = self._inner.get_observation()
+        return None if raw is None else _wrap_observation(raw, self._state_schema)
 
     def get_action(self) -> Optional[Action]:
-        return self._inner.get_action()
+        raw = self._inner.get_action()
+        return None if raw is None else _wrap_action(raw, self._action_schema)
 
     def get_state(self) -> Optional[State]:
-        return self._inner.get_state()
+        raw = self._inner.get_state()
+        return None if raw is None else _wrap_state(raw, self._state_schema)
 
     def get_video_frame(self, track_name: str) -> Optional[VideoFrameData]:
         return self._inner.get_video_frame(track_name)
-
-    # -- typed-value reconstruction ------------------------------------------
-
-    def typed_action(
-        self,
-        action: "Action | Dict[str, float]",
-    ) -> Dict[str, "float | int | bool"]:
-        """Cast `action.values` (or a raw dict) to native Python types per the
-        declared action schema: `DType.BOOL` → `bool`, integer dtypes → `int`,
-        float dtypes → `float`. Unknown keys are dropped silently since they
-        carry no dtype.
-        """
-        values = action if isinstance(action, dict) else action.values
-        return _cast_values(values, self._action_schema)
-
-    def typed_state(
-        self,
-        state: "State | Dict[str, float]",
-    ) -> Dict[str, "float | int | bool"]:
-        """Cast `state.values` (or a raw dict, e.g. `observation.state`) to
-        native Python types per the declared state schema.
-        """
-        values = state if isinstance(state, dict) else state.values
-        return _cast_values(values, self._state_schema)
 
     # -- push callbacks ------------------------------------------------------
 
@@ -491,8 +572,12 @@ class Portal:
 
     def on_drop(
         self,
-        callback: Callable[[List[Dict[str, float]]], Any],
+        callback: Callable[[List[Dict[str, Any]]], Any],
     ) -> None:
+        """`callback(dropped)` receives a list of typed state dicts that
+        couldn't be matched to a video frame. Each dict mirrors
+        `observation.state` — Python-native types per the declared schema.
+        """
         self._dispatcher.set_drop(callback)
 
     # -- rpc -----------------------------------------------------------------

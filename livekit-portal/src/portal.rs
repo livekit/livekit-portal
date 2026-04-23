@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::PortalConfig;
-use crate::data::{handle_data_received, DataPublisher, DataSlots};
+use crate::data::{handle_data_received, ActionSlot, DataPublisher, StateSlot};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rpc::RpcHandler;
@@ -19,7 +19,7 @@ use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
 
 type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
-type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
+type DropCb = Box<dyn Fn(Vec<HashMap<String, TypedValue>>) + Send + Sync>;
 
 /// Drains the buffers returned by `SyncBuffer::push_*` and dispatches them to
 /// the user — callback first (by reference, no clone), then into the pull-based
@@ -119,8 +119,8 @@ pub struct Portal {
     obs_sink: Arc<ObservationSink>,
 
     // Push callback + pull latest-wins slot, bundled per stream.
-    action: Arc<DataSlots>,
-    state: Arc<DataSlots>,
+    action: Arc<ActionSlot>,
+    state: Arc<StateSlot>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
 
@@ -163,8 +163,8 @@ impl Portal {
             action_publisher: Mutex::new(None),
             sync_buffer: Mutex::new(None),
             obs_sink,
-            action: Arc::new(DataSlots::new()),
-            state: Arc::new(DataSlots::new()),
+            action: Arc::new(ActionSlot::new()),
+            state: Arc::new(StateSlot::new()),
             video_tracks,
             metrics,
             peer_identity: Arc::new(Mutex::new(None)),
@@ -259,9 +259,13 @@ impl Portal {
         publisher.send_frame(rgb_data, width, height, timestamp_us)
     }
 
+    /// Publish a state sample (robot only). Values are typed — build the
+    /// map with `TypedValue::Bool(true)`, `0.5f32.into()`, etc. The
+    /// pipeline internally widens to `f64` for carry-forward and casts
+    /// back to the declared dtype at the wire boundary.
     pub fn send_state(
         &self,
-        values: &HashMap<String, f64>,
+        values: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         let publisher = self
@@ -272,9 +276,10 @@ impl Portal {
         publisher.send_map(values, timestamp_us)
     }
 
+    /// Publish an action (operator only). Same ergonomics as `send_state`.
     pub fn send_action(
         &self,
-        values: &HashMap<String, f64>,
+        values: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         let publisher =
@@ -433,16 +438,17 @@ impl Portal {
         self.obs_sink.get()
     }
 
-    /// Clone of the latest action received (Robot side), or `None`. The
-    /// `u64` is the sender's wall-clock timestamp in microseconds.
-    pub fn get_action(&self) -> Option<(u64, HashMap<String, f64>)> {
-        self.action.latest.lock().clone()
+    /// Clone of the latest action received (Robot side), or `None`.
+    /// `.values` holds typed values per the declared schema; `.raw_values`
+    /// is the lossless `f64` view.
+    pub fn get_action(&self) -> Option<Action> {
+        self.action.get()
     }
 
-    /// Clone of the latest state received (Operator side), or `None`. The
-    /// `u64` is the sender's wall-clock timestamp in microseconds.
-    pub fn get_state(&self) -> Option<(u64, HashMap<String, f64>)> {
-        self.state.latest.lock().clone()
+    /// Clone of the latest state received (Operator side), or `None`.
+    /// Typed per the declared schema.
+    pub fn get_state(&self) -> Option<State> {
+        self.state.get()
     }
 
     /// Clone of the latest frame received for `track_name`, or `None`.
@@ -452,10 +458,10 @@ impl Portal {
 
     // --- Callback registration (push API) ---
 
-    pub fn on_action(
-        &self,
-        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
-    ) {
+    /// Fire on every received action. The `Action` record exposes typed
+    /// values per the declared schema plus `raw_values` for the lossless
+    /// `f64` view.
+    pub fn on_action(&self, callback: impl Fn(&Action) + Send + Sync + 'static) {
         *self.action.cb.lock() = Some(Box::new(callback));
     }
 
@@ -463,10 +469,8 @@ impl Portal {
         self.obs_sink.set_observation_cb(Box::new(callback));
     }
 
-    pub fn on_state(
-        &self,
-        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
-    ) {
+    /// Fire on every received state. Semantics mirror `on_action`.
+    pub fn on_state(&self, callback: impl Fn(&State) + Send + Sync + 'static) {
         *self.state.cb.lock() = Some(Box::new(callback));
     }
 
@@ -483,7 +487,13 @@ impl Portal {
         }
     }
 
-    pub fn on_drop(&self, callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static) {
+    /// Fire on every batch of state samples that couldn't be matched to a
+    /// video frame. Each entry is the typed state payload (same shape as
+    /// `Observation.state`).
+    pub fn on_drop(
+        &self,
+        callback: impl Fn(Vec<HashMap<String, TypedValue>>) + Send + Sync + 'static,
+    ) {
         self.obs_sink.set_drop_cb(Box::new(callback));
     }
 
@@ -534,7 +544,7 @@ impl Portal {
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &self.config.video_tracks,
-            self.config.state_fields().map(String::from).collect(),
+            self.config.state_schema.clone(),
             self.config.sync_config(),
             self.metrics.clone(),
         )));
@@ -601,8 +611,8 @@ struct EventContext {
     state_schema_fp: u32,
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
     obs_sink: Arc<ObservationSink>,
-    action: Arc<DataSlots>,
-    state: Arc<DataSlots>,
+    action: Arc<ActionSlot>,
+    state: Arc<StateSlot>,
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
     metrics: Arc<MetricsRegistry>,

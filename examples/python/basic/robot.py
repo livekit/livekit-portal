@@ -2,9 +2,11 @@
 
 Reads LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET from .env (or env),
 mints a token for identity=robot, joins room=LIVEKIT_ROOM, publishes one
-video track ("cam1") and one state stream ("j1","j2","j3") at PORTAL_FPS.
-Prints any action it receives from the operator. Runs for
-PORTAL_DURATION_SECONDS (default 30) then cleanly disconnects.
+video track ("cam1") and one state stream with a mixed-dtype schema
+(three F32 joints, a BOOL gripper, an I8 mode) at PORTAL_FPS. Prints any
+action it receives from the operator (reconstructed to native Python
+types via `Portal.typed_action`). Runs for PORTAL_DURATION_SECONDS
+(default 30) then cleanly disconnects.
 
 Usage:
     cp .env.example .env   # fill in API_KEY / API_SECRET
@@ -23,8 +25,20 @@ from _common import _dump_metrics, env_float, env_int, load_env, mint_token, per
 
 IDENTITY = "robot"
 TRACK_NAME = "cam1"
-STATE_FIELDS = ["j1", "j2", "j3"]
-STATE_SCHEMA = [(name, DType.F64) for name in STATE_FIELDS]
+
+# Mixed-dtype schema: three float joints, a gripper bool, and a discrete
+# control mode. Mirrors the typical shape of a real robot's observation /
+# action vector — joints as floats, gripper as a binary signal, mode as a
+# small enum. Both sides (robot + teleoperator) must declare the same
+# schema in the same order.
+STATE_SCHEMA = [
+    ("j1", DType.F32),
+    ("j2", DType.F32),
+    ("j3", DType.F32),
+    ("gripper", DType.BOOL),
+    ("mode", DType.I8),
+]
+STATE_FIELDS = [name for name, _ in STATE_SCHEMA]
 
 
 _DOT_COLOR = np.array([255, 255, 255], dtype=np.uint8)
@@ -87,6 +101,10 @@ async def main() -> None:
         nonlocal actions_received
         actions_received += 1
         if actions_received % max(1, fps) == 0:
+            # `action.values` is a typed dict per the declared schema:
+            # gripper→bool, mode→int, joints→float. `action.raw_values`
+            # is the underlying Dict[str, float] if you need to write
+            # into a numpy buffer without per-field casting.
             print(
                 f"[robot] action #{actions_received}: ts={action.timestamp_us} "
                 f"values={action.values}"
@@ -116,11 +134,16 @@ async def main() -> None:
             frame = _make_frame(width, height, phase)
             ts_us = int(time.time() * 1_000_000)
             portal.send_video_frame(TRACK_NAME, frame, timestamp_us=ts_us)
+            # Send Python-native values; the publisher casts to the declared
+            # dtype at the wire boundary. `gripper=True` becomes one byte,
+            # `mode=2` becomes one signed byte.
             portal.send_state(
                 {
                     "j1": math.sin(phase),
                     "j2": math.cos(phase),
                     "j3": 0.1 * phase,
+                    "gripper": 1.0 if int(phase) % 2 == 0 else 0.0,
+                    "mode": float(int(phase) % 3),
                 },
                 timestamp_us=ts_us,
             )

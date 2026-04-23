@@ -1,7 +1,7 @@
 """Config builder smoke tests. No networking, no runtime."""
 import pytest
 
-from livekit.portal import Action, DType, FieldSpec, Portal, PortalConfig, PortalError, Role, State
+from livekit.portal import DType, FieldSpec, Portal, PortalConfig, PortalError, Role
 
 
 def test_new_config_constructs():
@@ -88,6 +88,13 @@ def test_fieldspec_accepted_as_schema_entry():
     assert cfg.action_schema == [("j1", DType.F32), ("j2", DType.F64)]
 
 
+# --- Typed delivery wrappers ------------------------------------------------
+#
+# These tests exercise the Python wrappers (`Action`, `State`, `Observation`)
+# rather than the FFI records. We build an FFI record by hand and pass it
+# through the same `_wrap_*` helpers the dispatcher uses on live deliveries.
+
+
 def _mixed_schema_portal():
     cfg = PortalConfig("typed", Role.OPERATOR)
     cfg.add_action_typed(
@@ -109,11 +116,12 @@ def _mixed_schema_portal():
     return Portal(cfg)
 
 
-def test_typed_action_reconstructs_native_types():
+def test_action_wrapper_values_are_typed_by_default():
+    from livekit.portal import _wrap_action
+    from livekit.portal import livekit_portal_ffi as _ffi
+
     portal = _mixed_schema_portal()
-    # What would arrive on the callback: all floats since that's what the
-    # FFI delivers. typed_action maps them back to the declared Python type.
-    action = Action(
+    ffi_action = _ffi.Action(
         values={
             "shoulder": 0.5,
             "elbow": -1.25,
@@ -121,44 +129,70 @@ def test_typed_action_reconstructs_native_types():
             "mode": 3.0,
             "counter": 42.0,
         },
-        timestamp_us=0,
+        timestamp_us=100,
     )
-    typed = portal.typed_action(action)
-    assert typed == {
+    action = _wrap_action(ffi_action, portal._action_schema)
+    assert action.timestamp_us == 100
+    # Typed by default.
+    assert action.values == {
         "shoulder": 0.5,
         "elbow": -1.25,
         "gripper": True,
         "mode": 3,
         "counter": 42,
     }
-    assert isinstance(typed["gripper"], bool)
-    assert isinstance(typed["mode"], int)
-    assert isinstance(typed["counter"], int)
-    assert isinstance(typed["shoulder"], float)
+    assert isinstance(action.values["gripper"], bool)
+    assert isinstance(action.values["mode"], int)
+    assert isinstance(action.values["shoulder"], float)
+    # Raw escape hatch preserves the f64 dict.
+    assert action.raw_values == {
+        "shoulder": 0.5,
+        "elbow": -1.25,
+        "gripper": 1.0,
+        "mode": 3.0,
+        "counter": 42.0,
+    }
 
 
-def test_typed_state_accepts_raw_dict():
+def test_state_wrapper_values_are_typed_by_default():
+    from livekit.portal import _wrap_state
+    from livekit.portal import livekit_portal_ffi as _ffi
+
     portal = _mixed_schema_portal()
-    # Observation.state arrives as a plain dict in lerobot/observer code; the
-    # helper should handle both a dict and a State record.
-    typed = portal.typed_state({"j1": 0.1, "j2": -0.2, "estop": 0.0})
-    assert typed == {"j1": 0.1, "j2": -0.2, "estop": False}
-    assert isinstance(typed["estop"], bool)
-
-
-def test_typed_helpers_drop_fields_missing_from_payload():
-    portal = _mixed_schema_portal()
-    # Partial update — gripper and mode absent. typed_action returns only
-    # the fields actually present, preserving their dtype cast.
-    typed = portal.typed_action(
-        Action(values={"shoulder": 0.25}, timestamp_us=0)
+    ffi_state = _ffi.State(
+        values={"j1": 0.1, "j2": -0.2, "estop": 1.0},
+        timestamp_us=99,
     )
-    assert typed == {"shoulder": 0.25}
+    state = _wrap_state(ffi_state, portal._state_schema)
+    assert state.values == {"j1": 0.1, "j2": -0.2, "estop": True}
+    assert isinstance(state.values["estop"], bool)
+    assert state.raw_values["estop"] == 1.0
 
 
-def test_typed_state_via_state_record():
+def test_observation_wrapper_exposes_typed_state():
+    from livekit.portal import _wrap_observation
+    from livekit.portal import livekit_portal_ffi as _ffi
+
     portal = _mixed_schema_portal()
-    typed = portal.typed_state(
-        State(values={"j1": 0.1, "estop": 1.0}, timestamp_us=0)
+    ffi_obs = _ffi.Observation(
+        state={"j1": 0.1, "j2": 0.2, "estop": 0.0},
+        frames={},
+        timestamp_us=50,
     )
-    assert typed == {"j1": 0.1, "estop": True}
+    obs = _wrap_observation(ffi_obs, portal._state_schema)
+    assert obs.state == {"j1": 0.1, "j2": 0.2, "estop": False}
+    assert obs.raw_state == {"j1": 0.1, "j2": 0.2, "estop": 0.0}
+    assert obs.frames == {}
+    assert obs.timestamp_us == 50
+
+
+def test_wrapper_drops_fields_missing_from_payload():
+    from livekit.portal import _wrap_action
+    from livekit.portal import livekit_portal_ffi as _ffi
+
+    portal = _mixed_schema_portal()
+    ffi_action = _ffi.Action(values={"shoulder": 0.25}, timestamp_us=0)
+    action = _wrap_action(ffi_action, portal._action_schema)
+    # Partial payload → wrapper returns only the fields that were sent.
+    assert action.values == {"shoulder": 0.25}
+    assert action.raw_values == {"shoulder": 0.25}
