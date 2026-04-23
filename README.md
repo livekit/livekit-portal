@@ -252,6 +252,27 @@ existing `Robot` or `Teleoperator` and the remote arm shows up as a local
 lerobot device to any workflow (teleop, dataset recording, policy eval). See
 [lerobot integration](docs/lerobot.md) for the full reference.
 
+## Why LiveKit
+
+Portal sits on LiveKit rather than raw WebRTC or a custom transport. The
+choice keeps the codebase focused on robotics instead of plumbing.
+
+| What LiveKit gives you | Why it matters for Portal |
+|---|---|
+| **Production SFU** | A robot room with an operator, a policy runner, and a passive viewer is the same session as one-to-one. No mesh, no client-side re-encoding. |
+| **Rooms, tokens, auth** | JWT-based permissions per participant. No identity service or handshake protocol to design. |
+| **Transport primitives** | RTP media with pacing and bandwidth adaptation. SCTP data channels, reliable or unreliable. Typed byte streams with chunking. RPC for one-shots. Portal maps observations straight onto these. |
+| **Cross-language SDKs** | Rust, Python, Swift, Kotlin, JavaScript, Unity. A browser teleop UI speaks the same protocol as the robot host. |
+| **Deploy anywhere** | [LiveKit Cloud](https://livekit.io/cloud) for zero ops, or self-host the open-source server. TURN relays handle NAT traversal. |
+| **Recording and egress** | Session recording lines up with dataset capture. Webhooks surface participant events. |
+
+On a raw WebRTC stack you keep the media engine and lose everything
+above. On a custom transport you reimplement all of it before the
+robotics work even starts.
+
+Running on a single machine or a LAN-only robot? You do not need any of
+this. A direct socket is enough.
+
 ## Documentation
 
 | Page | What's in it |
