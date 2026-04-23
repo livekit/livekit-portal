@@ -26,7 +26,7 @@ import asyncio
 import logging
 import threading
 import traceback
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 _log = logging.getLogger(__name__)
 
@@ -53,9 +53,9 @@ RpcInvocationData = _ffi.RpcInvocationData
 RpcError = _ffi.RpcError
 
 # A schema entry accepted by add_state_typed/add_action_typed. Either a
-# FieldSpec (record passthrough) or a (name, dtype) tuple — the latter is the
-# natural Python shape.
-SchemaEntry = Any  # Tuple[str, DType] | FieldSpec
+# FieldSpec (record passthrough) or a (name, dtype) tuple — the latter is
+# the natural Python shape.
+SchemaEntry = Union[Tuple[str, DType], FieldSpec]
 
 
 def _to_field_specs(schema: Iterable[SchemaEntry]) -> List[FieldSpec]:
@@ -66,6 +66,32 @@ def _to_field_specs(schema: Iterable[SchemaEntry]) -> List[FieldSpec]:
         else:
             name, dtype = entry
             out.append(FieldSpec(name=name, dtype=dtype))
+    return out
+
+
+_INT_DTYPES = frozenset(
+    {DType.I32, DType.I16, DType.I8, DType.U32, DType.U16, DType.U8}
+)
+
+
+def _cast_values(
+    values: Dict[str, float], schema: List[Tuple[str, DType]]
+) -> Dict[str, Any]:
+    """Map each value to its declared Python type: `BOOL` → `bool`, integer
+    dtypes → `int`, float dtypes → `float`. Keys missing from `schema` are
+    dropped; absent schema fields are omitted from the result.
+    """
+    out: Dict[str, Any] = {}
+    for name, dtype in schema:
+        if name not in values:
+            continue
+        v = values[name]
+        if dtype == DType.BOOL:
+            out[name] = bool(v)
+        elif dtype in _INT_DTYPES:
+            out[name] = int(v)
+        else:
+            out[name] = float(v)
     return out
 
 
@@ -347,6 +373,8 @@ class Portal:
         "_dispatcher",
         "_state_fields",
         "_action_fields",
+        "_state_schema",
+        "_action_schema",
         "_video_tracks",
     )
 
@@ -357,6 +385,11 @@ class Portal:
         self._state_fields: List[str] = list(self._inner.state_fields())
         self._action_fields: List[str] = list(self._inner.action_fields())
         self._video_tracks: List[str] = list(self._inner.video_tracks())
+        # The FFI does not surface dtype back, so mirror from the config.
+        # Needed to reconstruct native Python types on receive via
+        # `typed_action` / `typed_state`.
+        self._state_schema: List[Tuple[str, DType]] = list(config.state_schema)
+        self._action_schema: List[Tuple[str, DType]] = list(config.action_schema)
 
     # -- async lifecycle -----------------------------------------------------
 
@@ -413,6 +446,30 @@ class Portal:
 
     def get_video_frame(self, track_name: str) -> Optional[VideoFrameData]:
         return self._inner.get_video_frame(track_name)
+
+    # -- typed-value reconstruction ------------------------------------------
+
+    def typed_action(
+        self,
+        action: "Action | Dict[str, float]",
+    ) -> Dict[str, "float | int | bool"]:
+        """Cast `action.values` (or a raw dict) to native Python types per the
+        declared action schema: `DType.BOOL` → `bool`, integer dtypes → `int`,
+        float dtypes → `float`. Unknown keys are dropped silently since they
+        carry no dtype.
+        """
+        values = action if isinstance(action, dict) else action.values
+        return _cast_values(values, self._action_schema)
+
+    def typed_state(
+        self,
+        state: "State | Dict[str, float]",
+    ) -> Dict[str, "float | int | bool"]:
+        """Cast `state.values` (or a raw dict, e.g. `observation.state`) to
+        native Python types per the declared state schema.
+        """
+        values = state if isinstance(state, dict) else state.values
+        return _cast_values(values, self._state_schema)
 
     # -- push callbacks ------------------------------------------------------
 

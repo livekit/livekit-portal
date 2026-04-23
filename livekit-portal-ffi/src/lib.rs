@@ -323,19 +323,15 @@ impl PortalConfig {
     }
 
     pub fn add_state_typed(&self, schema: Vec<FieldSpec>) {
-        let owned: Vec<(String, core::DType)> =
-            schema.into_iter().map(|f| (f.name, f.dtype.into())).collect();
-        let refs: Vec<(&str, core::DType)> =
-            owned.iter().map(|(n, d)| (n.as_str(), *d)).collect();
-        self.inner.lock().add_state_typed(&refs);
+        self.inner
+            .lock()
+            .add_state_typed(schema.into_iter().map(|f| (f.name, f.dtype.into())));
     }
 
     pub fn add_action_typed(&self, schema: Vec<FieldSpec>) {
-        let owned: Vec<(String, core::DType)> =
-            schema.into_iter().map(|f| (f.name, f.dtype.into())).collect();
-        let refs: Vec<(&str, core::DType)> =
-            owned.iter().map(|(n, d)| (n.as_str(), *d)).collect();
-        self.inner.lock().add_action_typed(&refs);
+        self.inner
+            .lock()
+            .add_action_typed(schema.into_iter().map(|f| (f.name, f.dtype.into())));
     }
 
     pub fn set_fps(&self, fps: u32) {
@@ -386,8 +382,8 @@ impl Portal {
     #[uniffi::constructor]
     pub fn new(config: Arc<PortalConfig>, callbacks: Arc<dyn PortalCallbacks>) -> Arc<Self> {
         let cfg = config.inner.lock().clone();
-        let state_fields = cfg.state_fields();
-        let action_fields = cfg.action_fields();
+        let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
+        let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
 
         let inner = core::Portal::new(cfg);

@@ -1,17 +1,14 @@
 use crate::dtype::DType;
 use crate::types::{Role, SyncConfig};
 
-/// A single field declaration: name plus on-wire dtype.
-pub type FieldSchema = (String, DType);
-
 /// Configuration for a Portal session. Built incrementally before connecting.
 #[derive(Debug, Clone)]
 pub struct PortalConfig {
     pub(crate) session: String,
     pub(crate) role: Role,
     pub(crate) video_tracks: Vec<String>,
-    pub(crate) state_schema: Vec<FieldSchema>,
-    pub(crate) action_schema: Vec<FieldSchema>,
+    pub(crate) state_schema: Vec<(String, DType)>,
+    pub(crate) action_schema: Vec<(String, DType)>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
     pub(crate) fps: u32,
@@ -42,15 +39,29 @@ impl PortalConfig {
     }
 
     /// Declare state fields with per-field dtype. Order is significant and
-    /// must match on both peers.
-    pub fn add_state_typed(&mut self, schema: &[(&str, DType)]) {
-        self.state_schema.extend(schema.iter().map(|(n, d)| (n.to_string(), *d)));
+    /// must match on both peers. Appends to any previous declaration.
+    ///
+    /// Accepts anything iterable yielding `(name, DType)` — `&[(&str,
+    /// DType)]`, `Vec<(String, DType)>`, arrays, mapped iterators.
+    pub fn add_state_typed<S, I>(&mut self, schema: I)
+    where
+        S: Into<String>,
+        I: IntoIterator<Item = (S, DType)>,
+    {
+        self.state_schema.extend(schema.into_iter().map(|(n, d)| (n.into(), d)));
     }
 
     /// Declare action fields with per-field dtype. Order is significant and
-    /// must match on both peers.
-    pub fn add_action_typed(&mut self, schema: &[(&str, DType)]) {
-        self.action_schema.extend(schema.iter().map(|(n, d)| (n.to_string(), *d)));
+    /// must match on both peers. Appends to any previous declaration.
+    ///
+    /// Accepts anything iterable yielding `(name, DType)` — `&[(&str,
+    /// DType)]`, `Vec<(String, DType)>`, arrays, mapped iterators.
+    pub fn add_action_typed<S, I>(&mut self, schema: I)
+    where
+        S: Into<String>,
+        I: IntoIterator<Item = (S, DType)>,
+    {
+        self.action_schema.extend(schema.into_iter().map(|(n, d)| (n.into(), d)));
     }
 
     /// Unified observation rate (set to the video capture rate if state and
@@ -106,23 +117,25 @@ impl PortalConfig {
         &self.video_tracks
     }
 
-    /// Ordered state field names. Derived from `state_schema`.
-    pub fn state_fields(&self) -> Vec<String> {
-        self.state_schema.iter().map(|(n, _)| n.clone()).collect()
+    /// Ordered state field names. Derived from `state_schema`; does not
+    /// allocate.
+    pub fn state_fields(&self) -> impl Iterator<Item = &str> {
+        self.state_schema.iter().map(|(n, _)| n.as_str())
     }
 
-    /// Ordered action field names. Derived from `action_schema`.
-    pub fn action_fields(&self) -> Vec<String> {
-        self.action_schema.iter().map(|(n, _)| n.clone()).collect()
+    /// Ordered action field names. Derived from `action_schema`; does not
+    /// allocate.
+    pub fn action_fields(&self) -> impl Iterator<Item = &str> {
+        self.action_schema.iter().map(|(n, _)| n.as_str())
     }
 
     /// Full state schema (name + dtype).
-    pub fn state_schema(&self) -> &[FieldSchema] {
+    pub fn state_schema(&self) -> &[(String, DType)] {
         &self.state_schema
     }
 
     /// Full action schema (name + dtype).
-    pub fn action_schema(&self) -> &[FieldSchema] {
+    pub fn action_schema(&self) -> &[(String, DType)] {
         &self.action_schema
     }
 

@@ -30,20 +30,57 @@ impl DType {
         }
     }
 
-    /// Encode an `f64` into `out` at the declared width, saturating on
-    /// overflow for integer dtypes. `Bool` treats any non-zero finite value
-    /// as true.
-    pub(crate) fn encode(self, v: f64, out: &mut Vec<u8>) {
+    /// Encode an `f64` into `out` at the declared width. Returns `true` when
+    /// the value was lossy beyond ordinary float rounding: an integer dtype
+    /// saturated, or `Bool` received `NaN`. `F64` never reports lossy. `F32`
+    /// reports lossy only if the value is finite and outside `f32` range.
+    /// Caller uses the flag to emit a rate-limited warning.
+    pub(crate) fn encode(self, v: f64, out: &mut Vec<u8>) -> bool {
         match self {
-            DType::F64 => out.extend_from_slice(&v.to_le_bytes()),
-            DType::F32 => out.extend_from_slice(&(v as f32).to_le_bytes()),
-            DType::I32 => out.extend_from_slice(&saturate_i32(v).to_le_bytes()),
-            DType::I16 => out.extend_from_slice(&saturate_i16(v).to_le_bytes()),
-            DType::I8 => out.extend_from_slice(&saturate_i8(v).to_le_bytes()),
-            DType::U32 => out.extend_from_slice(&saturate_u32(v).to_le_bytes()),
-            DType::U16 => out.extend_from_slice(&saturate_u16(v).to_le_bytes()),
-            DType::U8 => out.extend_from_slice(&saturate_u8(v).to_le_bytes()),
-            DType::Bool => out.push(if v != 0.0 && !v.is_nan() { 1 } else { 0 }),
+            DType::F64 => {
+                out.extend_from_slice(&v.to_le_bytes());
+                false
+            }
+            DType::F32 => {
+                let f = v as f32;
+                out.extend_from_slice(&f.to_le_bytes());
+                v.is_finite() && !f.is_finite()
+            }
+            DType::I32 => {
+                let (x, sat) = saturate_i32(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::I16 => {
+                let (x, sat) = saturate_i16(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::I8 => {
+                let (x, sat) = saturate_i8(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::U32 => {
+                let (x, sat) = saturate_u32(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::U16 => {
+                let (x, sat) = saturate_u16(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::U8 => {
+                let (x, sat) = saturate_u8(v);
+                out.extend_from_slice(&x.to_le_bytes());
+                sat
+            }
+            DType::Bool => {
+                let saturated = v.is_nan();
+                out.push(if v != 0.0 && !v.is_nan() { 1 } else { 0 });
+                saturated
+            }
         }
     }
 
@@ -76,108 +113,105 @@ impl DType {
     }
 }
 
-fn saturate_i32(v: f64) -> i32 {
-    if v.is_nan() {
-        0
-    } else if v >= i32::MAX as f64 {
-        i32::MAX
-    } else if v <= i32::MIN as f64 {
-        i32::MIN
-    } else {
-        v as i32
-    }
+/// Saturating cast `f64 -> signed-int T`. Returns `(value, saturated?)`.
+/// `NaN` maps to 0 and is reported as saturated. Values exactly equal to
+/// `T::MIN` or `T::MAX` are representable and *not* reported.
+macro_rules! saturate_signed {
+    ($name:ident, $t:ty) => {
+        fn $name(v: f64) -> ($t, bool) {
+            if v.is_nan() {
+                (0, true)
+            } else if v > <$t>::MAX as f64 {
+                (<$t>::MAX, true)
+            } else if v < <$t>::MIN as f64 {
+                (<$t>::MIN, true)
+            } else {
+                (v as $t, false)
+            }
+        }
+    };
 }
 
-fn saturate_i16(v: f64) -> i16 {
-    if v.is_nan() {
-        0
-    } else if v >= i16::MAX as f64 {
-        i16::MAX
-    } else if v <= i16::MIN as f64 {
-        i16::MIN
-    } else {
-        v as i16
-    }
+/// Saturating cast `f64 -> unsigned-int T`. Negative and `NaN` inputs clamp
+/// to 0 and are reported as saturated. Zero and exact `T::MAX` are
+/// representable and not reported.
+macro_rules! saturate_unsigned {
+    ($name:ident, $t:ty) => {
+        fn $name(v: f64) -> ($t, bool) {
+            if v.is_nan() {
+                (0, true)
+            } else if v < 0.0 {
+                (0, true)
+            } else if v > <$t>::MAX as f64 {
+                (<$t>::MAX, true)
+            } else {
+                (v as $t, false)
+            }
+        }
+    };
 }
 
-fn saturate_i8(v: f64) -> i8 {
-    if v.is_nan() {
-        0
-    } else if v >= i8::MAX as f64 {
-        i8::MAX
-    } else if v <= i8::MIN as f64 {
-        i8::MIN
-    } else {
-        v as i8
-    }
-}
-
-fn saturate_u32(v: f64) -> u32 {
-    if v.is_nan() || v <= 0.0 {
-        0
-    } else if v >= u32::MAX as f64 {
-        u32::MAX
-    } else {
-        v as u32
-    }
-}
-
-fn saturate_u16(v: f64) -> u16 {
-    if v.is_nan() || v <= 0.0 {
-        0
-    } else if v >= u16::MAX as f64 {
-        u16::MAX
-    } else {
-        v as u16
-    }
-}
-
-fn saturate_u8(v: f64) -> u8 {
-    if v.is_nan() || v <= 0.0 {
-        0
-    } else if v >= u8::MAX as f64 {
-        u8::MAX
-    } else {
-        v as u8
-    }
-}
+saturate_signed!(saturate_i32, i32);
+saturate_signed!(saturate_i16, i16);
+saturate_signed!(saturate_i8, i8);
+saturate_unsigned!(saturate_u32, u32);
+saturate_unsigned!(saturate_u16, u16);
+saturate_unsigned!(saturate_u8, u8);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn roundtrip(dtype: DType, v: f64) -> f64 {
+    fn encode_decode(dtype: DType, v: f64) -> (f64, bool) {
         let mut buf = Vec::new();
-        dtype.encode(v, &mut buf);
+        let saturated = dtype.encode(v, &mut buf);
         assert_eq!(buf.len(), dtype.size_bytes());
-        dtype.decode(&buf).unwrap()
+        (dtype.decode(&buf).unwrap(), saturated)
     }
 
     #[test]
     fn f64_roundtrip() {
-        assert_eq!(roundtrip(DType::F64, 3.14159265358979), 3.14159265358979);
+        let (v, sat) = encode_decode(DType::F64, 3.14159265358979);
+        assert_eq!(v, 3.14159265358979);
+        assert!(!sat);
     }
 
     #[test]
-    fn f32_lossy_roundtrip() {
-        let r = roundtrip(DType::F32, 1.5);
-        assert_eq!(r, 1.5);
+    fn f32_reports_overflow() {
+        let (v, sat) = encode_decode(DType::F32, 1.5);
+        assert_eq!(v, 1.5);
+        assert!(!sat);
+        let (v, sat) = encode_decode(DType::F32, 1e40);
+        assert!(v.is_infinite());
+        assert!(sat, "f32 overflow must be reported as saturation");
     }
 
     #[test]
     fn int_saturates_on_overflow() {
-        assert_eq!(roundtrip(DType::I8, 500.0), 127.0);
-        assert_eq!(roundtrip(DType::I8, -500.0), -128.0);
-        assert_eq!(roundtrip(DType::U8, -5.0), 0.0);
-        assert_eq!(roundtrip(DType::U8, 1000.0), 255.0);
+        assert_eq!(encode_decode(DType::I8, 500.0), (127.0, true));
+        assert_eq!(encode_decode(DType::I8, -500.0), (-128.0, true));
+        assert_eq!(encode_decode(DType::U8, -5.0), (0.0, true));
+        assert_eq!(encode_decode(DType::U8, 1000.0), (255.0, true));
+        assert_eq!(encode_decode(DType::I8, 42.0), (42.0, false));
+    }
+
+    #[test]
+    fn int_boundary_values_are_not_reported() {
+        // Exact MIN/MAX are representable and should not flag.
+        assert_eq!(encode_decode(DType::I8, 127.0), (127.0, false));
+        assert_eq!(encode_decode(DType::I8, -128.0), (-128.0, false));
+        assert_eq!(encode_decode(DType::U16, 65535.0), (65535.0, false));
+        assert_eq!(encode_decode(DType::U8, 0.0), (0.0, false));
     }
 
     #[test]
     fn bool_maps_zero_and_nonzero() {
-        assert_eq!(roundtrip(DType::Bool, 0.0), 0.0);
-        assert_eq!(roundtrip(DType::Bool, 1.0), 1.0);
-        assert_eq!(roundtrip(DType::Bool, -3.2), 1.0);
-        assert_eq!(roundtrip(DType::Bool, f64::NAN), 0.0);
+        assert_eq!(encode_decode(DType::Bool, 0.0), (0.0, false));
+        assert_eq!(encode_decode(DType::Bool, 1.0), (1.0, false));
+        assert_eq!(encode_decode(DType::Bool, -3.2), (1.0, false));
+        let (v, sat) = encode_decode(DType::Bool, f64::NAN);
+        assert_eq!(v, 0.0);
+        assert!(sat, "NaN into Bool must be reported as saturation");
     }
 
     #[test]

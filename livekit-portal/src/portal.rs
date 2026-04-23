@@ -13,6 +13,7 @@ use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rpc::RpcHandler;
 use crate::rtt::RttService;
+use crate::serialization::schema_fingerprint;
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
@@ -210,8 +211,12 @@ impl Portal {
 
         // Event dispatch runs off a snapshot of the fields it touches, not the
         // whole Portal, so it doesn't need any outer lock.
+        let action_schema_fp = schema_fingerprint(&self.config.action_schema);
+        let state_schema_fp = schema_fingerprint(&self.config.state_schema);
         let ctx = EventContext {
             config: self.config.clone(),
+            action_schema_fp,
+            state_schema_fp,
             sync_buffer: self.sync_buffer.lock().clone(),
             obs_sink: self.obs_sink.clone(),
             action: self.action.clone(),
@@ -529,7 +534,7 @@ impl Portal {
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &self.config.video_tracks,
-            self.config.state_fields(),
+            self.config.state_fields().map(String::from).collect(),
             self.config.sync_config(),
             self.metrics.clone(),
         )));
@@ -589,6 +594,11 @@ fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandle
 /// Portal-level lock on the hot path.
 struct EventContext {
     config: PortalConfig,
+    /// Cached schema fingerprints so the receive hot path doesn't recompute
+    /// them per packet. Matches the peer's fingerprint when schemas agree;
+    /// a mismatch logs once per offending value and drops the packet.
+    action_schema_fp: u32,
+    state_schema_fp: u32,
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
     obs_sink: Arc<ObservationSink>,
     action: Arc<DataSlots>,
@@ -670,7 +680,9 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 &topic,
                 ctx.config.role,
                 &ctx.config.action_schema,
+                ctx.action_schema_fp,
                 &ctx.config.state_schema,
+                ctx.state_schema_fp,
                 &ctx.action,
                 &ctx.state,
                 ctx.sync_buffer.as_ref(),

@@ -138,6 +138,48 @@ asyncio.run(main())
 Callbacks fire on the asyncio loop that was running when you registered
 them. User code never runs on the tokio worker thread.
 
+## Typed values on receive
+
+`action.values` and `state.values` always arrive as `Dict[str, float]`. That
+is what the FFI boundary delivers. To reconstruct Python `bool` and `int`
+per the declared schema, use `portal.typed_action(action)` or
+`portal.typed_state(state)`:
+
+```python
+def on_action(action):
+    values = portal.typed_action(action)
+    # values["gripper"] is bool
+    # values["mode"] is int
+    # values["shoulder"] is float
+```
+
+Both helpers accept either the FFI record or a raw `dict` (handy for
+`observation.state`, which arrives as `dict[str, float]`). Fields not in the
+schema are dropped; schema fields not in the payload are omitted from the
+result.
+
+## Gotchas
+
+- **Saturation is silent except for a one-time log.** If you send `9999`
+  into an `I8` field, it clips to `127`. The publisher emits a single
+  `WARN` per (topic, field) on first saturation, then stays quiet. The
+  peer receives the clipped value and never sees the original.
+- **Schema mismatch is detected but not raised.** Every packet carries a
+  `u32` fingerprint derived from the ordered field names and dtypes. A
+  peer whose schema disagrees (any rename, dtype flip, or reorder) sees
+  its packets dropped with a `WARN` per unique offending fingerprint. The
+  healthy side keeps running. No exception is raised.
+- **Unknown field names on send are dropped.** Keys in the dict you pass
+  to `send_action` / `send_state` that are not in the declared schema get
+  a one-time `WARN` and are then silently ignored. Check `portal.metrics()`
+  and your logs if a field appears to not arrive — the typo is the usual
+  cause.
+- **NaN into `Bool` becomes `false`.** NaN into integer dtypes becomes
+  `0`. Both count as saturation and log once per field.
+- **Boundary values do not saturate.** `127.0` into `I8`, `-128.0` into
+  `I8`, `65535.0` into `U16`, and `0.0` into any unsigned type are
+  representable and silent.
+
 ## Frame format
 
 `send_video_frame` expects packed RGB24 NumPy arrays of shape `(H, W, 3)`
@@ -151,6 +193,8 @@ uint8. Width and height must both be even. Full details in
 - `portal.on_action(cb)`: incoming actions (robot only).
 - `portal.on_state(cb)`: raw state firehose (operator only). Every packet
   fires. Use `on_observation` if you want paced data.
+- `portal.typed_action(action)` / `portal.typed_state(state)`: cast to
+  native Python types (`bool`, `int`, `float`) per the declared dtype.
 - `portal.send_action(values, timestamp_us=...)`: operator only.
 - `portal.send_video_frame(name, frame, timestamp_us=...)`: robot only.
 - `portal.send_state(values, timestamp_us=...)`: robot only.
