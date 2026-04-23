@@ -4,8 +4,8 @@ Reads LIVEKIT_URL + LIVEKIT_API_KEY + LIVEKIT_API_SECRET from .env (or env),
 mints a token for identity=robot, joins room=LIVEKIT_ROOM, publishes one
 video track ("cam1") and one state stream with a mixed-dtype schema
 (three F32 joints, a BOOL gripper, an I8 mode) at PORTAL_FPS. Prints any
-action it receives from the operator (reconstructed to native Python
-types via `Portal.typed_action`). Runs for PORTAL_DURATION_SECONDS
+action it receives from the operator (`action.values` is already
+typed per the declared schema). Runs for PORTAL_DURATION_SECONDS
 (default 30) then cleanly disconnects.
 
 Usage:
