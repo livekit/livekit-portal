@@ -108,13 +108,13 @@ the control loop starts.
 
 ```python
 import asyncio, time
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session-1", Role.ROBOT)
     cfg.add_video("front")                       # add more tracks for multi-camera
-    cfg.add_state(["j1", "j2", "j3"])
-    cfg.add_action(["j1", "j2", "j3"])
+    cfg.add_state_typed([("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)])
+    cfg.add_action_typed([("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)])
     cfg.set_fps(30)
 
     portal = Portal(cfg)
@@ -144,13 +144,13 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session-1", Role.OPERATOR)
     cfg.add_video("front")
-    cfg.add_state(["j1", "j2", "j3"])
-    cfg.add_action(["j1", "j2", "j3"])
+    cfg.add_state_typed([("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)])
+    cfg.add_action_typed([("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)])
     cfg.set_fps(30)
 
     portal = Portal(cfg)

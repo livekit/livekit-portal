@@ -1,16 +1,146 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::config::FieldSpec;
+use crate::dtype::DType;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Robot,
     Operator,
 }
 
-/// A synchronized observation: one state matched with one frame from every registered video track.
+/// A value received on the wire, reconstructed to its declared dtype.
+///
+/// The core pipeline widens every value to `f64` for carry-forward and
+/// buffering — every supported integer dtype fits in `f64`'s 53-bit
+/// mantissa, so that widening is lossless. `TypedValue` is the
+/// presentation form handed to user code: the dtype is preserved, so a
+/// `BOOL` field arrives as `Bool(true)`, not `F64(1.0)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TypedValue {
+    F64(f64),
+    F32(f32),
+    I32(i32),
+    I16(i16),
+    I8(i8),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+    Bool(bool),
+}
+
+impl TypedValue {
+    /// Construct from an `f64` per the declared dtype. The pipeline hands
+    /// every value to this method at delivery; by that point the value
+    /// has already been round-tripped through `DType::encode`/`decode`
+    /// and lies in range for the dtype, so this is a straight cast.
+    ///
+    /// Rust's `as` cast from `f64` to an integer is saturating (Rust
+    /// 1.45+): out-of-range values clamp to the integer's bounds and
+    /// `NaN` becomes `0`.
+    ///
+    /// Exposed publicly so language bindings that receive an `f64` map
+    /// across the FFI (e.g. UniFFI) can adapt it back into `TypedValue`
+    /// for typed on-receive paths.
+    pub fn from_f64(v: f64, dtype: DType) -> Self {
+        match dtype {
+            DType::F64 => TypedValue::F64(v),
+            DType::F32 => TypedValue::F32(v as f32),
+            DType::I32 => TypedValue::I32(v as i32),
+            DType::I16 => TypedValue::I16(v as i16),
+            DType::I8 => TypedValue::I8(v as i8),
+            DType::U32 => TypedValue::U32(v as u32),
+            DType::U16 => TypedValue::U16(v as u16),
+            DType::U8 => TypedValue::U8(v as u8),
+            DType::Bool => TypedValue::Bool(v != 0.0 && !v.is_nan()),
+        }
+    }
+
+    /// The `DType` tag matching this variant — lets callers check a
+    /// typed value against a declared schema.
+    pub fn dtype(self) -> DType {
+        match self {
+            TypedValue::F64(_) => DType::F64,
+            TypedValue::F32(_) => DType::F32,
+            TypedValue::I32(_) => DType::I32,
+            TypedValue::I16(_) => DType::I16,
+            TypedValue::I8(_) => DType::I8,
+            TypedValue::U32(_) => DType::U32,
+            TypedValue::U16(_) => DType::U16,
+            TypedValue::U8(_) => DType::U8,
+            TypedValue::Bool(_) => DType::Bool,
+        }
+    }
+
+    /// Static name of the variant, for error messages.
+    pub fn variant_name(self) -> &'static str {
+        match self {
+            TypedValue::F64(_) => "F64",
+            TypedValue::F32(_) => "F32",
+            TypedValue::I32(_) => "I32",
+            TypedValue::I16(_) => "I16",
+            TypedValue::I8(_) => "I8",
+            TypedValue::U32(_) => "U32",
+            TypedValue::U16(_) => "U16",
+            TypedValue::U8(_) => "U8",
+            TypedValue::Bool(_) => "Bool",
+        }
+    }
+
+    /// Lossless widening back to `f64`. Useful when a consumer wants to
+    /// treat every field uniformly (e.g. writing into an `ndarray`).
+    pub fn as_f64(self) -> f64 {
+        match self {
+            TypedValue::F64(v) => v,
+            TypedValue::F32(v) => v as f64,
+            TypedValue::I32(v) => v as f64,
+            TypedValue::I16(v) => v as f64,
+            TypedValue::I8(v) => v as f64,
+            TypedValue::U32(v) => v as f64,
+            TypedValue::U16(v) => v as f64,
+            TypedValue::U8(v) => v as f64,
+            TypedValue::Bool(v) => if v { 1.0 } else { 0.0 },
+        }
+    }
+}
+
+impl From<TypedValue> for f64 {
+    fn from(v: TypedValue) -> Self {
+        v.as_f64()
+    }
+}
+
+/// One action received from the operator. Surfaces in `on_action` and
+/// `Portal::get_action`.
+#[derive(Debug, Clone)]
+pub struct Action {
+    /// Field name to typed value per the declared action schema.
+    pub values: HashMap<String, TypedValue>,
+    /// The same payload widened to `f64` — every dtype's lossless
+    /// representation on the pipeline. Useful when you want to write into
+    /// a numeric buffer without matching on each variant.
+    pub raw_values: HashMap<String, f64>,
+    pub timestamp_us: u64,
+}
+
+/// One state sample received from the robot. Surfaces in `on_state` and
+/// `Portal::get_state`.
+#[derive(Debug, Clone)]
+pub struct State {
+    pub values: HashMap<String, TypedValue>,
+    pub raw_values: HashMap<String, f64>,
+    pub timestamp_us: u64,
+}
+
+/// A synchronized observation: one state matched with one frame from every
+/// registered video track.
 #[derive(Debug, Clone)]
 pub struct Observation {
-    pub state: HashMap<String, f64>,
+    /// Typed per the declared state schema.
+    pub state: HashMap<String, TypedValue>,
+    /// Same payload as `state`, widened to `f64` (lossless).
+    pub raw_state: HashMap<String, f64>,
     pub frames: HashMap<String, VideoFrameData>,
     pub timestamp_us: u64,
 }
@@ -42,7 +172,52 @@ impl Default for SyncConfig {
     }
 }
 
-/// Build a field-name → value HashMap from ordered fields and values.
-pub(crate) fn to_field_map(fields: &[String], values: &[f64]) -> HashMap<String, f64> {
-    fields.iter().zip(values).map(|(k, v)| (k.clone(), *v)).collect()
+/// Build `(typed, raw)` maps from an ordered schema and its values. Both
+/// maps are returned so delivery records can carry typed *and* raw views
+/// without rebuilding either on access.
+pub(crate) fn to_value_maps(
+    schema: &[FieldSpec],
+    values: &[f64],
+) -> (HashMap<String, TypedValue>, HashMap<String, f64>) {
+    let mut typed = HashMap::with_capacity(schema.len());
+    let mut raw = HashMap::with_capacity(schema.len());
+    for (f, v) in schema.iter().zip(values.iter()) {
+        typed.insert(f.name.clone(), TypedValue::from_f64(*v, f.dtype));
+        raw.insert(f.name.clone(), *v);
+    }
+    (typed, raw)
+}
+
+// `From<primitive> for TypedValue` impls so callers can build typed maps
+// ergonomically with `.into()` rather than spelling the variant:
+//     let mut m: HashMap<String, TypedValue> = HashMap::new();
+//     m.insert("gripper".into(), true.into());
+//     m.insert("shoulder".into(), 0.5f32.into());
+
+impl From<f64> for TypedValue {
+    fn from(v: f64) -> Self { TypedValue::F64(v) }
+}
+impl From<f32> for TypedValue {
+    fn from(v: f32) -> Self { TypedValue::F32(v) }
+}
+impl From<i32> for TypedValue {
+    fn from(v: i32) -> Self { TypedValue::I32(v) }
+}
+impl From<i16> for TypedValue {
+    fn from(v: i16) -> Self { TypedValue::I16(v) }
+}
+impl From<i8> for TypedValue {
+    fn from(v: i8) -> Self { TypedValue::I8(v) }
+}
+impl From<u32> for TypedValue {
+    fn from(v: u32) -> Self { TypedValue::U32(v) }
+}
+impl From<u16> for TypedValue {
+    fn from(v: u16) -> Self { TypedValue::U16(v) }
+}
+impl From<u8> for TypedValue {
+    fn from(v: u8) -> Self { TypedValue::U8(v) }
+}
+impl From<bool> for TypedValue {
+    fn from(v: bool) -> Self { TypedValue::Bool(v) }
 }

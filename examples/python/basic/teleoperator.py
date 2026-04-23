@@ -14,12 +14,23 @@ import asyncio
 import math
 import time
 
-from livekit.portal import Observation, Portal, PortalConfig, Role
+from livekit.portal import DType, Observation, Portal, PortalConfig, Role
 from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
 
 IDENTITY = "teleoperator"
 TRACK_NAME = "cam1"
-STATE_FIELDS = ["j1", "j2", "j3"]
+
+# Must match `robot.py`'s schema exactly: same field order, same dtypes.
+# Any disagreement (reorder, rename, dtype flip) changes the schema
+# fingerprint and the peer's packets are dropped with a warning.
+STATE_SCHEMA = [
+    ("j1", DType.F32),
+    ("j2", DType.F32),
+    ("j3", DType.F32),
+    ("gripper", DType.BOOL),
+    ("mode", DType.I8),
+]
+STATE_FIELDS = [name for name, _ in STATE_SCHEMA]
 
 
 async def main() -> None:
@@ -32,8 +43,8 @@ async def main() -> None:
 
     cfg = PortalConfig(room, Role.OPERATOR)
     cfg.add_video(TRACK_NAME)
-    cfg.add_state(STATE_FIELDS)
-    cfg.add_action(STATE_FIELDS)
+    cfg.add_state_typed(STATE_SCHEMA)
+    cfg.add_action_typed(STATE_SCHEMA)
     cfg.set_fps(fps)
 
     portal = Portal(cfg)
@@ -49,6 +60,9 @@ async def main() -> None:
         if now - last_log >= 1.0:
             frame = obs.frames.get(TRACK_NAME)
             frame_desc = f"{frame.width}x{frame.height}" if frame else "none"
+            # `obs.state` is typed per the declared schema: gripper→bool,
+            # mode→int, joints→float. `obs.raw_state` is the underlying
+            # Dict[str, float] escape hatch.
             print(
                 f"[operator] obs #{observations}: ts={obs.timestamp_us} "
                 f"state={obs.state} frame={frame_desc}"
@@ -80,11 +94,16 @@ async def main() -> None:
         for i in range(n_ticks):
             phase = i / fps
             ts_us = int(time.time() * 1_000_000)
+            # Send Python floats; the publisher casts bool/int fields at
+            # the wire boundary. `mode=5` fits in I8; out-of-range values
+            # would saturate and log once per field.
             portal.send_action(
                 {
                     "j1": 0.5 * math.sin(phase * 2),
                     "j2": 0.5 * math.cos(phase * 2),
                     "j3": 0.0,
+                    "gripper": 1.0 if int(phase) % 2 == 0 else 0.0,
+                    "mode": float(i % 4),
                 },
                 timestamp_us=ts_us,
             )

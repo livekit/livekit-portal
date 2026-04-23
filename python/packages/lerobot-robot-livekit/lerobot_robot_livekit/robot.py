@@ -17,7 +17,7 @@ from typing import Any
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 
-from livekit.portal import Portal, PortalConfig, Role, i420_bytes_to_numpy_rgb
+from livekit.portal import DType, Portal, PortalConfig, Role, i420_bytes_to_numpy_rgb
 
 
 @RobotConfig.register_subclass("livekit")
@@ -131,9 +131,13 @@ class LiveKitRobot(Robot):
         for cam in self._camera_names:
             self._portal_cfg.add_video(cam)
         if self._state_motors:
-            self._portal_cfg.add_state(self._state_motors)
+            self._portal_cfg.add_state_typed(
+                [(name, DType.F64) for name in self._state_motors]
+            )
         if self._action_motors:
-            self._portal_cfg.add_action(self._action_motors)
+            self._portal_cfg.add_action_typed(
+                [(name, DType.F64) for name in self._action_motors]
+            )
         self._portal_cfg.set_fps(self.config.fps)
         if self.config.slack is not None:
             self._portal_cfg.set_slack(self.config.slack)

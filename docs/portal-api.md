@@ -46,22 +46,38 @@ returns `WrongRole`.
 | `Role.ROBOT` | video frames, state | actions |
 | `Role.OPERATOR` | actions | video frames + state, merged into synced observations |
 
-Both sides must register the same schema via `add_video` / `add_state` /
-`add_action`. Camera names and state/action field names must match across
-sides.
+Both sides must register the same schema via `add_video` / `add_state_typed` /
+`add_action_typed`. Camera names, field names, and per-field dtypes must
+match across sides.
+
+State and action schemas are typed. Each field declares a `DType` that drives
+its on-wire width. `DType.F64` is the lossless default. `F32` halves the
+bytes per field for joint angles. `I8`, `I16`, `U8`, `U16`, `U32` suit
+discrete indices or counters. `Bool` is one byte for binary signals like
+gripper open or estop. Values you send through `send_state` /
+`send_action` stay as Python floats. Saturation applies at the wire boundary
+for out-of-range integer values.
 
 ## Robot side
 
 ```python
 import asyncio
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session", Role.ROBOT)
     cfg.add_video("camera1")
     cfg.add_video("camera2")
-    cfg.add_state(["joint1", "joint2", "joint3"])
-    cfg.add_action(["joint1", "joint2", "joint3"])
+    cfg.add_state_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
+    cfg.add_action_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
 
     portal = Portal(cfg)
 
@@ -87,14 +103,22 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session", Role.OPERATOR)
     cfg.add_video("camera1")
     cfg.add_video("camera2")
-    cfg.add_state(["joint1", "joint2", "joint3"])
-    cfg.add_action(["joint1", "joint2", "joint3"])
+    cfg.add_state_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
+    cfg.add_action_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
 
     portal = Portal(cfg)
 
@@ -113,6 +137,62 @@ asyncio.run(main())
 
 Callbacks fire on the asyncio loop that was running when you registered
 them. User code never runs on the tokio worker thread.
+
+## Typed values on receive
+
+`Action`, `State`, and `Observation` are typed by default. `.values`
+(and `observation.state`) hold Python-native types per the declared
+schema: `DType.BOOL` fields are `bool`, integer dtypes are `int`, float
+dtypes are `float`. `.raw_values` (and `observation.raw_state`) keep
+the lossless `f64` view if you want to write into a numpy buffer
+without a per-field cast.
+
+```python
+def on_action(action):
+    # action.values["gripper"] is True (bool)
+    # action.values["mode"] is 3 (int)
+    # action.values["shoulder"] is 0.5 (float)
+    # action.raw_values is the underlying Dict[str, float]
+    ...
+```
+
+The Rust SDK mirrors this: `Action` / `State` / `Observation` carry
+`values: HashMap<String, TypedValue>` alongside `raw_values:
+HashMap<String, f64>`. The mental model is identical across languages:
+declare a dtype, send whatever you want, receive back as the declared
+type.
+
+## Gotchas
+
+- **Send-time dtype mismatch raises immediately.** If you send a
+  `float` into a `BOOL` field, a `bool` into a `F32` field, or any
+  other type that doesn't match the declared dtype, `send_state` /
+  `send_action` raises `PortalError::DtypeMismatch` before the packet
+  is constructed. No silent cast. Python follows the same rule via
+  `isinstance` checks on each value. `int` is accepted for float
+  dtypes (standard numeric promotion); `bool` is rejected everywhere
+  except `BOOL` fields.
+- **Saturation is silent except for a one-time log.** Saturation
+  happens after the dtype check passes — e.g., sending `9999` as an
+  `i8` in Rust (or `9999` as an int for an `I8` field in Python)
+  clips to `127`. The publisher emits a single `WARN` per (topic,
+  field) on first saturation, then stays quiet. The peer receives
+  the clipped value and never sees the original.
+- **Schema mismatch is detected but not raised.** Every packet carries a
+  `u32` fingerprint derived from the ordered field names and dtypes. A
+  peer whose schema disagrees (any rename, dtype flip, or reorder) sees
+  its packets dropped with a `WARN` per unique offending fingerprint. The
+  healthy side keeps running. No exception is raised.
+- **Unknown field names on send are dropped.** Keys in the dict you pass
+  to `send_action` / `send_state` that are not in the declared schema get
+  a one-time `WARN` and are then silently ignored. Check `portal.metrics()`
+  and your logs if a field appears to not arrive — the typo is the usual
+  cause.
+- **NaN into `Bool` becomes `false`.** NaN into integer dtypes becomes
+  `0`. Both count as saturation and log once per field.
+- **Boundary values do not saturate.** `127.0` into `I8`, `-128.0` into
+  `I8`, `65535.0` into `U16`, and `0.0` into any unsigned type are
+  representable and silent.
 
 ## Frame format
 

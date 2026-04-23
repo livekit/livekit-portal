@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use livekit::prelude::*;
@@ -6,12 +7,16 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::error::PortalResult;
+use crate::config::FieldSpec;
+use crate::error::{PortalError, PortalResult};
+
+#[cfg(test)]
+use crate::dtype::DType;
 use crate::metrics::{DataStream, MetricsRegistry};
 use crate::rtt::{RttService, RTT_TOPIC};
-use crate::serialization::{deserialize_values, serialize_values};
+use crate::serialization::{deserialize_values, schema_fingerprint, serialize_values, DecodeError};
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
-use crate::types::{to_field_map, Role};
+use crate::types::{to_value_maps, Action, Role, State, TypedValue};
 use crate::video::now_us;
 
 // --- Publisher ---
@@ -26,23 +31,34 @@ const PUBLISH_QUEUE_CAP: usize = 1024;
 /// at construction; `send` enqueues onto an mpsc channel, preserving ordering
 /// for reliable publishes and avoiding a task allocation per packet.
 pub(crate) struct DataPublisher {
-    fields: Vec<String>,
+    /// Owned schema. Referenced by every `send_map` call; never mutated after
+    /// construction.
+    schema: Vec<FieldSpec>,
+    /// Precomputed schema fingerprint, embedded in every outgoing packet.
+    fingerprint: u32,
     topic: String,
     reliable: bool,
     tx: mpsc::Sender<DataPacket>,
     task: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
     stream: DataStream,
-    // Per-field snapshot of the last sent value. `send_map` carries these
-    // forward when a caller supplies only a subset of the declared fields,
-    // so partial updates stay consistent with the robot's actual state.
-    // Seeded with 0.0, so fields never sent resolve to 0.
+    // Per-field snapshot of the last sent value, stored as f64 for lossless
+    // carry-forward. `send_map` carries these forward when a caller supplies
+    // only a subset of the declared fields, so partial updates stay
+    // consistent with the robot's actual state. Seeded with 0.0, so fields
+    // never sent resolve to 0.
     last_values: Mutex<Vec<f64>>,
+    /// Field indices already reported as saturating. Each field warns at
+    /// most once per publisher lifetime to keep the hot path quiet.
+    warned_saturated: Mutex<HashSet<usize>>,
+    /// Keys the caller sent that aren't in the schema. Logged once each so
+    /// typos are visible without spamming per packet.
+    warned_unknown_keys: Mutex<HashSet<String>>,
 }
 
 impl DataPublisher {
     pub fn new(
-        fields: Vec<String>,
+        schema: &[FieldSpec],
         topic: &str,
         reliable: bool,
         local_participant: LocalParticipant,
@@ -57,9 +73,12 @@ impl DataPublisher {
                 }
             }
         });
-        let last_values = Mutex::new(vec![0.0; fields.len()]);
+        let schema = schema.to_vec();
+        let fingerprint = schema_fingerprint(&schema);
+        let last_values = Mutex::new(vec![0.0; schema.len()]);
         Self {
-            fields,
+            schema,
+            fingerprint,
             topic: topic.to_string(),
             reliable,
             tx,
@@ -67,23 +86,42 @@ impl DataPublisher {
             metrics,
             stream,
             last_values,
+            warned_saturated: Mutex::new(HashSet::new()),
+            warned_unknown_keys: Mutex::new(HashSet::new()),
         }
     }
 
-    /// Send from a HashMap, reordering to declared field order. Missing fields
-    /// inherit their last sent value (0.0 if never sent) — partial updates
-    /// carry forward prior state instead of silently zeroing it.
+    /// Send from a map of typed values, reordering to declared field
+    /// order. Missing fields inherit their last sent value (0.0 if never
+    /// sent) — partial updates carry forward prior state instead of
+    /// silently zeroing it. Keys absent from the schema are logged once
+    /// per key, then ignored.
+    ///
+    /// Each value's `TypedValue` variant must match the declared dtype
+    /// for its field; a mismatch returns `PortalError::DtypeMismatch`
+    /// and no packet is sent. This rejects at the earliest point so a
+    /// bug in caller code fails loud instead of silently round-tripping
+    /// through an unintended cast.
+    ///
+    /// Typed values are widened to `f64` via `TypedValue::as_f64` before
+    /// carry-forward; the widening is lossless for every supported dtype.
     pub fn send_map(
         &self,
-        map: &HashMap<String, f64>,
+        map: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
+        self.check_dtypes(map)?;
+        self.warn_unknown_keys(map);
         let ts = timestamp_us.unwrap_or_else(now_us);
-        let payload = {
+        let (payload, saturated_indices) = {
             let mut last = self.last_values.lock();
-            apply_carry_forward(&self.fields, &mut last, map);
-            serialize_values(ts, &last)
+            apply_carry_forward(&self.schema, &mut last, map);
+            let out = serialize_values(self.fingerprint, ts, &last, &self.schema);
+            (out.payload, out.saturated_indices)
         };
+        if !saturated_indices.is_empty() {
+            self.warn_saturated(&saturated_indices);
+        }
         let packet = DataPacket {
             payload,
             topic: Some(self.topic.clone()),
@@ -108,14 +146,69 @@ impl DataPublisher {
         }
         Ok(())
     }
+
+    /// Reject on the first field whose `TypedValue` variant does not
+    /// match the declared dtype. Keys absent from the schema are ignored
+    /// here — they're already reported via `warn_unknown_keys`.
+    fn check_dtypes(&self, map: &HashMap<String, TypedValue>) -> PortalResult<()> {
+        for field in &self.schema {
+            if let Some(v) = map.get(&field.name) {
+                if v.dtype() != field.dtype {
+                    return Err(PortalError::DtypeMismatch {
+                        field: field.name.clone(),
+                        expected: field.dtype,
+                        got: v.variant_name(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn warn_unknown_keys(&self, map: &HashMap<String, TypedValue>) {
+        // Small schemas make a linear scan faster than a HashSet lookup.
+        for key in map.keys() {
+            if self.schema.iter().any(|f| &f.name == key) {
+                continue;
+            }
+            let mut warned = self.warned_unknown_keys.lock();
+            if warned.insert(key.clone()) {
+                log::warn!(
+                    "topic '{}': ignoring unknown field '{}' (not in schema)",
+                    self.topic,
+                    key
+                );
+            }
+        }
+    }
+
+    fn warn_saturated(&self, indices: &[usize]) {
+        let mut warned = self.warned_saturated.lock();
+        for &i in indices {
+            if warned.insert(i) {
+                let field = &self.schema[i];
+                log::warn!(
+                    "topic '{}': field '{}' saturated at {:?} (first occurrence)",
+                    self.topic,
+                    field.name,
+                    field.dtype
+                );
+            }
+        }
+    }
 }
 
 /// Update `last` in place with values from `map` for each declared field,
-/// leaving other slots untouched (carry-forward).
-fn apply_carry_forward(fields: &[String], last: &mut [f64], map: &HashMap<String, f64>) {
-    for (i, name) in fields.iter().enumerate() {
-        if let Some(&v) = map.get(name) {
-            last[i] = v;
+/// leaving other slots untouched (carry-forward). Typed values are
+/// lossless-widened to `f64` on the way in.
+fn apply_carry_forward(
+    schema: &[FieldSpec],
+    last: &mut [f64],
+    map: &HashMap<String, TypedValue>,
+) {
+    for (i, field) in schema.iter().enumerate() {
+        if let Some(v) = map.get(&field.name) {
+            last[i] = v.as_f64();
         }
     }
 }
@@ -130,34 +223,82 @@ impl Drop for DataPublisher {
 
 // --- Receiver (dispatches DataReceived events) ---
 
-pub(crate) type DataCb = Box<dyn Fn(u64, &HashMap<String, f64>) + Send + Sync>;
-
-/// Push callback + latest-wins slot for a single data stream (state or action),
-/// paired so receivers and getters share one allocation. The `u64` is the
-/// sender's wall-clock timestamp in microseconds, carried on the wire.
-pub(crate) struct DataSlots {
-    pub cb: Mutex<Option<DataCb>>,
-    pub latest: Mutex<Option<(u64, HashMap<String, f64>)>>,
+/// Push-callback + latest-wins slot for a single typed record (Action or
+/// State). Paired so receivers and getters share one allocation.
+pub(crate) struct DataSlot<R: Clone> {
+    pub cb: Mutex<Option<Box<dyn Fn(&R) + Send + Sync>>>,
+    pub latest: Mutex<Option<R>>,
+    /// Peer fingerprints already reported as mismatched. Logged once per
+    /// unique offender to surface schema drift without spamming.
+    warned_mismatches: Mutex<HashSet<u32>>,
 }
 
-impl DataSlots {
+impl<R: Clone> DataSlot<R> {
     pub fn new() -> Self {
-        Self { cb: Mutex::new(None), latest: Mutex::new(None) }
+        Self {
+            cb: Mutex::new(None),
+            latest: Mutex::new(None),
+            warned_mismatches: Mutex::new(HashSet::new()),
+        }
     }
 
-    /// Build the field map once, fire the callback by reference (no clone),
-    /// then hand ownership to the latest slot.
-    fn deliver(&self, timestamp_us: u64, fields: &[String], values: &[f64]) {
-        let map = to_field_map(fields, values);
+    /// Fire the callback by reference, then hand ownership to the
+    /// latest-wins slot.
+    ///
+    /// Callbacks run on a tokio worker thread; a panic inside user code
+    /// would abort that worker and kill the receive loop. Catching here
+    /// keeps the stream alive; the panic is logged and the latest slot
+    /// is still updated so pull-based getters continue to work.
+    fn deliver(&self, record: R) {
         if let Some(cb) = self.cb.lock().as_ref() {
-            cb(timestamp_us, &map);
+            let result = catch_unwind(AssertUnwindSafe(|| cb(&record)));
+            if result.is_err() {
+                log::error!("user callback panicked; receive loop continues");
+            }
         }
-        *self.latest.lock() = Some((timestamp_us, map));
+        *self.latest.lock() = Some(record);
+    }
+
+    pub fn get(&self) -> Option<R> {
+        self.latest.lock().clone()
     }
 
     pub fn clear(&self) {
         *self.latest.lock() = None;
     }
+
+    fn warn_mismatch(&self, topic: &str, expected: u32, got: u32) {
+        let mut warned = self.warned_mismatches.lock();
+        if warned.insert(got) {
+            log::warn!(
+                "topic '{topic}': dropping packet with schema fingerprint 0x{got:08x} (expected 0x{expected:08x}); peer's schema disagrees with ours"
+            );
+        }
+    }
+}
+
+pub(crate) type ActionSlot = DataSlot<Action>;
+pub(crate) type StateSlot = DataSlot<State>;
+
+/// Build an `Action` from the schema and the decoded f64 values. Kept
+/// here so `handle_data_received` and any test helpers share the same
+/// path.
+fn build_action(
+    timestamp_us: u64,
+    schema: &[FieldSpec],
+    values: &[f64],
+) -> Action {
+    let (typed, raw) = to_value_maps(schema, values);
+    Action { values: typed, raw_values: raw, timestamp_us }
+}
+
+fn build_state(
+    timestamp_us: u64,
+    schema: &[FieldSpec],
+    values: &[f64],
+) -> State {
+    let (typed, raw) = to_value_maps(schema, values);
+    State { values: typed, raw_values: raw, timestamp_us }
 }
 
 /// Handle a `DataReceived` event. Pushes into the sync buffer if applicable and
@@ -168,10 +309,12 @@ pub(crate) fn handle_data_received(
     payload: &[u8],
     topic: &str,
     config_role: Role,
-    action_fields: &[String],
-    state_fields: &[String],
-    action: &DataSlots,
-    state: &DataSlots,
+    action_schema: &[FieldSpec],
+    action_fp: u32,
+    state_schema: &[FieldSpec],
+    state_fp: u32,
+    action: &ActionSlot,
+    state: &StateSlot,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
     metrics: &MetricsRegistry,
     rtt: &RttService,
@@ -181,23 +324,37 @@ pub(crate) fn handle_data_received(
         return SyncOutput::empty();
     }
     match (config_role, topic) {
-        (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
-            Ok((send_ts, values)) => {
-                metrics.record_action_received(send_ts, now_us());
-                action.deliver(send_ts, action_fields, &values);
-            }
-            Err(e) => log::warn!("failed to deserialize action payload: {e}"),
-        },
-        (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
-            Ok((timestamp_us, values)) => {
-                metrics.record_state_received(timestamp_us, now_us());
-                state.deliver(timestamp_us, state_fields, &values);
-                if let Some(sb) = sync_buffer {
-                    return sb.lock().push_state(timestamp_us, values);
+        (Role::Robot, "portal_action") => {
+            match deserialize_values(payload, action_fp, action_schema) {
+                Ok((send_ts, values)) => {
+                    metrics.record_action_received(send_ts, now_us());
+                    action.deliver(build_action(send_ts, action_schema, &values));
+                }
+                Err(DecodeError::SchemaMismatch { expected, got }) => {
+                    action.warn_mismatch(topic, expected, got);
+                }
+                Err(DecodeError::Malformed(e)) => {
+                    log::warn!("failed to deserialize action payload: {e}");
                 }
             }
-            Err(e) => log::warn!("failed to deserialize state payload: {e}"),
-        },
+        }
+        (Role::Operator, "portal_state") => {
+            match deserialize_values(payload, state_fp, state_schema) {
+                Ok((timestamp_us, values)) => {
+                    metrics.record_state_received(timestamp_us, now_us());
+                    state.deliver(build_state(timestamp_us, state_schema, &values));
+                    if let Some(sb) = sync_buffer {
+                        return sb.lock().push_state(timestamp_us, values);
+                    }
+                }
+                Err(DecodeError::SchemaMismatch { expected, got }) => {
+                    state.warn_mismatch(topic, expected, got);
+                }
+                Err(DecodeError::Malformed(e)) => {
+                    log::warn!("failed to deserialize state payload: {e}");
+                }
+            }
+        }
         _ => {}
     }
     SyncOutput::empty()
@@ -209,22 +366,93 @@ mod tests {
 
     #[test]
     fn carry_forward_fills_missing_fields() {
-        let fields =
-            vec!["j1".to_string(), "j2".to_string(), "j3".to_string()];
+        let schema = vec![
+            FieldSpec::new("j1", DType::F64),
+            FieldSpec::new("j2", DType::F64),
+            FieldSpec::new("j3", DType::F64),
+        ];
         let mut last = vec![0.0; 3];
 
-        let m: HashMap<_, _> = [("j1".to_string(), 1.0)].into_iter().collect();
-        apply_carry_forward(&fields, &mut last, &m);
+        let m: HashMap<String, TypedValue> =
+            [("j1".to_string(), TypedValue::F64(1.0))].into_iter().collect();
+        apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![1.0, 0.0, 0.0], "unsent fields start at seed (0.0)");
 
-        let m: HashMap<_, _> = [("j2".to_string(), 2.5)].into_iter().collect();
-        apply_carry_forward(&fields, &mut last, &m);
+        let m: HashMap<String, TypedValue> =
+            [("j2".to_string(), TypedValue::F64(2.5))].into_iter().collect();
+        apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![1.0, 2.5, 0.0], "j1 carries forward; j2 updates; j3 still at seed");
 
-        let m: HashMap<_, _> =
-            [("j1".to_string(), -1.0), ("j3".to_string(), 7.0)].into_iter().collect();
-        apply_carry_forward(&fields, &mut last, &m);
+        let m: HashMap<String, TypedValue> = [
+            ("j1".to_string(), TypedValue::F64(-1.0)),
+            ("j3".to_string(), TypedValue::F64(7.0)),
+        ]
+        .into_iter()
+        .collect();
+        apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![-1.0, 2.5, 7.0], "j2 carries forward when omitted; others update");
     }
 
+    #[test]
+    fn check_dtypes_rejects_variant_mismatch() {
+        // A publisher is heavy to spin up (needs a live LocalParticipant),
+        // but the core logic of `check_dtypes` only needs the schema and
+        // the input map. Exercise the free function directly on a fake
+        // publisher-like setup.
+        fn check(
+            schema: &[FieldSpec],
+            map: &HashMap<String, TypedValue>,
+        ) -> Result<(), (String, DType, &'static str)> {
+            for field in schema {
+                if let Some(v) = map.get(&field.name) {
+                    if v.dtype() != field.dtype {
+                        return Err((field.name.clone(), field.dtype, v.variant_name()));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let schema = vec![
+            FieldSpec::new("gripper", DType::Bool),
+            FieldSpec::new("mode", DType::I8),
+        ];
+
+        // Correct variants pass.
+        let m: HashMap<String, TypedValue> = [
+            ("gripper".to_string(), TypedValue::Bool(true)),
+            ("mode".to_string(), TypedValue::I8(3)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(check(&schema, &m).is_ok());
+
+        // Wrong variant for gripper.
+        let m: HashMap<String, TypedValue> =
+            [("gripper".to_string(), TypedValue::F32(1.0))].into_iter().collect();
+        let err = check(&schema, &m).unwrap_err();
+        assert_eq!(err.0, "gripper");
+        assert_eq!(err.1, DType::Bool);
+        assert_eq!(err.2, "F32");
+    }
+
+    #[test]
+    fn typed_inputs_widen_to_f64_losslessly() {
+        let schema = vec![
+            FieldSpec::new("joint", DType::F32),
+            FieldSpec::new("gripper", DType::Bool),
+            FieldSpec::new("mode", DType::I8),
+        ];
+        let mut last = vec![0.0; 3];
+
+        let m: HashMap<String, TypedValue> = [
+            ("joint".to_string(), 0.5f32.into()),
+            ("gripper".to_string(), true.into()),
+            ("mode".to_string(), 3i8.into()),
+        ]
+        .into_iter()
+        .collect();
+        apply_carry_forward(&schema, &mut last, &m);
+        assert_eq!(last, vec![0.5, 1.0, 3.0]);
+    }
 }

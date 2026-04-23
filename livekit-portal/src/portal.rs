@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,18 +8,19 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::PortalConfig;
-use crate::data::{handle_data_received, DataPublisher, DataSlots};
+use crate::config::{FieldSpec, PortalConfig};
+use crate::data::{handle_data_received, ActionSlot, DataPublisher, StateSlot};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rpc::RpcHandler;
 use crate::rtt::RttService;
+use crate::serialization::schema_fingerprint;
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
 
 type ObservationCb = Box<dyn Fn(&Observation) + Send + Sync>;
-type DropCb = Box<dyn Fn(Vec<HashMap<String, f64>>) + Send + Sync>;
+type DropCb = Box<dyn Fn(Vec<HashMap<String, TypedValue>>) + Send + Sync>;
 
 /// Drains the buffers returned by `SyncBuffer::push_*` and dispatches them to
 /// the user — callback first (by reference, no clone), then into the pull-based
@@ -44,12 +46,20 @@ impl ObservationSink {
     pub(crate) fn dispatch(&self, output: SyncOutput) {
         let SyncOutput { observations, drops } = output;
 
+        // User callbacks run on the tokio worker dispatching room events.
+        // A panic here would abort the whole event loop, so we catch and
+        // log and keep going.
         if !observations.is_empty() {
             {
                 let cb_slot = self.observation_cb.lock();
                 if let Some(cb) = cb_slot.as_ref() {
                     for obs in &observations {
-                        cb(obs);
+                        let result = catch_unwind(AssertUnwindSafe(|| cb(obs)));
+                        if result.is_err() {
+                            log::error!(
+                                "observation callback panicked; event loop continues"
+                            );
+                        }
                     }
                 }
             }
@@ -62,7 +72,10 @@ impl ObservationSink {
 
         if !drops.is_empty() {
             if let Some(cb) = self.drop_cb.lock().as_ref() {
-                cb(drops);
+                let result = catch_unwind(AssertUnwindSafe(|| cb(drops)));
+                if result.is_err() {
+                    log::error!("drop callback panicked; event loop continues");
+                }
             }
         }
     }
@@ -118,8 +131,8 @@ pub struct Portal {
     obs_sink: Arc<ObservationSink>,
 
     // Push callback + pull latest-wins slot, bundled per stream.
-    action: Arc<DataSlots>,
-    state: Arc<DataSlots>,
+    action: Arc<ActionSlot>,
+    state: Arc<StateSlot>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
 
@@ -162,8 +175,8 @@ impl Portal {
             action_publisher: Mutex::new(None),
             sync_buffer: Mutex::new(None),
             obs_sink,
-            action: Arc::new(DataSlots::new()),
-            state: Arc::new(DataSlots::new()),
+            action: Arc::new(ActionSlot::new()),
+            state: Arc::new(StateSlot::new()),
             video_tracks,
             metrics,
             peer_identity: Arc::new(Mutex::new(None)),
@@ -210,8 +223,12 @@ impl Portal {
 
         // Event dispatch runs off a snapshot of the fields it touches, not the
         // whole Portal, so it doesn't need any outer lock.
+        let action_schema_fp = schema_fingerprint(&self.config.action_schema);
+        let state_schema_fp = schema_fingerprint(&self.config.state_schema);
         let ctx = EventContext {
             config: self.config.clone(),
+            action_schema_fp,
+            state_schema_fp,
             sync_buffer: self.sync_buffer.lock().clone(),
             obs_sink: self.obs_sink.clone(),
             action: self.action.clone(),
@@ -254,9 +271,13 @@ impl Portal {
         publisher.send_frame(rgb_data, width, height, timestamp_us)
     }
 
+    /// Publish a state sample (robot only). Values are typed — build the
+    /// map with `TypedValue::Bool(true)`, `0.5f32.into()`, etc. The
+    /// pipeline internally widens to `f64` for carry-forward and casts
+    /// back to the declared dtype at the wire boundary.
     pub fn send_state(
         &self,
-        values: &HashMap<String, f64>,
+        values: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         let publisher = self
@@ -267,9 +288,10 @@ impl Portal {
         publisher.send_map(values, timestamp_us)
     }
 
+    /// Publish an action (operator only). Same ergonomics as `send_state`.
     pub fn send_action(
         &self,
-        values: &HashMap<String, f64>,
+        values: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         let publisher =
@@ -278,6 +300,18 @@ impl Portal {
     }
 
     // --- RPC ---
+
+    /// Declared state schema (field names + dtypes), in declaration order.
+    /// Bindings mirror this snapshot internally; reading from the Portal
+    /// keeps the snapshot single-sourced.
+    pub fn state_schema(&self) -> &[FieldSpec] {
+        self.config.state_schema()
+    }
+
+    /// Declared action schema, same semantics as `state_schema`.
+    pub fn action_schema(&self) -> &[FieldSpec] {
+        self.config.action_schema()
+    }
 
     /// Identity of the opposite-role participant Portal has identified, if
     /// any. Latches on the first Portal-topic data packet or video track
@@ -428,16 +462,17 @@ impl Portal {
         self.obs_sink.get()
     }
 
-    /// Clone of the latest action received (Robot side), or `None`. The
-    /// `u64` is the sender's wall-clock timestamp in microseconds.
-    pub fn get_action(&self) -> Option<(u64, HashMap<String, f64>)> {
-        self.action.latest.lock().clone()
+    /// Clone of the latest action received (Robot side), or `None`.
+    /// `.values` holds typed values per the declared schema; `.raw_values`
+    /// is the lossless `f64` view.
+    pub fn get_action(&self) -> Option<Action> {
+        self.action.get()
     }
 
-    /// Clone of the latest state received (Operator side), or `None`. The
-    /// `u64` is the sender's wall-clock timestamp in microseconds.
-    pub fn get_state(&self) -> Option<(u64, HashMap<String, f64>)> {
-        self.state.latest.lock().clone()
+    /// Clone of the latest state received (Operator side), or `None`.
+    /// Typed per the declared schema.
+    pub fn get_state(&self) -> Option<State> {
+        self.state.get()
     }
 
     /// Clone of the latest frame received for `track_name`, or `None`.
@@ -447,10 +482,10 @@ impl Portal {
 
     // --- Callback registration (push API) ---
 
-    pub fn on_action(
-        &self,
-        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
-    ) {
+    /// Fire on every received action. The `Action` record exposes typed
+    /// values per the declared schema plus `raw_values` for the lossless
+    /// `f64` view.
+    pub fn on_action(&self, callback: impl Fn(&Action) + Send + Sync + 'static) {
         *self.action.cb.lock() = Some(Box::new(callback));
     }
 
@@ -458,10 +493,8 @@ impl Portal {
         self.obs_sink.set_observation_cb(Box::new(callback));
     }
 
-    pub fn on_state(
-        &self,
-        callback: impl Fn(u64, &HashMap<String, f64>) + Send + Sync + 'static,
-    ) {
+    /// Fire on every received state. Semantics mirror `on_action`.
+    pub fn on_state(&self, callback: impl Fn(&State) + Send + Sync + 'static) {
         *self.state.cb.lock() = Some(Box::new(callback));
     }
 
@@ -478,7 +511,13 @@ impl Portal {
         }
     }
 
-    pub fn on_drop(&self, callback: impl Fn(Vec<HashMap<String, f64>>) + Send + Sync + 'static) {
+    /// Fire on every batch of state samples that couldn't be matched to a
+    /// video frame. Each entry is the typed state payload (same shape as
+    /// `Observation.state`).
+    pub fn on_drop(
+        &self,
+        callback: impl Fn(Vec<HashMap<String, TypedValue>>) + Send + Sync + 'static,
+    ) {
         self.obs_sink.set_drop_cb(Box::new(callback));
     }
 
@@ -503,9 +542,9 @@ impl Portal {
             self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
         }
 
-        if !self.config.state_fields.is_empty() {
+        if !self.config.state_schema.is_empty() {
             let publisher = DataPublisher::new(
-                self.config.state_fields.clone(),
+                &self.config.state_schema,
                 "portal_state",
                 self.config.state_reliable,
                 lp.clone(),
@@ -516,7 +555,7 @@ impl Portal {
             log::info!(
                 "[{}] ready to publish state via {mode} data ({} fields)",
                 self.config.session,
-                self.config.state_fields.len()
+                self.config.state_schema.len()
             );
             *self.state_publisher.lock() = Some(Arc::new(publisher));
         }
@@ -529,21 +568,21 @@ impl Portal {
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &self.config.video_tracks,
-            self.config.state_fields.clone(),
+            self.config.state_schema.clone(),
             self.config.sync_config(),
             self.metrics.clone(),
         )));
         *self.sync_buffer.lock() = Some(sync_buffer);
 
-        if !self.config.action_fields.is_empty() {
+        if !self.config.action_schema.is_empty() {
             let mode = if self.config.action_reliable { "reliable" } else { "unreliable" };
             log::info!(
                 "[{}] ready to publish action via {mode} data ({} fields)",
                 self.config.session,
-                self.config.action_fields.len()
+                self.config.action_schema.len()
             );
             let publisher = DataPublisher::new(
-                self.config.action_fields.clone(),
+                &self.config.action_schema,
                 "portal_action",
                 self.config.action_reliable,
                 lp,
@@ -589,10 +628,15 @@ fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandle
 /// Portal-level lock on the hot path.
 struct EventContext {
     config: PortalConfig,
+    /// Cached schema fingerprints so the receive hot path doesn't recompute
+    /// them per packet. Matches the peer's fingerprint when schemas agree;
+    /// a mismatch logs once per offending value and drops the packet.
+    action_schema_fp: u32,
+    state_schema_fp: u32,
     sync_buffer: Option<Arc<Mutex<SyncBuffer>>>,
     obs_sink: Arc<ObservationSink>,
-    action: Arc<DataSlots>,
-    state: Arc<DataSlots>,
+    action: Arc<ActionSlot>,
+    state: Arc<StateSlot>,
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
     metrics: Arc<MetricsRegistry>,
@@ -669,8 +713,10 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 &payload,
                 &topic,
                 ctx.config.role,
-                &ctx.config.action_fields,
-                &ctx.config.state_fields,
+                &ctx.config.action_schema,
+                ctx.action_schema_fp,
+                &ctx.config.state_schema,
+                ctx.state_schema_fp,
                 &ctx.action,
                 &ctx.state,
                 ctx.sync_buffer.as_ref(),

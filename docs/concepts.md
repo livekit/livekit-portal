@@ -13,8 +13,9 @@ Portal is a **two-role** system. Each side commits to one role at
 | `Role.ROBOT` | video frames, state | actions |
 | `Role.OPERATOR` | actions | video frames + state → **synced observations** |
 
-Both sides register the same schema (`add_video`, `add_state`, `add_action`).
-Field names and camera names must match across sides.
+Both sides register the same schema via `add_video`, `add_state_typed`, and
+`add_action_typed`. Field names, per-field dtypes, and camera names must
+match across sides.
 
 ## The observation model
 

@@ -1,15 +1,21 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use crate::config::FieldSpec;
 use crate::metrics::MetricsRegistry;
 use crate::types::*;
+
+#[cfg(test)]
+use crate::dtype::DType;
 
 /// Result of a `push_frame` / `push_state` call. Callers dispatch these
 /// (invoke callbacks, enqueue into the pull-based buffer) *after* releasing
 /// the SyncBuffer lock so slow consumers don't stall the hot path.
 pub(crate) struct SyncOutput {
     pub observations: Vec<Observation>,
-    pub drops: Vec<HashMap<String, f64>>,
+    /// State samples that could not be matched to a video frame. Typed
+    /// per the declared state schema, same shape as `Observation.state`.
+    pub drops: Vec<HashMap<String, TypedValue>>,
 }
 
 impl SyncOutput {
@@ -28,7 +34,9 @@ pub(crate) struct SyncBuffer {
     // Parallel to `track_names`; indexed by track position.
     video_buffers: Vec<VecDeque<Arc<VideoFrameData>>>,
     state_buffer: VecDeque<(u64, Vec<f64>)>, // (timestamp_us, values)
-    state_fields: Vec<String>,
+    /// State schema — field names and their declared dtypes. Used to
+    /// reconstruct typed values into each `Observation` emitted.
+    state_schema: Vec<FieldSpec>,
     config: SyncConfig,
 
     // Per-track cursor: the largest index whose frame ts is <= head state ts
@@ -50,7 +58,7 @@ pub(crate) struct SyncBuffer {
 impl SyncBuffer {
     pub fn new(
         video_track_names: &[String],
-        state_fields: Vec<String>,
+        state_schema: Vec<FieldSpec>,
         config: SyncConfig,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
@@ -65,13 +73,21 @@ impl SyncBuffer {
             track_index,
             video_buffers,
             state_buffer: VecDeque::new(),
-            state_fields,
+            state_schema,
             config,
             cursors,
             blocker: None,
             matched_scratch,
             metrics,
         }
+    }
+
+    /// Build the typed state map once per emission. Separate so the two
+    /// call sites (overflow drop and sync emit) stay in lockstep, and
+    /// distinctly named to avoid shadowing the conceptual "typed state"
+    /// field on `Observation`.
+    fn build_typed_state_map(&self, values: &[f64]) -> HashMap<String, TypedValue> {
+        to_value_maps(&self.state_schema, values).0
     }
 
     pub fn push_frame(&mut self, track_name: &str, frame: Arc<VideoFrameData>) -> SyncOutput {
@@ -119,10 +135,10 @@ impl SyncBuffer {
         let old_head_ts = self.state_buffer.front().map(|(ts, _)| *ts);
         self.state_buffer.push_back((timestamp_us, values));
 
-        let mut overflow_drops: Vec<HashMap<String, f64>> = Vec::new();
+        let mut overflow_drops: Vec<HashMap<String, TypedValue>> = Vec::new();
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
             let (_, vals) = self.state_buffer.pop_front().unwrap();
-            overflow_drops.push(to_field_map(&self.state_fields, &vals));
+            overflow_drops.push(self.build_typed_state_map(&vals));
         }
         if !overflow_drops.is_empty() {
             self.metrics.record_state_dropped(overflow_drops.len() as u64);
@@ -258,7 +274,7 @@ impl SyncBuffer {
             if should_drop {
                 log::warn!("dropping unsyncable state (no matching video frames within range)");
                 let (_, values) = self.state_buffer.pop_front().unwrap();
-                output.drops.push(to_field_map(&self.state_fields, &values));
+                output.drops.push(self.build_typed_state_map(&values));
                 self.metrics.record_state_dropped(1);
                 // Retry next state with fresh iteration.
                 continue;
@@ -293,8 +309,10 @@ impl SyncBuffer {
                 }
             }
 
+            let (typed_state, raw_state) = to_value_maps(&self.state_schema, &values);
             output.observations.push(Observation {
-                state: to_field_map(&self.state_fields, &values),
+                state: typed_state,
+                raw_state,
                 frames: frames_map,
                 timestamp_us: ts,
             });
@@ -337,7 +355,11 @@ mod tests {
 
     fn mk(names: &[String], fields: Vec<String>, config: SyncConfig) -> SyncBuffer {
         let metrics = Arc::new(MetricsRegistry::new(names));
-        SyncBuffer::new(names, fields, config, metrics)
+        // Tests were written before typed fields — default every name to F64
+        // so the internal observation builder has a dtype per position.
+        let schema: Vec<FieldSpec> =
+            fields.into_iter().map(|n| FieldSpec::new(n, DType::F64)).collect();
+        SyncBuffer::new(names, schema, config, metrics)
     }
 
     #[test]
@@ -351,8 +373,8 @@ mod tests {
         let out = buf.push_state(1010, vec![1.0, 2.0]);
         assert_eq!(out.observations.len(), 1);
         let obs = &out.observations[0];
-        assert_eq!(obs.state["j1"], 1.0);
-        assert_eq!(obs.state["j2"], 2.0);
+        assert_eq!(obs.state["j1"], TypedValue::F64(1.0));
+        assert_eq!(obs.state["j2"], TypedValue::F64(2.0));
         assert_eq!(obs.timestamp_us, 1010);
     }
 
@@ -381,7 +403,7 @@ mod tests {
         let out = push_f(&mut buf, "cam1", 200_000);
         assert!(out.observations.is_empty());
         assert_eq!(out.drops.len(), 1);
-        assert_eq!(out.drops[0]["j1"], 1.0);
+        assert_eq!(out.drops[0]["j1"], TypedValue::F64(1.0));
     }
 
     #[test]
@@ -548,12 +570,12 @@ mod tests {
         let out = buf.push_state(2_000, vec![2.0]);
         assert!(out.observations.is_empty());
         assert_eq!(out.drops.len(), 1);
-        assert_eq!(out.drops[0]["j1"], 1.0);
+        assert_eq!(out.drops[0]["j1"], TypedValue::F64(1.0));
 
         // Only the second state remains. A frame matching it fires the obs.
         let out = push_f(&mut buf, "cam1", 2_005);
         assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].state["j1"], 2.0, "evicted state should not leak through");
+        assert_eq!(out.observations[0].state["j1"], TypedValue::F64(2.0), "evicted state should not leak through");
         assert_eq!(out.observations[0].timestamp_us, 2_000);
     }
 
@@ -617,7 +639,7 @@ mod tests {
         // Third push triggers overflow; state@100 must appear in drops.
         let out = buf.push_state(300, vec![3.0]);
         assert_eq!(out.drops.len(), 1);
-        assert_eq!(out.drops[0]["j1"], 1.0);
+        assert_eq!(out.drops[0]["j1"], TypedValue::F64(1.0));
     }
 
     /// With a widened range (>1 tick), a state whose exact frame was lost
@@ -673,9 +695,9 @@ mod tests {
         // state@33_333 then matches its own frame.
         let out = push_f(&mut buf, "cam1", 100_000);
         assert_eq!(out.drops.len(), 1, "state@0 drops once its horizon is crossed");
-        assert_eq!(out.drops[0]["j1"], 1.0);
+        assert_eq!(out.drops[0]["j1"], TypedValue::F64(1.0));
         assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].state["j1"], 2.0);
+        assert_eq!(out.observations[0].state["j1"], TypedValue::F64(2.0));
         assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 33_333);
     }
 

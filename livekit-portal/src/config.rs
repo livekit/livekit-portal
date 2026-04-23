@@ -1,4 +1,35 @@
+use crate::dtype::DType;
 use crate::types::{Role, SyncConfig};
+
+/// A single schema entry: field name plus declared on-wire dtype.
+///
+/// Named for parity with the UniFFI-facing `FieldSpec` record the
+/// bindings expose. Tuple form `(name, dtype)` is still accepted by the
+/// `add_*_typed` methods — `FieldSpec` is the self-documenting
+/// alternative.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldSpec {
+    pub name: String,
+    pub dtype: DType,
+}
+
+impl FieldSpec {
+    pub fn new(name: impl Into<String>, dtype: DType) -> Self {
+        Self { name: name.into(), dtype }
+    }
+}
+
+impl<S: Into<String>> From<(S, DType)> for FieldSpec {
+    fn from((name, dtype): (S, DType)) -> Self {
+        Self { name: name.into(), dtype }
+    }
+}
+
+impl From<FieldSpec> for (String, DType) {
+    fn from(f: FieldSpec) -> Self {
+        (f.name, f.dtype)
+    }
+}
 
 /// Configuration for a Portal session. Built incrementally before connecting.
 #[derive(Debug, Clone)]
@@ -6,8 +37,8 @@ pub struct PortalConfig {
     pub(crate) session: String,
     pub(crate) role: Role,
     pub(crate) video_tracks: Vec<String>,
-    pub(crate) state_fields: Vec<String>,
-    pub(crate) action_fields: Vec<String>,
+    pub(crate) state_schema: Vec<FieldSpec>,
+    pub(crate) action_schema: Vec<FieldSpec>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
     pub(crate) fps: u32,
@@ -22,8 +53,8 @@ impl PortalConfig {
             session: session.into(),
             role,
             video_tracks: Vec::new(),
-            state_fields: Vec::new(),
-            action_fields: Vec::new(),
+            state_schema: Vec::new(),
+            action_schema: Vec::new(),
             state_reliable: true,
             action_reliable: true,
             fps: 30,
@@ -37,12 +68,30 @@ impl PortalConfig {
         self.video_tracks.push(name.into());
     }
 
-    pub fn add_state(&mut self, fields: &[&str]) {
-        self.state_fields.extend(fields.iter().map(|s| s.to_string()));
+    /// Declare state fields with per-field dtype. Order is significant and
+    /// must match on both peers. Appends to any previous declaration.
+    ///
+    /// Accepts anything iterable yielding a `FieldSpec` or anything
+    /// convertible to one — `&[(&str, DType)]`, `[FieldSpec, ...]`,
+    /// `Vec<(String, DType)>`, mapped iterators.
+    pub fn add_state_typed<F, I>(&mut self, schema: I)
+    where
+        F: Into<FieldSpec>,
+        I: IntoIterator<Item = F>,
+    {
+        self.state_schema.extend(schema.into_iter().map(Into::into));
     }
 
-    pub fn add_action(&mut self, fields: &[&str]) {
-        self.action_fields.extend(fields.iter().map(|s| s.to_string()));
+    /// Declare action fields with per-field dtype. Order is significant and
+    /// must match on both peers. Appends to any previous declaration.
+    ///
+    /// Same input flexibility as `add_state_typed`.
+    pub fn add_action_typed<F, I>(&mut self, schema: I)
+    where
+        F: Into<FieldSpec>,
+        I: IntoIterator<Item = F>,
+    {
+        self.action_schema.extend(schema.into_iter().map(Into::into));
     }
 
     /// Unified observation rate (set to the video capture rate if state and
@@ -98,12 +147,26 @@ impl PortalConfig {
         &self.video_tracks
     }
 
-    pub fn state_fields(&self) -> &[String] {
-        &self.state_fields
+    /// Ordered state field names. Derived from `state_schema`; does not
+    /// allocate.
+    pub fn state_fields(&self) -> impl Iterator<Item = &str> {
+        self.state_schema.iter().map(|f| f.name.as_str())
     }
 
-    pub fn action_fields(&self) -> &[String] {
-        &self.action_fields
+    /// Ordered action field names. Derived from `action_schema`; does not
+    /// allocate.
+    pub fn action_fields(&self) -> impl Iterator<Item = &str> {
+        self.action_schema.iter().map(|f| f.name.as_str())
+    }
+
+    /// Full state schema.
+    pub fn state_schema(&self) -> &[FieldSpec] {
+        &self.state_schema
+    }
+
+    /// Full action schema.
+    pub fn action_schema(&self) -> &[FieldSpec] {
+        &self.action_schema
     }
 
     /// Derived sync config used internally by the sync buffer. Not public.
