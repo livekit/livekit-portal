@@ -1,4 +1,8 @@
+use crate::dtype::DType;
 use crate::types::{Role, SyncConfig};
+
+/// A single field declaration: name plus on-wire dtype.
+pub type FieldSchema = (String, DType);
 
 /// Configuration for a Portal session. Built incrementally before connecting.
 #[derive(Debug, Clone)]
@@ -6,8 +10,8 @@ pub struct PortalConfig {
     pub(crate) session: String,
     pub(crate) role: Role,
     pub(crate) video_tracks: Vec<String>,
-    pub(crate) state_fields: Vec<String>,
-    pub(crate) action_fields: Vec<String>,
+    pub(crate) state_schema: Vec<FieldSchema>,
+    pub(crate) action_schema: Vec<FieldSchema>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
     pub(crate) fps: u32,
@@ -22,8 +26,8 @@ impl PortalConfig {
             session: session.into(),
             role,
             video_tracks: Vec::new(),
-            state_fields: Vec::new(),
-            action_fields: Vec::new(),
+            state_schema: Vec::new(),
+            action_schema: Vec::new(),
             state_reliable: true,
             action_reliable: true,
             fps: 30,
@@ -37,12 +41,16 @@ impl PortalConfig {
         self.video_tracks.push(name.into());
     }
 
-    pub fn add_state(&mut self, fields: &[&str]) {
-        self.state_fields.extend(fields.iter().map(|s| s.to_string()));
+    /// Declare state fields with per-field dtype. Order is significant and
+    /// must match on both peers.
+    pub fn add_state_typed(&mut self, schema: &[(&str, DType)]) {
+        self.state_schema.extend(schema.iter().map(|(n, d)| (n.to_string(), *d)));
     }
 
-    pub fn add_action(&mut self, fields: &[&str]) {
-        self.action_fields.extend(fields.iter().map(|s| s.to_string()));
+    /// Declare action fields with per-field dtype. Order is significant and
+    /// must match on both peers.
+    pub fn add_action_typed(&mut self, schema: &[(&str, DType)]) {
+        self.action_schema.extend(schema.iter().map(|(n, d)| (n.to_string(), *d)));
     }
 
     /// Unified observation rate (set to the video capture rate if state and
@@ -98,12 +106,24 @@ impl PortalConfig {
         &self.video_tracks
     }
 
-    pub fn state_fields(&self) -> &[String] {
-        &self.state_fields
+    /// Ordered state field names. Derived from `state_schema`.
+    pub fn state_fields(&self) -> Vec<String> {
+        self.state_schema.iter().map(|(n, _)| n.clone()).collect()
     }
 
-    pub fn action_fields(&self) -> &[String] {
-        &self.action_fields
+    /// Ordered action field names. Derived from `action_schema`.
+    pub fn action_fields(&self) -> Vec<String> {
+        self.action_schema.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// Full state schema (name + dtype).
+    pub fn state_schema(&self) -> &[FieldSchema] {
+        &self.state_schema
+    }
+
+    /// Full action schema (name + dtype).
+    pub fn action_schema(&self) -> &[FieldSchema] {
+        &self.action_schema
     }
 
     /// Derived sync config used internally by the sync buffer. Not public.

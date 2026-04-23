@@ -14,12 +14,13 @@ import asyncio
 import math
 import time
 
-from livekit.portal import Observation, Portal, PortalConfig, Role
+from livekit.portal import DType, Observation, Portal, PortalConfig, Role
 from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
 
 IDENTITY = "teleoperator"
 TRACK_NAME = "cam1"
 STATE_FIELDS = ["j1", "j2", "j3"]
+STATE_SCHEMA = [(name, DType.F64) for name in STATE_FIELDS]
 
 
 async def main() -> None:
@@ -32,8 +33,8 @@ async def main() -> None:
 
     cfg = PortalConfig(room, Role.OPERATOR)
     cfg.add_video(TRACK_NAME)
-    cfg.add_state(STATE_FIELDS)
-    cfg.add_action(STATE_FIELDS)
+    cfg.add_state_typed(STATE_SCHEMA)
+    cfg.add_action_typed(STATE_SCHEMA)
     cfg.set_fps(fps)
 
     portal = Portal(cfg)

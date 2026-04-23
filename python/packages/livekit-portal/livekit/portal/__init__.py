@@ -26,7 +26,7 @@ import asyncio
 import logging
 import threading
 import traceback
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 _log = logging.getLogger(__name__)
 
@@ -37,6 +37,8 @@ from ._frame import i420_bytes_to_numpy_rgb
 # Re-export generated types. The UniFFI module is the source of truth for
 # class identity — wrapping them here would force duplicate isinstance checks.
 Role = _ffi.Role
+DType = _ffi.DType
+FieldSpec = _ffi.FieldSpec
 Observation = _ffi.Observation
 Action = _ffi.Action
 State = _ffi.State
@@ -49,6 +51,22 @@ RttMetrics = _ffi.RttMetrics
 PortalError = _ffi.PortalError
 RpcInvocationData = _ffi.RpcInvocationData
 RpcError = _ffi.RpcError
+
+# A schema entry accepted by add_state_typed/add_action_typed. Either a
+# FieldSpec (record passthrough) or a (name, dtype) tuple — the latter is the
+# natural Python shape.
+SchemaEntry = Any  # Tuple[str, DType] | FieldSpec
+
+
+def _to_field_specs(schema: Iterable[SchemaEntry]) -> List[FieldSpec]:
+    out: List[FieldSpec] = []
+    for entry in schema:
+        if isinstance(entry, FieldSpec):
+            out.append(entry)
+        else:
+            name, dtype = entry
+            out.append(FieldSpec(name=name, dtype=dtype))
+    return out
 
 
 # --- Dispatcher -------------------------------------------------------------
@@ -212,9 +230,10 @@ class _RpcHandlerAdapter(_ffi.RpcHandler):
 class PortalConfig:
     """Builder for a Portal session.
 
-    Mirrors the old protobuf-wrapper API so existing callers keep working.
-    State (`video_tracks`, `state_fields`, `action_fields`) is mirrored in
+    State (`video_tracks`, `state_schema`, `action_schema`) is mirrored in
     Python for fast lookup — the Rust side owns the authoritative copy.
+    Use `add_state_typed` / `add_action_typed` with `(name, DType)` pairs to
+    declare fields.
     """
 
     __slots__ = (
@@ -222,8 +241,8 @@ class PortalConfig:
         "_session",
         "_role",
         "_video_tracks",
-        "_state_fields",
-        "_action_fields",
+        "_state_schema",
+        "_action_schema",
     )
 
     def __init__(self, session: str, role: Role) -> None:
@@ -231,8 +250,8 @@ class PortalConfig:
         self._session = session
         self._role = role
         self._video_tracks: List[str] = []
-        self._state_fields: List[str] = []
-        self._action_fields: List[str] = []
+        self._state_schema: List[Tuple[str, DType]] = []
+        self._action_schema: List[Tuple[str, DType]] = []
 
     @property
     def session(self) -> str:
@@ -248,23 +267,43 @@ class PortalConfig:
 
     @property
     def state_fields(self) -> List[str]:
-        return list(self._state_fields)
+        return [name for name, _ in self._state_schema]
 
     @property
     def action_fields(self) -> List[str]:
-        return list(self._action_fields)
+        return [name for name, _ in self._action_schema]
+
+    @property
+    def state_schema(self) -> List[Tuple[str, DType]]:
+        return list(self._state_schema)
+
+    @property
+    def action_schema(self) -> List[Tuple[str, DType]]:
+        return list(self._action_schema)
 
     def add_video(self, name: str) -> None:
         self._inner.add_video(name)
         self._video_tracks.append(name)
 
-    def add_state(self, fields: List[str]) -> None:
-        self._inner.add_state(list(fields))
-        self._state_fields.extend(fields)
+    def add_state_typed(self, schema: Iterable[SchemaEntry]) -> None:
+        """Declare state fields with per-field dtype.
 
-    def add_action(self, fields: List[str]) -> None:
-        self._inner.add_action(list(fields))
-        self._action_fields.extend(fields)
+        Accepts an iterable of `(name, DType)` tuples or `FieldSpec` records.
+        Order is significant and must match on both peers.
+        """
+        specs = _to_field_specs(schema)
+        self._inner.add_state_typed(specs)
+        self._state_schema.extend((s.name, s.dtype) for s in specs)
+
+    def add_action_typed(self, schema: Iterable[SchemaEntry]) -> None:
+        """Declare action fields with per-field dtype.
+
+        Accepts an iterable of `(name, DType)` tuples or `FieldSpec` records.
+        Order is significant and must match on both peers.
+        """
+        specs = _to_field_specs(schema)
+        self._inner.add_action_typed(specs)
+        self._action_schema.extend((s.name, s.dtype) for s in specs)
 
     def set_fps(self, fps: int) -> None:
         self._inner.set_fps(fps)
@@ -465,6 +504,8 @@ class Portal:
 
 __all__ = [
     "Role",
+    "DType",
+    "FieldSpec",
     "PortalConfig",
     "Portal",
     "Observation",

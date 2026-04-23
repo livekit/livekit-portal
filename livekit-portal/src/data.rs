@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::dtype::DType;
 use crate::error::PortalResult;
 use crate::metrics::{DataStream, MetricsRegistry};
 use crate::rtt::{RttService, RTT_TOPIC};
@@ -27,22 +28,24 @@ const PUBLISH_QUEUE_CAP: usize = 1024;
 /// for reliable publishes and avoiding a task allocation per packet.
 pub(crate) struct DataPublisher {
     fields: Vec<String>,
+    dtypes: Vec<DType>,
     topic: String,
     reliable: bool,
     tx: mpsc::Sender<DataPacket>,
     task: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
     stream: DataStream,
-    // Per-field snapshot of the last sent value. `send_map` carries these
-    // forward when a caller supplies only a subset of the declared fields,
-    // so partial updates stay consistent with the robot's actual state.
-    // Seeded with 0.0, so fields never sent resolve to 0.
+    // Per-field snapshot of the last sent value, stored as f64 for lossless
+    // carry-forward. `send_map` carries these forward when a caller supplies
+    // only a subset of the declared fields, so partial updates stay
+    // consistent with the robot's actual state. Seeded with 0.0, so fields
+    // never sent resolve to 0.
     last_values: Mutex<Vec<f64>>,
 }
 
 impl DataPublisher {
     pub fn new(
-        fields: Vec<String>,
+        schema: &[(String, DType)],
         topic: &str,
         reliable: bool,
         local_participant: LocalParticipant,
@@ -57,9 +60,12 @@ impl DataPublisher {
                 }
             }
         });
+        let fields: Vec<String> = schema.iter().map(|(n, _)| n.clone()).collect();
+        let dtypes: Vec<DType> = schema.iter().map(|(_, d)| *d).collect();
         let last_values = Mutex::new(vec![0.0; fields.len()]);
         Self {
             fields,
+            dtypes,
             topic: topic.to_string(),
             reliable,
             tx,
@@ -82,7 +88,7 @@ impl DataPublisher {
         let payload = {
             let mut last = self.last_values.lock();
             apply_carry_forward(&self.fields, &mut last, map);
-            serialize_values(ts, &last)
+            serialize_values(ts, &last, &self.dtypes)
         };
         let packet = DataPacket {
             payload,
@@ -168,8 +174,8 @@ pub(crate) fn handle_data_received(
     payload: &[u8],
     topic: &str,
     config_role: Role,
-    action_fields: &[String],
-    state_fields: &[String],
+    action_schema: &[(String, DType)],
+    state_schema: &[(String, DType)],
     action: &DataSlots,
     state: &DataSlots,
     sync_buffer: Option<&Arc<Mutex<SyncBuffer>>>,
@@ -181,23 +187,33 @@ pub(crate) fn handle_data_received(
         return SyncOutput::empty();
     }
     match (config_role, topic) {
-        (Role::Robot, "portal_action") => match deserialize_values(payload, action_fields.len()) {
-            Ok((send_ts, values)) => {
-                metrics.record_action_received(send_ts, now_us());
-                action.deliver(send_ts, action_fields, &values);
-            }
-            Err(e) => log::warn!("failed to deserialize action payload: {e}"),
-        },
-        (Role::Operator, "portal_state") => match deserialize_values(payload, state_fields.len()) {
-            Ok((timestamp_us, values)) => {
-                metrics.record_state_received(timestamp_us, now_us());
-                state.deliver(timestamp_us, state_fields, &values);
-                if let Some(sb) = sync_buffer {
-                    return sb.lock().push_state(timestamp_us, values);
+        (Role::Robot, "portal_action") => {
+            let dtypes: Vec<DType> = action_schema.iter().map(|(_, d)| *d).collect();
+            match deserialize_values(payload, &dtypes) {
+                Ok((send_ts, values)) => {
+                    metrics.record_action_received(send_ts, now_us());
+                    let fields: Vec<String> =
+                        action_schema.iter().map(|(n, _)| n.clone()).collect();
+                    action.deliver(send_ts, &fields, &values);
                 }
+                Err(e) => log::warn!("failed to deserialize action payload: {e}"),
             }
-            Err(e) => log::warn!("failed to deserialize state payload: {e}"),
-        },
+        }
+        (Role::Operator, "portal_state") => {
+            let dtypes: Vec<DType> = state_schema.iter().map(|(_, d)| *d).collect();
+            match deserialize_values(payload, &dtypes) {
+                Ok((timestamp_us, values)) => {
+                    metrics.record_state_received(timestamp_us, now_us());
+                    let fields: Vec<String> =
+                        state_schema.iter().map(|(n, _)| n.clone()).collect();
+                    state.deliver(timestamp_us, &fields, &values);
+                    if let Some(sb) = sync_buffer {
+                        return sb.lock().push_state(timestamp_us, values);
+                    }
+                }
+                Err(e) => log::warn!("failed to deserialize state payload: {e}"),
+            }
+        }
         _ => {}
     }
     SyncOutput::empty()

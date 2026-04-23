@@ -52,6 +52,45 @@ impl From<core::Role> for Role {
     }
 }
 
+/// Per-field dtype declared in state/action schemas. Mirrors
+/// `livekit_portal::DType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DType {
+    F64,
+    F32,
+    I32,
+    I16,
+    I8,
+    U32,
+    U16,
+    U8,
+    Bool,
+}
+
+impl From<DType> for core::DType {
+    fn from(d: DType) -> Self {
+        match d {
+            DType::F64 => core::DType::F64,
+            DType::F32 => core::DType::F32,
+            DType::I32 => core::DType::I32,
+            DType::I16 => core::DType::I16,
+            DType::I8 => core::DType::I8,
+            DType::U32 => core::DType::U32,
+            DType::U16 => core::DType::U16,
+            DType::U8 => core::DType::U8,
+            DType::Bool => core::DType::Bool,
+        }
+    }
+}
+
+/// One declared field: name + dtype. Crosses the FFI boundary as a record so
+/// bindings can pass a list of these to `add_state_typed` / `add_action_typed`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FieldSpec {
+    pub name: String,
+    pub dtype: DType,
+}
+
 /// Decoded video frame. Receive-side `data` is I420 planar bytes; send-side
 /// callers pass packed RGB24 directly to `send_video_frame`.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -283,14 +322,20 @@ impl PortalConfig {
         self.inner.lock().add_video(name);
     }
 
-    pub fn add_state(&self, fields: Vec<String>) {
-        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-        self.inner.lock().add_state(&refs);
+    pub fn add_state_typed(&self, schema: Vec<FieldSpec>) {
+        let owned: Vec<(String, core::DType)> =
+            schema.into_iter().map(|f| (f.name, f.dtype.into())).collect();
+        let refs: Vec<(&str, core::DType)> =
+            owned.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+        self.inner.lock().add_state_typed(&refs);
     }
 
-    pub fn add_action(&self, fields: Vec<String>) {
-        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-        self.inner.lock().add_action(&refs);
+    pub fn add_action_typed(&self, schema: Vec<FieldSpec>) {
+        let owned: Vec<(String, core::DType)> =
+            schema.into_iter().map(|f| (f.name, f.dtype.into())).collect();
+        let refs: Vec<(&str, core::DType)> =
+            owned.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+        self.inner.lock().add_action_typed(&refs);
     }
 
     pub fn set_fps(&self, fps: u32) {
@@ -341,8 +386,8 @@ impl Portal {
     #[uniffi::constructor]
     pub fn new(config: Arc<PortalConfig>, callbacks: Arc<dyn PortalCallbacks>) -> Arc<Self> {
         let cfg = config.inner.lock().clone();
-        let state_fields = cfg.state_fields().to_vec();
-        let action_fields = cfg.action_fields().to_vec();
+        let state_fields = cfg.state_fields();
+        let action_fields = cfg.action_fields();
         let video_tracks = cfg.video_tracks().to_vec();
 
         let inner = core::Portal::new(cfg);

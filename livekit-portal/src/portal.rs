@@ -503,9 +503,9 @@ impl Portal {
             self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
         }
 
-        if !self.config.state_fields.is_empty() {
+        if !self.config.state_schema.is_empty() {
             let publisher = DataPublisher::new(
-                self.config.state_fields.clone(),
+                &self.config.state_schema,
                 "portal_state",
                 self.config.state_reliable,
                 lp.clone(),
@@ -516,7 +516,7 @@ impl Portal {
             log::info!(
                 "[{}] ready to publish state via {mode} data ({} fields)",
                 self.config.session,
-                self.config.state_fields.len()
+                self.config.state_schema.len()
             );
             *self.state_publisher.lock() = Some(Arc::new(publisher));
         }
@@ -529,21 +529,21 @@ impl Portal {
 
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
             &self.config.video_tracks,
-            self.config.state_fields.clone(),
+            self.config.state_fields(),
             self.config.sync_config(),
             self.metrics.clone(),
         )));
         *self.sync_buffer.lock() = Some(sync_buffer);
 
-        if !self.config.action_fields.is_empty() {
+        if !self.config.action_schema.is_empty() {
             let mode = if self.config.action_reliable { "reliable" } else { "unreliable" };
             log::info!(
                 "[{}] ready to publish action via {mode} data ({} fields)",
                 self.config.session,
-                self.config.action_fields.len()
+                self.config.action_schema.len()
             );
             let publisher = DataPublisher::new(
-                self.config.action_fields.clone(),
+                &self.config.action_schema,
                 "portal_action",
                 self.config.action_reliable,
                 lp,
@@ -669,8 +669,8 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
                 &payload,
                 &topic,
                 ctx.config.role,
-                &ctx.config.action_fields,
-                &ctx.config.state_fields,
+                &ctx.config.action_schema,
+                &ctx.config.state_schema,
                 &ctx.action,
                 &ctx.state,
                 ctx.sync_buffer.as_ref(),

@@ -46,22 +46,38 @@ returns `WrongRole`.
 | `Role.ROBOT` | video frames, state | actions |
 | `Role.OPERATOR` | actions | video frames + state, merged into synced observations |
 
-Both sides must register the same schema via `add_video` / `add_state` /
-`add_action`. Camera names and state/action field names must match across
-sides.
+Both sides must register the same schema via `add_video` / `add_state_typed` /
+`add_action_typed`. Camera names, field names, and per-field dtypes must
+match across sides.
+
+State and action schemas are typed. Each field declares a `DType` that drives
+its on-wire width. `DType.F64` is the lossless default. `F32` halves the
+bytes per field for joint angles. `I8`, `I16`, `U8`, `U16`, `U32` suit
+discrete indices or counters. `Bool` is one byte for binary signals like
+gripper open or estop. Values you send through `send_state` /
+`send_action` stay as Python floats. Saturation applies at the wire boundary
+for out-of-range integer values.
 
 ## Robot side
 
 ```python
 import asyncio
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session", Role.ROBOT)
     cfg.add_video("camera1")
     cfg.add_video("camera2")
-    cfg.add_state(["joint1", "joint2", "joint3"])
-    cfg.add_action(["joint1", "joint2", "joint3"])
+    cfg.add_state_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
+    cfg.add_action_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
 
     portal = Portal(cfg)
 
@@ -87,14 +103,22 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 async def main():
     cfg = PortalConfig("session", Role.OPERATOR)
     cfg.add_video("camera1")
     cfg.add_video("camera2")
-    cfg.add_state(["joint1", "joint2", "joint3"])
-    cfg.add_action(["joint1", "joint2", "joint3"])
+    cfg.add_state_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
+    cfg.add_action_typed([
+        ("joint1", DType.F32),
+        ("joint2", DType.F32),
+        ("joint3", DType.F32),
+    ])
 
     portal = Portal(cfg)
 

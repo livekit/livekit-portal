@@ -18,12 +18,13 @@ import time
 
 import numpy as np
 
-from livekit.portal import Action, Portal, PortalConfig, Role, RpcInvocationData
+from livekit.portal import Action, DType, Portal, PortalConfig, Role, RpcInvocationData
 from _common import _dump_metrics, env_float, env_int, load_env, mint_token, periodic_metrics, required_env
 
 IDENTITY = "robot"
 TRACK_NAME = "cam1"
 STATE_FIELDS = ["j1", "j2", "j3"]
+STATE_SCHEMA = [(name, DType.F64) for name in STATE_FIELDS]
 
 
 _DOT_COLOR = np.array([255, 255, 255], dtype=np.uint8)
@@ -74,8 +75,8 @@ async def main() -> None:
 
     cfg = PortalConfig(room, Role.ROBOT)
     cfg.add_video(TRACK_NAME)
-    cfg.add_state(STATE_FIELDS)
-    cfg.add_action(STATE_FIELDS)
+    cfg.add_state_typed(STATE_SCHEMA)
+    cfg.add_action_typed(STATE_SCHEMA)
     cfg.set_fps(fps)
 
     portal = Portal(cfg)

@@ -1,5 +1,6 @@
 pub mod config;
 mod data;
+pub mod dtype;
 pub mod error;
 pub mod metrics;
 mod portal;
@@ -11,6 +12,7 @@ pub mod types;
 mod video;
 
 pub use config::PortalConfig;
+pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
 pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};
 pub use portal::Portal;

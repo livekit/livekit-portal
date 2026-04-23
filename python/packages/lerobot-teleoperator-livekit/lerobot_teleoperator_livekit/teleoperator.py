@@ -18,7 +18,7 @@ import numpy as np
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 
-from livekit.portal import Portal, PortalConfig, Role
+from livekit.portal import DType, Portal, PortalConfig, Role
 
 
 @TeleoperatorConfig.register_subclass("livekit")
@@ -146,9 +146,13 @@ class LiveKitTeleoperator(Teleoperator):
         for cam in self._camera_names:
             self._portal_cfg.add_video(cam)
         if self._state_motors:
-            self._portal_cfg.add_state(self._state_motors)
+            self._portal_cfg.add_state_typed(
+                [(name, DType.F64) for name in self._state_motors]
+            )
         if self._action_motors:
-            self._portal_cfg.add_action(self._action_motors)
+            self._portal_cfg.add_action_typed(
+                [(name, DType.F64) for name in self._action_motors]
+            )
         self._portal_cfg.set_fps(self.config.fps)
         if self.config.slack is not None:
             self._portal_cfg.set_slack(self.config.slack)
