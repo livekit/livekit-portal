@@ -24,7 +24,7 @@ They connect to the **same LiveKit room** and sync via Portal.
   own USB-serial controller
 - One OpenCV-compatible camera on the robot side
 - The Portal native library built once at the repo root:
-  `cd python/packages/livekit-portal && bash scripts/build_native.sh`
+  `bash scripts/build_ffi_python.sh`
 
 ---
 
@@ -174,7 +174,7 @@ macOS, the first time you run it the OS may prompt for camera permission —
 accept and rerun.
 
 **`ImportError: cannot find liblivekit_portal_ffi`** — build the native
-library: `cd ../../packages/livekit-portal && bash scripts/build_native.sh`.
+library: `cd ../../.. && bash scripts/build_ffi_python.sh`.
 
 ---
 
