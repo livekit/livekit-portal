@@ -137,9 +137,13 @@ config.set_state_reliable(True)  # default: True. reliable = lossless ordered de
 config.set_action_reliable(True) # default: True. use False for high-frequency inference where latest value matters most
 
 config.set_ping_ms(1000)         # default: 1000. set 0 to disable RTT pinging on this side
+
+config.set_reuse_stale_frames(False)  # default: False. True = freeze video on frame loss instead of dropping the state
 ```
 
 **Tolerance tradeoff**: at `tolerance=0.5`, a state only matches a frame within half a tick — a single lost frame drops the observation (precision over recovery). At the default `tolerance=1.5`, a state can fall back to the adjacent frame (T±1) if its own was lost, preserving the observation at the cost of ±1 tick of misalignment. A fair-share check prevents an earlier state from stealing a frame that a later state in the buffer has a closer claim to. Values `>2.0` allow T±2 fallback (rarely worth it). Pick **tight (≤1.0)** for real-time control where misalignment is unsafe; pick **widened (≥1.5)** for data collection or lossy links where dropping is worse than slight misalignment.
+
+**Reuse stale frames**: default off. When on, a state whose video match window has elapsed reuses the most recent already-emitted frame on that track instead of dropping. Video "freezes" on the last good frame during loss while state keeps flowing. Every state becomes an observation once every track has emitted at least once. Before that, the strict drop-on-horizon rule still applies so the state buffer stays bounded if video never starts. Turn on for data collection or logging where losing a state is worse than a transient video freeze. Leave off for real-time control where a stale frame would misalign the perception/action loop.
 
 ### Metrics
 
@@ -155,6 +159,7 @@ The snapshot is grouped into four sections:
 ```
 metrics.sync
   observations_emitted        # cumulative synced observations delivered
+  stale_observations_emitted  # subset of observations_emitted where any track reused its last frame (reuse_stale_frames only)
   states_dropped              # cumulative: sync-fail drops + state-buffer overflow drops
   match_delta_us_p50/p95      # worst per-track alignment within each observation, rolling window
   last_blocker_track          # sticky: most recent track that stalled sync
@@ -182,9 +187,11 @@ Jitter is the RFC 3550 EWMA on inter-arrival deltas: `J += (|D| − J) / 16`, wh
 
 Percentiles are computed from a bounded ring of 256 recent samples — fast, bounded memory, accurate enough for health monitoring rather than SLO reporting.
 
+**Under `reuse_stale_frames`**: `last_blocker_track` only updates while a track is still waiting for its first frame. Once every track has emitted, reuse replaces the wait, so a later freeze leaves `last_blocker_track` pinned to its last startup value — use `stale_observations_emitted` as the freeze signal instead. `match_delta_us_p95` also becomes unbounded (stale deltas can be seconds long), so alerts keyed on that metric need reshaping.
+
 ### Drop Policy
 
-When the video frame buffer cannot satisfy sync for a state, all states up to and including that state are dropped. When states are dropped, the drop callback fires.
+Under the default strict policy, when the video frame buffer cannot satisfy sync for a state, all states up to and including that state are dropped. When states are dropped, the drop callback fires.
 
 ```python
 inference_portal.on_drop(callback)  # called with the dropped states, fires on both sync failure and buffer overflow
@@ -192,11 +199,13 @@ inference_portal.on_drop(callback)  # called with the dropped states, fires on b
 
 The drop callback is informational — the application decides what to do (e-stop, log degradation, custom recovery). Portal does not impose any safety policy on the robot; the user controls the robot loop and knows best how to react.
 
+With `set_reuse_stale_frames(True)`, sync-fail drops are replaced by stale-frame reuse once a track has emitted at least once. Only two drop sources remain: (1) state-buffer overflow during the pre-first-emission startup window, and (2) a past-horizon frame arriving before any emission has happened for the blocked track.
+
 ### Sync Internals
 
 Once a state and video frames are synced into an observation, all video frames up to that point are removed from the buffer.
 
-If the video frame buffer cannot satisfy sync for a state (no frame from every track within the search range), all states up to and including that state are dropped and the drop callback fires.
+Under the default strict policy, if the video frame buffer cannot satisfy sync for a state (no frame from every track within the search range), all states up to and including that state are dropped and the drop callback fires. Under the reuse policy, the state falls back to that track's most recently emitted frame and the observation fires normally — the video buffer is left untouched so a later state can still consume the fresh frame.
 
 ## Examples
 

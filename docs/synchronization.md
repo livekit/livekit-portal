@@ -89,6 +89,30 @@ is not a match and all future frames are ≥ that timestamp, so drop.
 These three outcomes (match / wait / drop) are the state machine the
 algorithm executes per head state on every push.
 
+### Optional: stale-frame reuse
+
+Enable `reuse_stale_frames` on `PortalConfig` to flip the drop outcome
+into a **reuse** outcome once a track has emitted at least once. The
+state falls back to that track's last-emitted frame, so the observation
+still fires — video "freezes" on the last good frame during loss while
+state keeps flowing. An empty buffer with a last-emitted frame emits
+immediately without waiting for the next fresh frame.
+
+| Track state, with `reuse_stale_frames = true` and `last_emitted.is_some()` | Decision |
+|---------------------------------------------------------------------------|----------|
+| Newest frame has `ts >= S + R` | **Reuse** last-emitted frame. Buffer is untouched — a later state can still consume the fresh frame. |
+| Buffer empty | **Reuse** last-emitted frame immediately. |
+| Fresh in-range match exists | **Match** (fresh match wins, `last_emitted` advances). |
+
+During the startup window before the first emission, `last_emitted` is
+`None` and there's no fallback — the strict drop rule still applies so
+the state buffer stays bounded if video never arrives at all. Once the
+first observation fires, reuse takes over and drops cease.
+
+Use this when data-collection or logging pipelines prefer a transient
+video freeze over a missing state. Leave it off for real-time control
+where a stale frame would misalign the perception/action loop.
+
 ## Naïve algorithm (what we *don't* do)
 
 The straightforward implementation does this on every push:

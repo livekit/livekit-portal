@@ -13,6 +13,8 @@ config.set_state_reliable(True)   # default: True
 config.set_action_reliable(True)  # default: True
 
 config.set_ping_ms(1000)      # RTT ping cadence. 0 disables. default: 1000.
+
+config.set_reuse_stale_frames(False)  # freeze video on loss instead of dropping (default: False)
 ```
 
 ## The three knobs
@@ -50,6 +52,32 @@ config.set_tolerance(1.5)    # still measured in video-tick intervals (~16.6 ms)
 
 Under asymmetric rates, the overall drop rate is proportional to
 `state_rate × video_loss_rate`, not the video rate.
+
+## Reuse stale frames
+
+Off by default. Flip on with `config.set_reuse_stale_frames(True)` when
+the application would rather see a frozen-video observation than a
+dropped state. A state whose video match window has elapsed reuses the
+most recent already-emitted frame on that track — video "freezes" on
+the last good frame while state keeps flowing. Every state becomes an
+observation once every track has emitted at least once. Before that,
+the strict drop-on-horizon rule still applies so the state buffer stays
+bounded if video never starts.
+
+| Use case | Pick |
+|---|---|
+| Real-time inference / control | `False` — a stale frame would misalign the perception/action loop. |
+| Data collection / logging | `True` — a dropped state is lost data; a transient video freeze is recoverable. |
+| Teleop viewer | `True` — visual continuity > frame-perfect alignment. |
+
+Under reuse, the freeze signal is `metrics.sync.stale_observations_emitted`
+— a rising counter at steady `observations_emitted` rate means a track
+is silently frozen. `match_delta_us_p95` also tracks drift between the
+state and its stale frame and can be used to gauge freeze duration, but
+it becomes unbounded once reuse kicks in so any alert keyed on it
+should be re-scoped. `last_blocker_track` only updates while a track is
+still waiting for its first frame, so don't rely on it to identify a
+freeze after startup — use `stale_observations_emitted` instead.
 
 ## Reliability
 

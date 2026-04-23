@@ -522,6 +522,19 @@ class PortalConfig:
     def set_ping_ms(self, ms: int) -> None:
         self._inner.set_ping_ms(ms)
 
+    def set_reuse_stale_frames(self, enable: bool) -> None:
+        """Reuse the most recent already-emitted frame on a track when the
+        current state has no in-range match. Video "freezes" on the last good
+        frame during loss, but state keeps flowing — every state becomes an
+        observation once every track has emitted at least once.
+
+        Off by default (strict drop-on-horizon). Turn on for data collection
+        or logging where losing state is worse than a transient video freeze.
+        Leave off for real-time control where a stale frame would misalign
+        the perception/action loop.
+        """
+        self._inner.set_reuse_stale_frames(enable)
+
     def close(self) -> None:
         """No-op: UniFFI releases the Rust-side handle when Python GC drops
         the last reference. Kept for backwards compatibility with callers

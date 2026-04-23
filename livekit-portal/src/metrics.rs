@@ -17,6 +17,11 @@ pub struct PortalMetrics {
 #[derive(Debug, Clone, Default)]
 pub struct SyncMetrics {
     pub observations_emitted: u64,
+    /// Subset of `observations_emitted` where at least one track contributed a
+    /// stale, previously-emitted frame (reuse fallback). Always 0 unless
+    /// `reuse_stale_frames` is enabled. A rising counter at steady observation
+    /// rate signals a silently frozen video track.
+    pub stale_observations_emitted: u64,
     pub states_dropped: u64,
     /// Worst per-track alignment `max_t |state_ts − frame_ts|` across the
     /// tracks in each emitted observation, over a rolling 256-sample window.
@@ -81,6 +86,7 @@ pub(crate) struct MetricsRegistry {
     action_jitter: Mutex<JitterState>,
 
     observations_emitted: AtomicU64,
+    stale_observations_emitted: AtomicU64,
     states_dropped: AtomicU64,
     match_deltas: Mutex<SampleRing>,
     // Index into `track_order`; `usize::MAX` means "no blocker recorded".
@@ -110,6 +116,7 @@ impl MetricsRegistry {
             state_jitter: Mutex::new(JitterState::default()),
             action_jitter: Mutex::new(JitterState::default()),
             observations_emitted: AtomicU64::new(0),
+            stale_observations_emitted: AtomicU64::new(0),
             states_dropped: AtomicU64::new(0),
             match_deltas: Mutex::new(SampleRing::new(SAMPLE_RING_CAP)),
             last_blocker_track: AtomicUsize::new(usize::MAX),
@@ -144,6 +151,10 @@ impl MetricsRegistry {
     pub fn record_observation(&self, worst_delta_us: u64) {
         self.observations_emitted.fetch_add(1, Ordering::Relaxed);
         self.match_deltas.lock().push(worst_delta_us);
+    }
+
+    pub fn record_stale_observation(&self) {
+        self.stale_observations_emitted.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_state_dropped(&self, n: u64) {
@@ -202,6 +213,9 @@ impl MetricsRegistry {
         PortalMetrics {
             sync: SyncMetrics {
                 observations_emitted: self.observations_emitted.load(Ordering::Relaxed),
+                stale_observations_emitted: self
+                    .stale_observations_emitted
+                    .load(Ordering::Relaxed),
                 states_dropped: self.states_dropped.load(Ordering::Relaxed),
                 match_delta_us_p50: match_p50,
                 match_delta_us_p95: match_p95,
@@ -237,6 +251,7 @@ impl MetricsRegistry {
         *self.state_jitter.lock() = JitterState::default();
         *self.action_jitter.lock() = JitterState::default();
         self.observations_emitted.store(0, Ordering::Relaxed);
+        self.stale_observations_emitted.store(0, Ordering::Relaxed);
         self.states_dropped.store(0, Ordering::Relaxed);
         self.match_deltas.lock().clear();
         self.last_blocker_track.store(usize::MAX, Ordering::Relaxed);

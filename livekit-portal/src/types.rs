@@ -160,6 +160,13 @@ pub struct SyncConfig {
     pub video_buffer_size: u32,
     pub state_buffer_size: u32,
     pub search_range_us: u64,
+    /// When true, a state whose video match window has elapsed reuses the
+    /// most recently emitted frame on that track instead of being dropped.
+    /// Video effectively "freezes" during frame loss while state keeps
+    /// flowing — every state becomes an observation once every track has
+    /// emitted at least once. Default is `false`, preserving the strict
+    /// drop-on-horizon behavior.
+    pub reuse_stale_frames: bool,
 }
 
 impl Default for SyncConfig {
@@ -168,6 +175,7 @@ impl Default for SyncConfig {
             video_buffer_size: 5,    // ~83ms at 60fps
             state_buffer_size: 5,    // ~83ms at 60fps
             search_range_us: 10_000, // 10ms — half a frame interval at 60fps
+            reuse_stale_frames: false,
         }
     }
 }
