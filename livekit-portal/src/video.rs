@@ -1,4 +1,5 @@
 use std::mem::MaybeUninit;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -160,7 +161,15 @@ impl VideoReceiver {
                 metrics.record_received(timestamp_us, now_us());
 
                 if let Some(cb) = slots.cb.lock().as_ref() {
-                    cb(&name, &frame_arc);
+                    // User callback runs on this tokio worker; a panic
+                    // would abort the receive task and silently stop
+                    // delivering frames. Catch and log.
+                    let result = catch_unwind(AssertUnwindSafe(|| cb(&name, &frame_arc)));
+                    if result.is_err() {
+                        log::error!(
+                            "video frame callback panicked on track '{name}'; receive loop continues"
+                        );
+                    }
                 }
                 // VideoFrameData clone is cheap — pixel buffer is Arc<[u8]>.
                 *slots.latest.lock() = Some((*frame_arc).clone());

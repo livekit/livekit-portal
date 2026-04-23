@@ -398,11 +398,6 @@ pub struct Portal {
     state_fields: Vec<String>,
     action_fields: Vec<String>,
     video_tracks: Vec<String>,
-    // Schemas are mirrored from the config so `send_*` can convert the
-    // incoming `HashMap<String, f64>` (from Python) into the core's
-    // `HashMap<String, TypedValue>` without another FFI call.
-    state_schema: Vec<core::FieldSpec>,
-    action_schema: Vec<core::FieldSpec>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -416,8 +411,6 @@ impl Portal {
         let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
         let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
-        let state_schema: Vec<core::FieldSpec> = cfg.state_schema().to_vec();
-        let action_schema: Vec<core::FieldSpec> = cfg.action_schema().to_vec();
 
         let inner = core::Portal::new(cfg);
 
@@ -467,8 +460,6 @@ impl Portal {
             state_fields,
             action_fields,
             video_tracks,
-            state_schema,
-            action_schema,
         })
     }
 
@@ -498,7 +489,10 @@ impl Portal {
         values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let typed = f64_to_typed(&values, &self.state_schema);
+        // Schema comes from the core Portal on every send so we don't
+        // carry a duplicate snapshot. Lookup is a linear scan over a
+        // small list — cheaper than cloning the Vec at construction.
+        let typed = f64_to_typed(&values, self.inner.state_schema());
         self.inner.send_state(&typed, timestamp_us).map_err(Into::into)
     }
 
@@ -507,7 +501,7 @@ impl Portal {
         values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let typed = f64_to_typed(&values, &self.action_schema);
+        let typed = f64_to_typed(&values, self.inner.action_schema());
         self.inner.send_action(&typed, timestamp_us).map_err(Into::into)
     }
 

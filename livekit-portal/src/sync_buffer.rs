@@ -82,9 +82,11 @@ impl SyncBuffer {
         }
     }
 
-    /// Helper: build the typed state map once per emission. Separate so
-    /// the two call sites (overflow drop and sync emit) stay in lockstep.
-    fn typed_state(&self, values: &[f64]) -> HashMap<String, TypedValue> {
+    /// Build the typed state map once per emission. Separate so the two
+    /// call sites (overflow drop and sync emit) stay in lockstep, and
+    /// distinctly named to avoid shadowing the conceptual "typed state"
+    /// field on `Observation`.
+    fn build_typed_state_map(&self, values: &[f64]) -> HashMap<String, TypedValue> {
         to_value_maps(&self.state_schema, values).0
     }
 
@@ -136,7 +138,7 @@ impl SyncBuffer {
         let mut overflow_drops: Vec<HashMap<String, TypedValue>> = Vec::new();
         while self.state_buffer.len() > self.config.state_buffer_size as usize {
             let (_, vals) = self.state_buffer.pop_front().unwrap();
-            overflow_drops.push(self.typed_state(&vals));
+            overflow_drops.push(self.build_typed_state_map(&vals));
         }
         if !overflow_drops.is_empty() {
             self.metrics.record_state_dropped(overflow_drops.len() as u64);
@@ -272,7 +274,7 @@ impl SyncBuffer {
             if should_drop {
                 log::warn!("dropping unsyncable state (no matching video frames within range)");
                 let (_, values) = self.state_buffer.pop_front().unwrap();
-                output.drops.push(self.typed_state(&values));
+                output.drops.push(self.build_typed_state_map(&values));
                 self.metrics.record_state_dropped(1);
                 // Retry next state with fresh iteration.
                 continue;

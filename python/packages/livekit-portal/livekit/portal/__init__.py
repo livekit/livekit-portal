@@ -56,6 +56,13 @@ RpcError = _ffi.RpcError
 # the natural Python shape.
 SchemaEntry = Union[Tuple[str, DType], FieldSpec]
 
+# One field value after `_cast_values` reconstruction. Matches the
+# declared dtype family: `BOOL` → `bool`, integer dtypes → `int`, float
+# dtypes → `float`. Exposed at module scope so static type-checkers can
+# reason about the shape of `action.values` / `state.values` /
+# `observation.state`.
+TypedScalar = Union[bool, int, float]
+
 
 def _to_field_specs(schema: Iterable[SchemaEntry]) -> List[FieldSpec]:
     out: List[FieldSpec] = []
@@ -73,6 +80,16 @@ _INT_DTYPES = frozenset(
 )
 _FLOAT_DTYPES = frozenset({DType.F64, DType.F32})
 
+# numpy is listed in pyproject.toml's runtime deps (camera frames need it).
+# Its scalar types register with `numbers.Integral` / `numbers.Real` for
+# int/float, but `np.bool_` does *not* register as `bool`/`Integral`/`Real`,
+# so accept it explicitly. Falls back cleanly if numpy is somehow absent.
+try:
+    import numpy as _np  # noqa: F401
+    _NUMPY_BOOL_TYPES: Tuple[type, ...] = (bool, _np.bool_)
+except ImportError:  # pragma: no cover
+    _NUMPY_BOOL_TYPES = (bool,)
+
 
 def _validate_send_values(
     values: Dict[str, Any],
@@ -85,10 +102,12 @@ def _validate_send_values(
     the bug at the earliest point.
 
     Rules:
-      - `DType.BOOL` → `bool` only (True/False).
-      - integer dtypes → any real integer (int, numpy int, ...) except
-        `bool` (since `bool` is-a `int` in Python).
-      - float dtypes → any real number (int or float) except `bool`.
+      - `DType.BOOL` → `bool` or `numpy.bool_`.
+      - integer dtypes → any `numbers.Integral` (int, numpy int kinds)
+        except booleans (Python `bool` is-a `int`; `numpy.bool_` is
+        treated the same way to match).
+      - float dtypes → any `numbers.Real` (int, float, numpy numerics)
+        except booleans.
 
     Keys absent from the schema skip validation — they're reported
     separately by the core publisher's unknown-key warn path.
@@ -102,11 +121,17 @@ def _validate_send_values(
         if dtype is None:
             continue
         if dtype == DType.BOOL:
-            ok = isinstance(v, bool)
+            ok = isinstance(v, _NUMPY_BOOL_TYPES)
         elif dtype in _INT_DTYPES:
-            ok = isinstance(v, numbers.Integral) and not isinstance(v, bool)
+            ok = (
+                isinstance(v, numbers.Integral)
+                and not isinstance(v, _NUMPY_BOOL_TYPES)
+            )
         else:  # float dtype
-            ok = isinstance(v, numbers.Real) and not isinstance(v, bool)
+            ok = (
+                isinstance(v, numbers.Real)
+                and not isinstance(v, _NUMPY_BOOL_TYPES)
+            )
         if not ok:
             # `flat_error` on the FFI side means the generated
             # `PortalError.DtypeMismatch` class takes the formatted
@@ -120,7 +145,7 @@ def _validate_send_values(
 
 def _cast_values(
     values: Dict[str, float], schema: List[FieldSpec]
-) -> Dict[str, Any]:
+) -> Dict[str, TypedScalar]:
     """Map each value to its declared Python type: `BOOL` → `bool`, integer
     dtypes → `int`, float dtypes → `float`. Keys missing from `schema` are
     dropped; absent schema fields are omitted from the result.
@@ -130,7 +155,7 @@ def _cast_values(
     U32/U16/U8) fits in the 53-bit mantissa of f64, the round trip through
     the pipeline is lossless and this cast is exact.
     """
-    out: Dict[str, Any] = {}
+    out: Dict[str, TypedScalar] = {}
     for field in schema:
         if field.name not in values:
             continue
@@ -166,7 +191,7 @@ class Action:
     widened to `f64`, for callers that want to skip the per-field cast.
     """
 
-    values: Dict[str, Any]
+    values: Dict[str, TypedScalar]
     raw_values: Dict[str, float]
     timestamp_us: int
 
@@ -178,7 +203,7 @@ class State:
     Semantics for `values` / `raw_values` match `Action`.
     """
 
-    values: Dict[str, Any]
+    values: Dict[str, TypedScalar]
     raw_values: Dict[str, float]
     timestamp_us: int
 
@@ -192,7 +217,7 @@ class Observation:
     layer — one entry per registered video track.
     """
 
-    state: Dict[str, Any]
+    state: Dict[str, TypedScalar]
     raw_state: Dict[str, float]
     frames: Dict[str, VideoFrameData]
     timestamp_us: int
@@ -705,6 +730,7 @@ __all__ = [
     "Role",
     "DType",
     "FieldSpec",
+    "TypedScalar",
     "PortalConfig",
     "Portal",
     "Observation",

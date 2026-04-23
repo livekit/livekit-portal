@@ -267,3 +267,36 @@ def test_send_unknown_key_is_not_blocked_by_validator():
         pytest.fail("unknown keys must not trigger dtype validation")
     except PortalError:
         pass
+
+
+def test_send_accepts_numpy_scalars():
+    # ML code routinely hands us `np.bool_`, `np.int32`, `np.float32` from
+    # policy tensors. The validator has to accept them or the SDK is
+    # unusable for that audience.
+    np = pytest.importorskip("numpy")
+    portal = _mixed_schema_portal()
+    try:
+        portal.send_action(
+            {
+                "shoulder": np.float32(0.5),
+                "elbow": np.float64(-0.25),
+                "gripper": np.bool_(True),
+                "mode": np.int8(3),
+                "counter": np.uint16(42),
+            }
+        )
+    except PortalError.DtypeMismatch as e:
+        pytest.fail(f"numpy scalars rejected: {e}")
+    except PortalError:
+        # WrongRole or similar — validation passed, that's what we test.
+        pass
+
+
+def test_send_rejects_numpy_bool_for_int_field():
+    # Symmetry with Python bool: `np.bool_` must not satisfy an int
+    # field, otherwise a bug where someone stashed a bool in a mode
+    # field would slip through.
+    np = pytest.importorskip("numpy")
+    portal = _mixed_schema_portal()
+    with pytest.raises(PortalError.DtypeMismatch):
+        portal.send_action({"mode": np.bool_(True)})

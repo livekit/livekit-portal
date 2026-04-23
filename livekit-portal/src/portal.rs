@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::PortalConfig;
+use crate::config::{FieldSpec, PortalConfig};
 use crate::data::{handle_data_received, ActionSlot, DataPublisher, StateSlot};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
@@ -45,12 +46,20 @@ impl ObservationSink {
     pub(crate) fn dispatch(&self, output: SyncOutput) {
         let SyncOutput { observations, drops } = output;
 
+        // User callbacks run on the tokio worker dispatching room events.
+        // A panic here would abort the whole event loop, so we catch and
+        // log and keep going.
         if !observations.is_empty() {
             {
                 let cb_slot = self.observation_cb.lock();
                 if let Some(cb) = cb_slot.as_ref() {
                     for obs in &observations {
-                        cb(obs);
+                        let result = catch_unwind(AssertUnwindSafe(|| cb(obs)));
+                        if result.is_err() {
+                            log::error!(
+                                "observation callback panicked; event loop continues"
+                            );
+                        }
                     }
                 }
             }
@@ -63,7 +72,10 @@ impl ObservationSink {
 
         if !drops.is_empty() {
             if let Some(cb) = self.drop_cb.lock().as_ref() {
-                cb(drops);
+                let result = catch_unwind(AssertUnwindSafe(|| cb(drops)));
+                if result.is_err() {
+                    log::error!("drop callback panicked; event loop continues");
+                }
             }
         }
     }
@@ -288,6 +300,18 @@ impl Portal {
     }
 
     // --- RPC ---
+
+    /// Declared state schema (field names + dtypes), in declaration order.
+    /// Bindings mirror this snapshot internally; reading from the Portal
+    /// keeps the snapshot single-sourced.
+    pub fn state_schema(&self) -> &[FieldSpec] {
+        self.config.state_schema()
+    }
+
+    /// Declared action schema, same semantics as `state_schema`.
+    pub fn action_schema(&self) -> &[FieldSpec] {
+        self.config.action_schema()
+    }
 
     /// Identity of the opposite-role participant Portal has identified, if
     /// any. Latches on the first Portal-topic data packet or video track

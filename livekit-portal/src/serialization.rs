@@ -226,6 +226,37 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_is_stable_across_independent_constructions() {
+        // Two peers build their schemas separately; if the field names,
+        // order, and dtypes agree, the u32 fingerprint must match —
+        // otherwise the receive path drops every packet.
+        let peer_robot = schema(&[
+            ("j1", DType::F32),
+            ("gripper", DType::Bool),
+            ("mode", DType::I8),
+        ]);
+        let peer_operator = schema(&[
+            ("j1", DType::F32),
+            ("gripper", DType::Bool),
+            ("mode", DType::I8),
+        ]);
+        assert_eq!(
+            schema_fingerprint(&peer_robot),
+            schema_fingerprint(&peer_operator),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_name_changes() {
+        // Rename is the subtle bug: same position, same dtype, different
+        // spelling. Must fail fingerprint comparison so the peer rejects
+        // packets instead of silently misattributing values.
+        let a = schema(&[("shoulder", DType::F32)]);
+        let b = schema(&[("shouder", DType::F32)]);
+        assert_ne!(schema_fingerprint(&a), schema_fingerprint(&b));
+    }
+
+    #[test]
     fn saturation_is_reported() {
         let s = schema(&[("x", DType::I8)]);
         let fp = schema_fingerprint(&s);

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use livekit::prelude::*;
@@ -243,9 +244,17 @@ impl<R: Clone> DataSlot<R> {
 
     /// Fire the callback by reference, then hand ownership to the
     /// latest-wins slot.
+    ///
+    /// Callbacks run on a tokio worker thread; a panic inside user code
+    /// would abort that worker and kill the receive loop. Catching here
+    /// keeps the stream alive; the panic is logged and the latest slot
+    /// is still updated so pull-based getters continue to work.
     fn deliver(&self, record: R) {
         if let Some(cb) = self.cb.lock().as_ref() {
-            cb(&record);
+            let result = catch_unwind(AssertUnwindSafe(|| cb(&record)));
+            if result.is_err() {
+                log::error!("user callback panicked; receive loop continues");
+            }
         }
         *self.latest.lock() = Some(record);
     }
