@@ -196,3 +196,68 @@ def test_wrapper_drops_fields_missing_from_payload():
     # Partial payload → wrapper returns only the fields that were sent.
     assert action.values == {"shoulder": 0.25}
     assert action.raw_values == {"shoulder": 0.25}
+
+
+# --- Send-side dtype enforcement --------------------------------------------
+#
+# The Python wrapper validates each outgoing value's Python type against
+# the declared dtype before crossing the FFI boundary. A mismatch raises
+# `PortalError.DtypeMismatch` at the earliest point so the caller sees
+# the bug in their stack trace, not as a silent cast on the peer.
+
+
+def test_send_rejects_float_for_bool_field():
+    portal = _mixed_schema_portal()
+    with pytest.raises(PortalError.DtypeMismatch) as info:
+        portal.send_action({"gripper": 0.5})
+    msg = str(info.value)
+    assert "gripper" in msg
+    assert "BOOL" in msg
+
+
+def test_send_rejects_int_for_float_field_via_bool():
+    # Python's `True` is also an int (1). A BOOL-looking value should
+    # never slip into a float field.
+    portal = _mixed_schema_portal()
+    with pytest.raises(PortalError.DtypeMismatch):
+        portal.send_action({"shoulder": True})
+
+
+def test_send_rejects_bool_for_int_field():
+    portal = _mixed_schema_portal()
+    with pytest.raises(PortalError.DtypeMismatch):
+        portal.send_action({"mode": True})
+
+
+def test_send_rejects_float_for_int_field():
+    portal = _mixed_schema_portal()
+    with pytest.raises(PortalError.DtypeMismatch):
+        portal.send_action({"mode": 3.5})
+
+
+def test_send_accepts_int_for_float_field():
+    # Numeric promotion: int is a valid float. Should pass validation
+    # (and be rejected only by the publisher role check — our fixture is
+    # OPERATOR so sending an action is the right role).
+    portal = _mixed_schema_portal()
+    # Does not raise at the validation step.
+    try:
+        portal.send_action({"shoulder": 1, "gripper": True, "mode": 3})
+    except PortalError.DtypeMismatch:
+        pytest.fail("int should coerce into a float-declared field")
+    except PortalError:
+        # May raise a different PortalError because there's no connected
+        # peer / role — that's fine. We only care that validation passed.
+        pass
+
+
+def test_send_unknown_key_is_not_blocked_by_validator():
+    # Unknown keys skip the dtype check — the core publisher warns about
+    # them separately. Validator shouldn't raise for keys not in schema.
+    portal = _mixed_schema_portal()
+    try:
+        portal.send_action({"gripper": True, "unknown_key": 1.0})
+    except PortalError.DtypeMismatch:
+        pytest.fail("unknown keys must not trigger dtype validation")
+    except PortalError:
+        pass

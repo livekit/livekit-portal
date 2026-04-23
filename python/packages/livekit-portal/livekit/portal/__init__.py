@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import numbers
 import threading
 import traceback
 from dataclasses import dataclass, field
@@ -70,6 +71,51 @@ def _to_field_specs(schema: Iterable[SchemaEntry]) -> List[FieldSpec]:
 _INT_DTYPES = frozenset(
     {DType.I32, DType.I16, DType.I8, DType.U32, DType.U16, DType.U8}
 )
+_FLOAT_DTYPES = frozenset({DType.F64, DType.F32})
+
+
+def _validate_send_values(
+    values: Dict[str, Any],
+    schema: List[Tuple[str, DType]],
+    stream: str,
+) -> None:
+    """Reject a send payload whose values' Python types disagree with the
+    declared dtype. Mirrors the core Rust `PortalError::DtypeMismatch`
+    check — raised before we cross the FFI boundary so the caller sees
+    the bug at the earliest point.
+
+    Rules:
+      - `DType.BOOL` → `bool` only (True/False).
+      - integer dtypes → any real integer (int, numpy int, ...) except
+        `bool` (since `bool` is-a `int` in Python).
+      - float dtypes → any real number (int or float) except `bool`.
+
+    Keys absent from the schema skip validation — they're reported
+    separately by the core publisher's unknown-key warn path.
+    """
+    # Build a quick lookup once per call. Schemas are small (typical << 32
+    # fields) so the dict overhead is negligible versus a linear scan per
+    # value.
+    declared: Dict[str, DType] = {name: dtype for name, dtype in schema}
+    for name, v in values.items():
+        dtype = declared.get(name)
+        if dtype is None:
+            continue
+        if dtype == DType.BOOL:
+            ok = isinstance(v, bool)
+        elif dtype in _INT_DTYPES:
+            ok = isinstance(v, numbers.Integral) and not isinstance(v, bool)
+        else:  # float dtype
+            ok = isinstance(v, numbers.Real) and not isinstance(v, bool)
+        if not ok:
+            # `flat_error` on the FFI side means the generated
+            # `PortalError.DtypeMismatch` class takes the formatted
+            # message as a single positional arg; the structured fields
+            # are embedded in the string, matching the error surfaced by
+            # the Rust core.
+            raise PortalError.DtypeMismatch(
+                f"field '{name}' declared as {dtype} but sent as {type(v).__name__}"
+            )
 
 
 def _cast_values(
@@ -523,16 +569,27 @@ class Portal:
 
     def send_state(
         self,
-        values: Dict[str, float],
+        values: Dict[str, Any],
         timestamp_us: Optional[int] = None,
     ) -> None:
+        """Publish a state sample (robot role only). Each value's Python
+        type must match the field's declared dtype: `True` / `False` for
+        `DType.BOOL`, `int` for integer dtypes, `int` or `float` for
+        float dtypes. A mismatch raises `PortalError.DtypeMismatch`
+        before any packet is sent.
+        """
+        _validate_send_values(values, self._state_schema, "state")
         self._inner.send_state(values, timestamp_us)
 
     def send_action(
         self,
-        values: Dict[str, float],
+        values: Dict[str, Any],
         timestamp_us: Optional[int] = None,
     ) -> None:
+        """Publish an action (operator role only). Same validation rules
+        as `send_state`.
+        """
+        _validate_send_values(values, self._action_schema, "action")
         self._inner.send_action(values, timestamp_us)
 
     # -- pull (sync, latest-wins) --------------------------------------------

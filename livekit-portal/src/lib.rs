@@ -11,7 +11,7 @@ mod sync_buffer;
 pub mod types;
 mod video;
 
-pub use config::PortalConfig;
+pub use config::{FieldSpec, PortalConfig};
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
 pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};

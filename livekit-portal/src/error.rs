@@ -1,3 +1,4 @@
+use crate::dtype::DType;
 use crate::rpc::RpcError;
 use crate::types::Role;
 use thiserror::Error;
@@ -35,6 +36,9 @@ pub enum PortalError {
 
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
+
+    #[error("field '{field}' declared as {expected:?} but sent as {got}; use the matching TypedValue variant or redeclare the dtype")]
+    DtypeMismatch { field: String, expected: DType, got: &'static str },
 
     #[error("{0}")]
     Rpc(RpcError),

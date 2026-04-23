@@ -83,6 +83,22 @@ impl From<DType> for core::DType {
     }
 }
 
+impl From<core::DType> for DType {
+    fn from(d: core::DType) -> Self {
+        match d {
+            core::DType::F64 => DType::F64,
+            core::DType::F32 => DType::F32,
+            core::DType::I32 => DType::I32,
+            core::DType::I16 => DType::I16,
+            core::DType::I8 => DType::I8,
+            core::DType::U32 => DType::U32,
+            core::DType::U16 => DType::U16,
+            core::DType::U8 => DType::U8,
+            core::DType::Bool => DType::Bool,
+        }
+    }
+}
+
 /// One declared field: name + dtype. Crosses the FFI boundary as a record so
 /// bindings can pass a list of these to `add_state_typed` / `add_action_typed`.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -203,6 +219,9 @@ pub enum PortalError {
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
 
+    #[error("field '{field}' declared as {expected:?} but sent as {got}")]
+    DtypeMismatch { field: String, expected: DType, got: String },
+
     #[error("rpc error {code}: {message}")]
     Rpc { code: u32, message: String, data: Option<String> },
 }
@@ -224,6 +243,13 @@ impl From<core::PortalError> for PortalError {
             }
             core::PortalError::Deserialization(s) => PortalError::Deserialization(s),
             core::PortalError::WrongRole(r) => PortalError::WrongRole(r.into()),
+            core::PortalError::DtypeMismatch { field, expected, got } => {
+                PortalError::DtypeMismatch {
+                    field,
+                    expected: expected.into(),
+                    got: got.to_string(),
+                }
+            }
             core::PortalError::Rpc(e) => {
                 PortalError::Rpc { code: e.code, message: e.message, data: e.data }
             }

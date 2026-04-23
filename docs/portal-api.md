@@ -164,10 +164,20 @@ type.
 
 ## Gotchas
 
-- **Saturation is silent except for a one-time log.** If you send `9999`
-  into an `I8` field, it clips to `127`. The publisher emits a single
-  `WARN` per (topic, field) on first saturation, then stays quiet. The
-  peer receives the clipped value and never sees the original.
+- **Send-time dtype mismatch raises immediately.** If you send a
+  `float` into a `BOOL` field, a `bool` into a `F32` field, or any
+  other type that doesn't match the declared dtype, `send_state` /
+  `send_action` raises `PortalError::DtypeMismatch` before the packet
+  is constructed. No silent cast. Python follows the same rule via
+  `isinstance` checks on each value. `int` is accepted for float
+  dtypes (standard numeric promotion); `bool` is rejected everywhere
+  except `BOOL` fields.
+- **Saturation is silent except for a one-time log.** Saturation
+  happens after the dtype check passes — e.g., sending `9999` as an
+  `i8` in Rust (or `9999` as an int for an `I8` field in Python)
+  clips to `127`. The publisher emits a single `WARN` per (topic,
+  field) on first saturation, then stays quiet. The peer receives
+  the clipped value and never sees the original.
 - **Schema mismatch is detected but not raised.** Every packet carries a
   `u32` fingerprint derived from the ordered field names and dtypes. A
   peer whose schema disagrees (any rename, dtype flip, or reorder) sees

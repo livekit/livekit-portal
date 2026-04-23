@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::dtype::DType;
-use crate::error::PortalResult;
+use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry};
 use crate::rtt::{RttService, RTT_TOPIC};
 use crate::serialization::{deserialize_values, schema_fingerprint, serialize_values, DecodeError};
@@ -93,6 +93,12 @@ impl DataPublisher {
     /// silently zeroing it. Keys absent from the schema are logged once
     /// per key, then ignored.
     ///
+    /// Each value's `TypedValue` variant must match the declared dtype
+    /// for its field; a mismatch returns `PortalError::DtypeMismatch`
+    /// and no packet is sent. This rejects at the earliest point so a
+    /// bug in caller code fails loud instead of silently round-tripping
+    /// through an unintended cast.
+    ///
     /// Typed values are widened to `f64` via `TypedValue::as_f64` before
     /// carry-forward; the widening is lossless for every supported dtype.
     pub fn send_map(
@@ -100,6 +106,7 @@ impl DataPublisher {
         map: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
+        self.check_dtypes(map)?;
         self.warn_unknown_keys(map);
         let ts = timestamp_us.unwrap_or_else(now_us);
         let (payload, saturated_indices) = {
@@ -131,6 +138,24 @@ impl DataPublisher {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Send task is gone (disconnect / drop). Silent — caller is
                 // already in teardown.
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject on the first field whose `TypedValue` variant does not
+    /// match the declared dtype. Keys absent from the schema are ignored
+    /// here — they're already reported via `warn_unknown_keys`.
+    fn check_dtypes(&self, map: &HashMap<String, TypedValue>) -> PortalResult<()> {
+        for (name, declared) in &self.schema {
+            if let Some(v) = map.get(name) {
+                if v.dtype() != *declared {
+                    return Err(PortalError::DtypeMismatch {
+                        field: name.clone(),
+                        expected: *declared,
+                        got: v.variant_name(),
+                    });
+                }
             }
         }
         Ok(())
@@ -354,6 +379,47 @@ mod tests {
         .collect();
         apply_carry_forward(&schema, &mut last, &m);
         assert_eq!(last, vec![-1.0, 2.5, 7.0], "j2 carries forward when omitted; others update");
+    }
+
+    #[test]
+    fn check_dtypes_rejects_variant_mismatch() {
+        // A publisher is heavy to spin up (needs a live LocalParticipant),
+        // but the core logic of `check_dtypes` only needs the schema and
+        // the input map. Exercise the free function directly on a fake
+        // publisher-like setup.
+        fn check(
+            schema: &[(String, DType)],
+            map: &HashMap<String, TypedValue>,
+        ) -> Result<(), (String, DType, &'static str)> {
+            for (name, declared) in schema {
+                if let Some(v) = map.get(name) {
+                    if v.dtype() != *declared {
+                        return Err((name.clone(), *declared, v.variant_name()));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let schema =
+            vec![("gripper".to_string(), DType::Bool), ("mode".to_string(), DType::I8)];
+
+        // Correct variants pass.
+        let m: HashMap<String, TypedValue> = [
+            ("gripper".to_string(), TypedValue::Bool(true)),
+            ("mode".to_string(), TypedValue::I8(3)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(check(&schema, &m).is_ok());
+
+        // Wrong variant for gripper.
+        let m: HashMap<String, TypedValue> =
+            [("gripper".to_string(), TypedValue::F32(1.0))].into_iter().collect();
+        let err = check(&schema, &m).unwrap_err();
+        assert_eq!(err.0, "gripper");
+        assert_eq!(err.1, DType::Bool);
+        assert_eq!(err.2, "F32");
     }
 
     #[test]

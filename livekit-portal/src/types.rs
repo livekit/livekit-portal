@@ -56,6 +56,37 @@ impl TypedValue {
         }
     }
 
+    /// The `DType` tag matching this variant — lets callers check a
+    /// typed value against a declared schema.
+    pub fn dtype(self) -> DType {
+        match self {
+            TypedValue::F64(_) => DType::F64,
+            TypedValue::F32(_) => DType::F32,
+            TypedValue::I32(_) => DType::I32,
+            TypedValue::I16(_) => DType::I16,
+            TypedValue::I8(_) => DType::I8,
+            TypedValue::U32(_) => DType::U32,
+            TypedValue::U16(_) => DType::U16,
+            TypedValue::U8(_) => DType::U8,
+            TypedValue::Bool(_) => DType::Bool,
+        }
+    }
+
+    /// Static name of the variant, for error messages.
+    pub fn variant_name(self) -> &'static str {
+        match self {
+            TypedValue::F64(_) => "F64",
+            TypedValue::F32(_) => "F32",
+            TypedValue::I32(_) => "I32",
+            TypedValue::I16(_) => "I16",
+            TypedValue::I8(_) => "I8",
+            TypedValue::U32(_) => "U32",
+            TypedValue::U16(_) => "U16",
+            TypedValue::U8(_) => "U8",
+            TypedValue::Bool(_) => "Bool",
+        }
+    }
+
     /// Lossless widening back to `f64`. Useful when a consumer wants to
     /// treat every field uniformly (e.g. writing into an `ndarray`).
     pub fn as_f64(self) -> f64 {
