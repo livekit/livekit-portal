@@ -39,6 +39,7 @@ class LiveKitRobotConfig(RobotConfig):
     tolerance: float | None = None
     state_reliable: bool = True
     action_reliable: bool = True
+    reuse_stale_frames: bool = False
 
 
 class LiveKitRobot(Robot):
@@ -145,6 +146,7 @@ class LiveKitRobot(Robot):
             self._portal_cfg.set_tolerance(self.config.tolerance)
         self._portal_cfg.set_state_reliable(self.config.state_reliable)
         self._portal_cfg.set_action_reliable(self.config.action_reliable)
+        self._portal_cfg.set_reuse_stale_frames(self.config.reuse_stale_frames)
 
         self._portal = Portal(self._portal_cfg)
         self._run(self._portal.connect(self.config.url, self.config.token))

@@ -160,21 +160,29 @@ for each state in state_buffer (oldest first):
     for each video track:
         find frame in that track's buffer where |frame.timestamp_us - state.timestamp_us| < search_range
         pick the frame with minimum delta
-        if no frame found for this track: 
-            this state cannot be synced
-            if all frames in this track's buffer are NEWER than state + search_range:
+        if no frame found for this track:
+            this state cannot be synced with a fresh frame
+            if config.reuse_stale_frames AND last_emitted_frames[track] is Some:
+                use last emitted frame as a stale fallback (do NOT drain buffer)
+            else if all frames in this track's buffer are NEWER than state + search_range:
                 state is unsyncable — drop it and all older states
                 fire drop callback
             else:
                 wait for more frames (break, try again later)
             break
-    if all tracks matched:
+    if all tracks matched (fresh or stale):
         form Observation
-        remove matched frames and all older frames from each buffer
-        remove this state and all older states from state buffer
+        for tracks with a fresh match:
+            remove matched frames and all older frames from that buffer
+            update last_emitted_frames[track] = that frame
+        for tracks using stale reuse:
+            leave buffer and last_emitted_frames untouched
+        remove this state from state buffer
         push Observation to observation buffer
         fire observation callback
 ```
+
+Stale reuse is opt-in (`config.reuse_stale_frames`, default off). When on, video "freezes" on the last good frame during loss while every state still turns into an observation. See `docs/synchronization.md` for the full state table.
 
 ### 8. Language Bindings
 

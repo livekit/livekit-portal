@@ -139,6 +139,7 @@ pub struct State {
 #[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct SyncMetrics {
     pub observations_emitted: u64,
+    pub stale_observations_emitted: u64,
     pub states_dropped: u64,
     pub match_delta_us_p50: Option<u64>,
     pub match_delta_us_p95: Option<u64>,
@@ -382,6 +383,10 @@ impl PortalConfig {
 
     pub fn set_ping_ms(&self, ms: u64) {
         self.inner.lock().set_ping_ms(ms);
+    }
+
+    pub fn set_reuse_stale_frames(&self, enable: bool) {
+        self.inner.lock().set_reuse_stale_frames(enable);
     }
 }
 
@@ -647,6 +652,7 @@ fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {
     PortalMetrics {
         sync: SyncMetrics {
             observations_emitted: m.sync.observations_emitted,
+            stale_observations_emitted: m.sync.stale_observations_emitted,
             states_dropped: m.sync.states_dropped,
             match_delta_us_p50: m.sync.match_delta_us_p50,
             match_delta_us_p95: m.sync.match_delta_us_p95,

@@ -45,6 +45,7 @@ pub struct PortalConfig {
     pub(crate) slack: u32,
     pub(crate) tolerance: f32,
     pub(crate) ping_ms: u64,
+    pub(crate) reuse_stale_frames: bool,
 }
 
 impl PortalConfig {
@@ -61,6 +62,7 @@ impl PortalConfig {
             slack: 5,
             tolerance: 1.5,
             ping_ms: 1000,
+            reuse_stale_frames: false,
         }
     }
 
@@ -143,6 +145,34 @@ impl PortalConfig {
         self.ping_ms = ms;
     }
 
+    /// When enabled, a state whose video match window has elapsed reuses
+    /// the most recent already-emitted frame on that track instead of
+    /// being dropped. Video "freezes" on the last good frame during loss
+    /// while state keeps flowing — every state becomes an observation
+    /// once every track has emitted at least once.
+    ///
+    /// Drops still happen in two cases: (1) a track that has not yet
+    /// emitted its first frame (pre-first-emission, or after `clear()`
+    /// resets the last-emitted slots) — either sync-fail on a
+    /// past-horizon frame or state-buffer overflow, same as strict mode,
+    /// and (2) state-buffer overflow itself, which remains a hard safety
+    /// net against a fully halted video pipeline.
+    ///
+    /// Monitoring note: under reuse, `last_blocker_track` only updates
+    /// during pre-first-emission and won't point at a silently frozen
+    /// track. Use `stale_observations_emitted` as the freeze signal.
+    /// `match_delta_us_p95` also becomes unbounded (stale deltas can be
+    /// arbitrarily large), so alerts keyed on that metric need reshaping.
+    ///
+    /// Off by default, which preserves the strict drop-on-horizon policy.
+    /// Turn this on for data collection or logging pipelines where
+    /// losing a state is worse than a transient video freeze; leave it
+    /// off for real-time control where a stale frame would misalign the
+    /// perception/action loop.
+    pub fn set_reuse_stale_frames(&mut self, enable: bool) {
+        self.reuse_stale_frames = enable;
+    }
+
     pub fn video_tracks(&self) -> &[String] {
         &self.video_tracks
     }
@@ -176,6 +206,7 @@ impl PortalConfig {
             video_buffer_size: self.slack,
             state_buffer_size: self.slack,
             search_range_us,
+            reuse_stale_frames: self.reuse_stale_frames,
         }
     }
 }
