@@ -37,8 +37,8 @@ pub struct PortalConfig {
     pub(crate) session: String,
     pub(crate) role: Role,
     pub(crate) video_tracks: Vec<String>,
-    pub(crate) state_schema: Vec<(String, DType)>,
-    pub(crate) action_schema: Vec<(String, DType)>,
+    pub(crate) state_schema: Vec<FieldSpec>,
+    pub(crate) action_schema: Vec<FieldSpec>,
     pub(crate) state_reliable: bool,
     pub(crate) action_reliable: bool,
     pub(crate) fps: u32,
@@ -79,8 +79,7 @@ impl PortalConfig {
         F: Into<FieldSpec>,
         I: IntoIterator<Item = F>,
     {
-        self.state_schema
-            .extend(schema.into_iter().map(|f| f.into()).map(|f| (f.name, f.dtype)));
+        self.state_schema.extend(schema.into_iter().map(Into::into));
     }
 
     /// Declare action fields with per-field dtype. Order is significant and
@@ -92,8 +91,7 @@ impl PortalConfig {
         F: Into<FieldSpec>,
         I: IntoIterator<Item = F>,
     {
-        self.action_schema
-            .extend(schema.into_iter().map(|f| f.into()).map(|f| (f.name, f.dtype)));
+        self.action_schema.extend(schema.into_iter().map(Into::into));
     }
 
     /// Unified observation rate (set to the video capture rate if state and
@@ -152,22 +150,22 @@ impl PortalConfig {
     /// Ordered state field names. Derived from `state_schema`; does not
     /// allocate.
     pub fn state_fields(&self) -> impl Iterator<Item = &str> {
-        self.state_schema.iter().map(|(n, _)| n.as_str())
+        self.state_schema.iter().map(|f| f.name.as_str())
     }
 
     /// Ordered action field names. Derived from `action_schema`; does not
     /// allocate.
     pub fn action_fields(&self) -> impl Iterator<Item = &str> {
-        self.action_schema.iter().map(|(n, _)| n.as_str())
+        self.action_schema.iter().map(|f| f.name.as_str())
     }
 
-    /// Full state schema (name + dtype).
-    pub fn state_schema(&self) -> &[(String, DType)] {
+    /// Full state schema.
+    pub fn state_schema(&self) -> &[FieldSpec] {
         &self.state_schema
     }
 
-    /// Full action schema (name + dtype).
-    pub fn action_schema(&self) -> &[(String, DType)] {
+    /// Full action schema.
+    pub fn action_schema(&self) -> &[FieldSpec] {
         &self.action_schema
     }
 

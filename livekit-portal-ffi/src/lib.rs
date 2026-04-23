@@ -401,8 +401,8 @@ pub struct Portal {
     // Schemas are mirrored from the config so `send_*` can convert the
     // incoming `HashMap<String, f64>` (from Python) into the core's
     // `HashMap<String, TypedValue>` without another FFI call.
-    state_schema: Vec<(String, core::DType)>,
-    action_schema: Vec<(String, core::DType)>,
+    state_schema: Vec<core::FieldSpec>,
+    action_schema: Vec<core::FieldSpec>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -416,8 +416,8 @@ impl Portal {
         let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
         let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
-        let state_schema: Vec<(String, core::DType)> = cfg.state_schema().to_vec();
-        let action_schema: Vec<(String, core::DType)> = cfg.action_schema().to_vec();
+        let state_schema: Vec<core::FieldSpec> = cfg.state_schema().to_vec();
+        let action_schema: Vec<core::FieldSpec> = cfg.action_schema().to_vec();
 
         let inner = core::Portal::new(cfg);
 
@@ -620,15 +620,15 @@ fn observation_from_core(o: &core::Observation) -> Observation {
 /// `F64` so the core's unknown-key warn path still fires.
 fn f64_to_typed(
     values: &HashMap<String, f64>,
-    schema: &[(String, core::DType)],
+    schema: &[core::FieldSpec],
 ) -> HashMap<String, core::TypedValue> {
     values
         .iter()
         .map(|(name, &v)| {
             let dtype = schema
                 .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, d)| *d)
+                .find(|f| &f.name == name)
+                .map(|f| f.dtype)
                 .unwrap_or(core::DType::F64);
             (name.clone(), core::TypedValue::from_f64(v, dtype))
         })

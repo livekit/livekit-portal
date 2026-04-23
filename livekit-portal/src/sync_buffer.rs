@@ -1,9 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::dtype::DType;
+use crate::config::FieldSpec;
 use crate::metrics::MetricsRegistry;
 use crate::types::*;
+
+#[cfg(test)]
+use crate::dtype::DType;
 
 /// Result of a `push_frame` / `push_state` call. Callers dispatch these
 /// (invoke callbacks, enqueue into the pull-based buffer) *after* releasing
@@ -33,7 +36,7 @@ pub(crate) struct SyncBuffer {
     state_buffer: VecDeque<(u64, Vec<f64>)>, // (timestamp_us, values)
     /// State schema — field names and their declared dtypes. Used to
     /// reconstruct typed values into each `Observation` emitted.
-    state_schema: Vec<(String, DType)>,
+    state_schema: Vec<FieldSpec>,
     config: SyncConfig,
 
     // Per-track cursor: the largest index whose frame ts is <= head state ts
@@ -55,7 +58,7 @@ pub(crate) struct SyncBuffer {
 impl SyncBuffer {
     pub fn new(
         video_track_names: &[String],
-        state_schema: Vec<(String, DType)>,
+        state_schema: Vec<FieldSpec>,
         config: SyncConfig,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
@@ -352,8 +355,8 @@ mod tests {
         let metrics = Arc::new(MetricsRegistry::new(names));
         // Tests were written before typed fields — default every name to F64
         // so the internal observation builder has a dtype per position.
-        let schema: Vec<(String, DType)> =
-            fields.into_iter().map(|n| (n, DType::F64)).collect();
+        let schema: Vec<FieldSpec> =
+            fields.into_iter().map(|n| FieldSpec::new(n, DType::F64)).collect();
         SyncBuffer::new(names, schema, config, metrics)
     }
 

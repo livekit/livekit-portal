@@ -6,8 +6,11 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::dtype::DType;
+use crate::config::FieldSpec;
 use crate::error::{PortalError, PortalResult};
+
+#[cfg(test)]
+use crate::dtype::DType;
 use crate::metrics::{DataStream, MetricsRegistry};
 use crate::rtt::{RttService, RTT_TOPIC};
 use crate::serialization::{deserialize_values, schema_fingerprint, serialize_values, DecodeError};
@@ -29,7 +32,7 @@ const PUBLISH_QUEUE_CAP: usize = 1024;
 pub(crate) struct DataPublisher {
     /// Owned schema. Referenced by every `send_map` call; never mutated after
     /// construction.
-    schema: Vec<(String, DType)>,
+    schema: Vec<FieldSpec>,
     /// Precomputed schema fingerprint, embedded in every outgoing packet.
     fingerprint: u32,
     topic: String,
@@ -54,7 +57,7 @@ pub(crate) struct DataPublisher {
 
 impl DataPublisher {
     pub fn new(
-        schema: &[(String, DType)],
+        schema: &[FieldSpec],
         topic: &str,
         reliable: bool,
         local_participant: LocalParticipant,
@@ -147,12 +150,12 @@ impl DataPublisher {
     /// match the declared dtype. Keys absent from the schema are ignored
     /// here — they're already reported via `warn_unknown_keys`.
     fn check_dtypes(&self, map: &HashMap<String, TypedValue>) -> PortalResult<()> {
-        for (name, declared) in &self.schema {
-            if let Some(v) = map.get(name) {
-                if v.dtype() != *declared {
+        for field in &self.schema {
+            if let Some(v) = map.get(&field.name) {
+                if v.dtype() != field.dtype {
                     return Err(PortalError::DtypeMismatch {
-                        field: name.clone(),
-                        expected: *declared,
+                        field: field.name.clone(),
+                        expected: field.dtype,
                         got: v.variant_name(),
                     });
                 }
@@ -164,7 +167,7 @@ impl DataPublisher {
     fn warn_unknown_keys(&self, map: &HashMap<String, TypedValue>) {
         // Small schemas make a linear scan faster than a HashSet lookup.
         for key in map.keys() {
-            if self.schema.iter().any(|(n, _)| n == key) {
+            if self.schema.iter().any(|f| &f.name == key) {
                 continue;
             }
             let mut warned = self.warned_unknown_keys.lock();
@@ -182,12 +185,12 @@ impl DataPublisher {
         let mut warned = self.warned_saturated.lock();
         for &i in indices {
             if warned.insert(i) {
-                let (name, dtype) = &self.schema[i];
+                let field = &self.schema[i];
                 log::warn!(
                     "topic '{}': field '{}' saturated at {:?} (first occurrence)",
                     self.topic,
-                    name,
-                    dtype
+                    field.name,
+                    field.dtype
                 );
             }
         }
@@ -198,12 +201,12 @@ impl DataPublisher {
 /// leaving other slots untouched (carry-forward). Typed values are
 /// lossless-widened to `f64` on the way in.
 fn apply_carry_forward(
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
     last: &mut [f64],
     map: &HashMap<String, TypedValue>,
 ) {
-    for (i, (name, _)) in schema.iter().enumerate() {
-        if let Some(v) = map.get(name) {
+    for (i, field) in schema.iter().enumerate() {
+        if let Some(v) = map.get(&field.name) {
             last[i] = v.as_f64();
         }
     }
@@ -273,7 +276,7 @@ pub(crate) type StateSlot = DataSlot<State>;
 /// path.
 fn build_action(
     timestamp_us: u64,
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
     values: &[f64],
 ) -> Action {
     let (typed, raw) = to_value_maps(schema, values);
@@ -282,7 +285,7 @@ fn build_action(
 
 fn build_state(
     timestamp_us: u64,
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
     values: &[f64],
 ) -> State {
     let (typed, raw) = to_value_maps(schema, values);
@@ -297,9 +300,9 @@ pub(crate) fn handle_data_received(
     payload: &[u8],
     topic: &str,
     config_role: Role,
-    action_schema: &[(String, DType)],
+    action_schema: &[FieldSpec],
     action_fp: u32,
-    state_schema: &[(String, DType)],
+    state_schema: &[FieldSpec],
     state_fp: u32,
     action: &ActionSlot,
     state: &StateSlot,
@@ -355,9 +358,9 @@ mod tests {
     #[test]
     fn carry_forward_fills_missing_fields() {
         let schema = vec![
-            ("j1".to_string(), DType::F64),
-            ("j2".to_string(), DType::F64),
-            ("j3".to_string(), DType::F64),
+            FieldSpec::new("j1", DType::F64),
+            FieldSpec::new("j2", DType::F64),
+            FieldSpec::new("j3", DType::F64),
         ];
         let mut last = vec![0.0; 3];
 
@@ -388,21 +391,23 @@ mod tests {
         // the input map. Exercise the free function directly on a fake
         // publisher-like setup.
         fn check(
-            schema: &[(String, DType)],
+            schema: &[FieldSpec],
             map: &HashMap<String, TypedValue>,
         ) -> Result<(), (String, DType, &'static str)> {
-            for (name, declared) in schema {
-                if let Some(v) = map.get(name) {
-                    if v.dtype() != *declared {
-                        return Err((name.clone(), *declared, v.variant_name()));
+            for field in schema {
+                if let Some(v) = map.get(&field.name) {
+                    if v.dtype() != field.dtype {
+                        return Err((field.name.clone(), field.dtype, v.variant_name()));
                     }
                 }
             }
             Ok(())
         }
 
-        let schema =
-            vec![("gripper".to_string(), DType::Bool), ("mode".to_string(), DType::I8)];
+        let schema = vec![
+            FieldSpec::new("gripper", DType::Bool),
+            FieldSpec::new("mode", DType::I8),
+        ];
 
         // Correct variants pass.
         let m: HashMap<String, TypedValue> = [
@@ -425,9 +430,9 @@ mod tests {
     #[test]
     fn typed_inputs_widen_to_f64_losslessly() {
         let schema = vec![
-            ("joint".to_string(), DType::F32),
-            ("gripper".to_string(), DType::Bool),
-            ("mode".to_string(), DType::I8),
+            FieldSpec::new("joint", DType::F32),
+            FieldSpec::new("gripper", DType::Bool),
+            FieldSpec::new("mode", DType::I8),
         ];
         let mut last = vec![0.0; 3];
 

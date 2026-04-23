@@ -76,7 +76,7 @@ _FLOAT_DTYPES = frozenset({DType.F64, DType.F32})
 
 def _validate_send_values(
     values: Dict[str, Any],
-    schema: List[Tuple[str, DType]],
+    schema: List[FieldSpec],
     stream: str,
 ) -> None:
     """Reject a send payload whose values' Python types disagree with the
@@ -96,7 +96,7 @@ def _validate_send_values(
     # Build a quick lookup once per call. Schemas are small (typical << 32
     # fields) so the dict overhead is negligible versus a linear scan per
     # value.
-    declared: Dict[str, DType] = {name: dtype for name, dtype in schema}
+    declared: Dict[str, DType] = {f.name: f.dtype for f in schema}
     for name, v in values.items():
         dtype = declared.get(name)
         if dtype is None:
@@ -119,7 +119,7 @@ def _validate_send_values(
 
 
 def _cast_values(
-    values: Dict[str, float], schema: List[Tuple[str, DType]]
+    values: Dict[str, float], schema: List[FieldSpec]
 ) -> Dict[str, Any]:
     """Map each value to its declared Python type: `BOOL` → `bool`, integer
     dtypes → `int`, float dtypes → `float`. Keys missing from `schema` are
@@ -131,16 +131,16 @@ def _cast_values(
     the pipeline is lossless and this cast is exact.
     """
     out: Dict[str, Any] = {}
-    for name, dtype in schema:
-        if name not in values:
+    for field in schema:
+        if field.name not in values:
             continue
-        v = values[name]
-        if dtype == DType.BOOL:
-            out[name] = bool(v)
-        elif dtype in _INT_DTYPES:
-            out[name] = int(v)
+        v = values[field.name]
+        if field.dtype == DType.BOOL:
+            out[field.name] = bool(v)
+        elif field.dtype in _INT_DTYPES:
+            out[field.name] = int(v)
         else:
-            out[name] = float(v)
+            out[field.name] = float(v)
     return out
 
 
@@ -199,7 +199,7 @@ class Observation:
 
 
 def _wrap_action(
-    action: _ffi.Action, schema: List[Tuple[str, DType]]
+    action: _ffi.Action, schema: List[FieldSpec]
 ) -> Action:
     return Action(
         values=_cast_values(action.values, schema),
@@ -209,7 +209,7 @@ def _wrap_action(
 
 
 def _wrap_state(
-    state: _ffi.State, schema: List[Tuple[str, DType]]
+    state: _ffi.State, schema: List[FieldSpec]
 ) -> State:
     return State(
         values=_cast_values(state.values, schema),
@@ -219,7 +219,7 @@ def _wrap_state(
 
 
 def _wrap_observation(
-    obs: _ffi.Observation, state_schema: List[Tuple[str, DType]]
+    obs: _ffi.Observation, state_schema: List[FieldSpec]
 ) -> Observation:
     return Observation(
         state=_cast_values(obs.state, state_schema),
@@ -243,8 +243,8 @@ class _Dispatcher(_ffi.PortalCallbacks):
 
     def __init__(
         self,
-        action_schema: List[Tuple[str, DType]],
-        state_schema: List[Tuple[str, DType]],
+        action_schema: List[FieldSpec],
+        state_schema: List[FieldSpec],
     ) -> None:
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -424,8 +424,8 @@ class PortalConfig:
         self._session = session
         self._role = role
         self._video_tracks: List[str] = []
-        self._state_schema: List[Tuple[str, DType]] = []
-        self._action_schema: List[Tuple[str, DType]] = []
+        self._state_schema: List[FieldSpec] = []
+        self._action_schema: List[FieldSpec] = []
 
     @property
     def session(self) -> str:
@@ -441,18 +441,18 @@ class PortalConfig:
 
     @property
     def state_fields(self) -> List[str]:
-        return [name for name, _ in self._state_schema]
+        return [f.name for f in self._state_schema]
 
     @property
     def action_fields(self) -> List[str]:
-        return [name for name, _ in self._action_schema]
+        return [f.name for f in self._action_schema]
 
     @property
-    def state_schema(self) -> List[Tuple[str, DType]]:
+    def state_schema(self) -> List[FieldSpec]:
         return list(self._state_schema)
 
     @property
-    def action_schema(self) -> List[Tuple[str, DType]]:
+    def action_schema(self) -> List[FieldSpec]:
         return list(self._action_schema)
 
     def add_video(self, name: str) -> None:
@@ -467,7 +467,7 @@ class PortalConfig:
         """
         specs = _to_field_specs(schema)
         self._inner.add_state_typed(specs)
-        self._state_schema.extend((s.name, s.dtype) for s in specs)
+        self._state_schema.extend(specs)
 
     def add_action_typed(self, schema: Iterable[SchemaEntry]) -> None:
         """Declare action fields with per-field dtype.
@@ -477,7 +477,7 @@ class PortalConfig:
         """
         specs = _to_field_specs(schema)
         self._inner.add_action_typed(specs)
-        self._action_schema.extend((s.name, s.dtype) for s in specs)
+        self._action_schema.extend(specs)
 
     def set_fps(self, fps: int) -> None:
         self._inner.set_fps(fps)
@@ -530,8 +530,8 @@ class Portal:
         # Schema snapshots let delivery records reconstruct Python types
         # per declared dtype — the FFI boundary delivers everything as
         # `Dict[str, float]` (the core pipeline is f64 throughout).
-        self._state_schema: List[Tuple[str, DType]] = list(config.state_schema)
-        self._action_schema: List[Tuple[str, DType]] = list(config.action_schema)
+        self._state_schema: List[FieldSpec] = list(config.state_schema)
+        self._action_schema: List[FieldSpec] = list(config.action_schema)
         self._dispatcher = _Dispatcher(self._action_schema, self._state_schema)
         self._inner = _ffi.Portal(config._inner, self._dispatcher)
         # Snapshot what the Rust side confirmed it was built with.

@@ -19,8 +19,11 @@ def test_config_adders_are_captured():
     assert cfg.video_tracks == ["cam1", "cam2"]
     assert cfg.state_fields == ["j1", "j2", "j3"]
     assert cfg.action_fields == ["j1", "j2", "j3"]
-    assert cfg.state_schema == [("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)]
-    assert cfg.action_schema == [("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)]
+    expected = [
+        FieldSpec(name=n, dtype=DType.F32) for n in ("j1", "j2", "j3")
+    ]
+    assert cfg.state_schema == expected
+    assert cfg.action_schema == expected
 
 
 def test_mixed_dtype_schema_is_accepted():
@@ -35,10 +38,10 @@ def test_mixed_dtype_schema_is_accepted():
     )
     assert cfg.action_fields == ["shoulder", "gripper", "mode", "counter"]
     assert cfg.action_schema == [
-        ("shoulder", DType.F32),
-        ("gripper", DType.BOOL),
-        ("mode", DType.I8),
-        ("counter", DType.U16),
+        FieldSpec(name="shoulder", dtype=DType.F32),
+        FieldSpec(name="gripper", dtype=DType.BOOL),
+        FieldSpec(name="mode", dtype=DType.I8),
+        FieldSpec(name="counter", dtype=DType.U16),
     ]
 
 
@@ -85,7 +88,10 @@ def test_fieldspec_accepted_as_schema_entry():
     cfg.add_action_typed(
         [FieldSpec(name="j1", dtype=DType.F32), ("j2", DType.F64)]
     )
-    assert cfg.action_schema == [("j1", DType.F32), ("j2", DType.F64)]
+    assert cfg.action_schema == [
+        FieldSpec(name="j1", dtype=DType.F32),
+        FieldSpec(name="j2", dtype=DType.F64),
+    ]
 
 
 # --- Typed delivery wrappers ------------------------------------------------

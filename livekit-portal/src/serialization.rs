@@ -1,3 +1,4 @@
+use crate::config::FieldSpec;
 use crate::dtype::DType;
 use crate::error::PortalError;
 
@@ -10,18 +11,18 @@ const HEADER_LEN: usize = 4 + 8;
 /// FNV-1a over `name_bytes, 0xff, dtype_tag, 0xff` per field. Not
 /// cryptographic; collision odds at ~4e9 inputs are negligible for this
 /// use.
-pub(crate) fn schema_fingerprint(schema: &[(String, DType)]) -> u32 {
+pub(crate) fn schema_fingerprint(schema: &[FieldSpec]) -> u32 {
     const FNV_OFFSET: u32 = 0x811c9dc5;
     const FNV_PRIME: u32 = 0x01000193;
     let mut h = FNV_OFFSET;
-    for (name, dtype) in schema {
-        for byte in name.as_bytes() {
+    for f in schema {
+        for byte in f.name.as_bytes() {
             h ^= *byte as u32;
             h = h.wrapping_mul(FNV_PRIME);
         }
         h ^= 0xff;
         h = h.wrapping_mul(FNV_PRIME);
-        h ^= dtype_tag(*dtype) as u32;
+        h ^= dtype_tag(f.dtype) as u32;
         h = h.wrapping_mul(FNV_PRIME);
         h ^= 0xff;
         h = h.wrapping_mul(FNV_PRIME);
@@ -61,16 +62,16 @@ pub(crate) fn serialize_values(
     fingerprint: u32,
     timestamp_us: u64,
     values: &[f64],
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
 ) -> EncodeResult {
     debug_assert_eq!(values.len(), schema.len());
-    let payload_bytes: usize = schema.iter().map(|(_, d)| d.size_bytes()).sum();
+    let payload_bytes: usize = schema.iter().map(|f| f.dtype.size_bytes()).sum();
     let mut buf = Vec::with_capacity(HEADER_LEN + payload_bytes);
     buf.extend_from_slice(&fingerprint.to_le_bytes());
     buf.extend_from_slice(&timestamp_us.to_le_bytes());
     let mut saturated_indices = Vec::new();
-    for (i, (v, (_, dtype))) in values.iter().zip(schema.iter()).enumerate() {
-        if dtype.encode(*v, &mut buf) {
+    for (i, (v, field)) in values.iter().zip(schema.iter()).enumerate() {
+        if field.dtype.encode(*v, &mut buf) {
             saturated_indices.push(i);
         }
     }
@@ -101,7 +102,7 @@ impl From<PortalError> for DecodeError {
 pub(crate) fn deserialize_values(
     data: &[u8],
     fingerprint: u32,
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
 ) -> Result<(u64, Vec<f64>), DecodeError> {
     if data.len() < HEADER_LEN {
         return Err(DecodeError::Malformed(PortalError::Deserialization(format!(
@@ -113,7 +114,7 @@ pub(crate) fn deserialize_values(
     if fp_got != fingerprint {
         return Err(DecodeError::SchemaMismatch { expected: fingerprint, got: fp_got });
     }
-    let payload_bytes: usize = schema.iter().map(|(_, d)| d.size_bytes()).sum();
+    let payload_bytes: usize = schema.iter().map(|f| f.dtype.size_bytes()).sum();
     let expected_len = HEADER_LEN + payload_bytes;
     if data.len() != expected_len {
         return Err(DecodeError::Malformed(PortalError::Deserialization(format!(
@@ -125,9 +126,9 @@ pub(crate) fn deserialize_values(
     let timestamp_us = u64::from_le_bytes(data[4..12].try_into().unwrap());
     let mut values = Vec::with_capacity(schema.len());
     let mut offset = HEADER_LEN;
-    for (_, dtype) in schema.iter() {
-        let width = dtype.size_bytes();
-        values.push(dtype.decode(&data[offset..offset + width])?);
+    for f in schema.iter() {
+        let width = f.dtype.size_bytes();
+        values.push(f.dtype.decode(&data[offset..offset + width])?);
         offset += width;
     }
     Ok((timestamp_us, values))
@@ -137,8 +138,8 @@ pub(crate) fn deserialize_values(
 mod tests {
     use super::*;
 
-    fn schema(pairs: &[(&str, DType)]) -> Vec<(String, DType)> {
-        pairs.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    fn schema(pairs: &[(&str, DType)]) -> Vec<FieldSpec> {
+        pairs.iter().map(|(n, d)| FieldSpec::new(*n, *d)).collect()
     }
 
     #[test]
@@ -173,7 +174,7 @@ mod tests {
 
     #[test]
     fn empty_schema() {
-        let s: Vec<(String, DType)> = Vec::new();
+        let s: Vec<FieldSpec> = Vec::new();
         let fp = schema_fingerprint(&s);
         let out = serialize_values(fp, 42, &[], &s);
         assert_eq!(out.payload.len(), HEADER_LEN);

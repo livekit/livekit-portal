@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::config::FieldSpec;
 use crate::dtype::DType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,14 +176,14 @@ impl Default for SyncConfig {
 /// maps are returned so delivery records can carry typed *and* raw views
 /// without rebuilding either on access.
 pub(crate) fn to_value_maps(
-    schema: &[(String, DType)],
+    schema: &[FieldSpec],
     values: &[f64],
 ) -> (HashMap<String, TypedValue>, HashMap<String, f64>) {
     let mut typed = HashMap::with_capacity(schema.len());
     let mut raw = HashMap::with_capacity(schema.len());
-    for ((name, dtype), v) in schema.iter().zip(values.iter()) {
-        typed.insert(name.clone(), TypedValue::from_f64(*v, *dtype));
-        raw.insert(name.clone(), *v);
+    for (f, v) in schema.iter().zip(values.iter()) {
+        typed.insert(f.name.clone(), TypedValue::from_f64(*v, f.dtype));
+        raw.insert(f.name.clone(), *v);
     }
     (typed, raw)
 }
