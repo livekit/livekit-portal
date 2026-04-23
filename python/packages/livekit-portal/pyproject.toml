@@ -23,8 +23,9 @@ examples = [
 ]
 
 # The Rust cdylib and generated UniFFI module are built out-of-band via
-# `scripts/build_native.sh` and dropped into `livekit/portal/`. Both must
-# live next to each other for UniFFI's runtime CDLL lookup to resolve.
+# the repo-root `scripts/build_ffi_python.sh` and dropped into
+# `livekit/portal/`. Both must live next to each other for UniFFI's
+# runtime CDLL lookup to resolve.
 
 # PEP 420 implicit namespace package: `livekit` has no __init__.py so it can
 # coexist with livekit-api (`livekit.api`), livekit-protocol (`livekit.protocol`),

@@ -24,13 +24,13 @@ build from source.
 
 ```bash
 git clone https://github.com/livekit/livekit-portal.git
-cd livekit-portal/python/packages/livekit-portal
+cd livekit-portal
 
-uv sync                                    # install Python deps into .venv
-bash scripts/build_native.sh release       # compile cdylib + generate UniFFI bindings
+bash scripts/build_ffi_python.sh release   # compile cdylib + generate UniFFI bindings
+cd python/packages/livekit-portal && uv sync   # install Python deps into .venv
 ```
 
-`build_native.sh` runs `cargo build -p livekit-portal-ffi`, drops the
+`build_ffi_python.sh` runs `cargo build -p livekit-portal-ffi`, drops the
 platform cdylib (`liblivekit_portal_ffi.{dylib,so,dll}`) next to the
 Python package, and emits the matching UniFFI Python module. First build
 takes a couple of minutes. Subsequent builds are incremental.
@@ -60,9 +60,9 @@ dependencies = ["livekit-portal"]
 livekit-portal = { path = "/absolute/path/to/livekit-portal/python/packages/livekit-portal", editable = true }
 ```
 
-Rerun `bash scripts/build_native.sh release` (in the Portal repo) whenever
-the Rust code changes. The editable install picks up the new cdylib on
-next import. Prebuilt wheels are on the roadmap.
+Rerun `bash scripts/build_ffi_python.sh release` (in the Portal repo)
+whenever the Rust code changes. The editable install picks up the new
+cdylib on next import. Prebuilt wheels are on the roadmap.
 
 ## 2. Mint tokens
 

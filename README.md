@@ -57,13 +57,13 @@ Today you build from source. The flow is one clone, one build, one sync.
 
 ```bash
 git clone https://github.com/livekit/livekit-portal.git
-cd livekit-portal/python/packages/livekit-portal
+cd livekit-portal
 
-uv sync                                    # install Python deps into .venv
-bash scripts/build_native.sh release       # compile cdylib + generate UniFFI bindings
+bash scripts/build_ffi_python.sh release   # compile cdylib + generate UniFFI bindings
+cd python/packages/livekit-portal && uv sync   # install Python deps into .venv
 ```
 
-`build_native.sh` calls `cargo build -p livekit-portal-ffi`, drops the
+`build_ffi_python.sh` calls `cargo build -p livekit-portal-ffi`, drops the
 resulting `liblivekit_portal_ffi.{dylib,so,dll}` next to the Python
 sources, and runs `uniffi-bindgen` to emit the matching Python module. On
 a cold machine this takes a couple of minutes.
@@ -93,7 +93,7 @@ dependencies = ["livekit-portal"]
 livekit-portal = { path = "/absolute/path/to/livekit-portal/python/packages/livekit-portal", editable = true }
 ```
 
-Rerun `build_native.sh` whenever the Rust code changes. The editable
+Rerun `build_ffi_python.sh` whenever the Rust code changes. The editable
 install picks up the refreshed cdylib on the next import. Prebuilt
 wheels are on the roadmap.
 

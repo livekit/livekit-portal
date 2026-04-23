@@ -12,12 +12,11 @@ Both plugins do Portal sync for you: timestamp-matched observations, reliable st
 The packages live in this repo's `python/` uv workspace. For a consumer repo, depend on them directly; for local development:
 
 ```bash
-cd python
-uv sync                                                  # resolves everything
-./packages/livekit-portal/scripts/build_native.sh release
+bash scripts/build_ffi_python.sh release                 # build the cdylib
+cd python && uv sync                                     # resolves everything
 ```
 
-`build_native.sh` compiles the Rust FFI crate and drops the cdylib into `packages/livekit-portal/livekit/portal/`, where `ctypes` loads it at import time. Skip it only if you've set `LIVEKIT_PORTAL_FFI_LIB` to a prebuilt binary.
+`build_ffi_python.sh` compiles the Rust FFI crate and drops the cdylib into `python/packages/livekit-portal/livekit/portal/`, where `ctypes` loads it at import time. Skip it only if you've set `LIVEKIT_PORTAL_FFI_LIB` to a prebuilt binary.
 
 Standalone install (once published):
 
@@ -213,7 +212,7 @@ The loop also handles Portal's callback dispatch, so if you ever want to registe
 
 | Symptom | Likely cause |
 |---|---|
-| `ffi not initialized` | cdylib didn't load. Rerun `build_native.sh` or set `LIVEKIT_PORTAL_FFI_LIB`. |
+| `ffi not initialized` | cdylib didn't load. Rerun `build_ffi_python.sh` or set `LIVEKIT_PORTAL_FFI_LIB`. |
 | `LiveKit*Config.url and .token are required` | Token mint returned empty string, or you forgot to set them in the config. |
 | Observations always empty | First sync hasn't happened yet. Confirm both sides joined the same room, camera names match, and `fps` is identical. |
 | High `states_dropped` | Encoder is throttling or a camera stopped publishing. Compare `portal.metrics().transport.frames_received` (operator) with `frames_sent` (robot). |

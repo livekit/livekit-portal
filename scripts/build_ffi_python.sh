@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Build the livekit-portal-ffi cdylib and regenerate the UniFFI Python
 # bindings. The cdylib and generated module both land next to the package
-# source (livekit/portal/) so the wheel ships them together.
+# source (python/packages/livekit-portal/livekit/portal/) so the wheel
+# ships them together.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# scripts/ lives at packages/livekit-portal/scripts/ under the python workspace,
-# so repo root is four levels up from here.
-REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
-PKG_DIR="$HERE/../livekit/portal"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+PKG_DIR="$REPO_ROOT/python/packages/livekit-portal/livekit/portal"
 
 MODE="${1:-release}"
 if [[ "$MODE" != "release" && "$MODE" != "debug" ]]; then

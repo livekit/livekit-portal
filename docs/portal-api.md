@@ -13,10 +13,10 @@ Portal is not on PyPI yet. You build from source. See the
 
 ```bash
 git clone https://github.com/livekit/livekit-portal.git
-cd livekit-portal/python/packages/livekit-portal
+cd livekit-portal
 
-uv sync
-bash scripts/build_native.sh release       # or `debug` for faster iteration
+bash scripts/build_ffi_python.sh release   # or `debug` for faster iteration
+cd python/packages/livekit-portal && uv sync
 ```
 
 If the cdylib lives elsewhere (e.g. during Rust-side dev), point
