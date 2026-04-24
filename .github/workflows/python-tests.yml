@@ -1,0 +1,51 @@
+name: Python tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: python-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest on ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust is needed to build the livekit-portal-ffi cdylib and regenerate
+      # the UniFFI-generated Python module (both live next to the package
+      # source; the wheel ships them together).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # uniffi is pinned to a git rev, so cache by the ffi crate's
+          # Cargo.toml + the lockfile rather than the default workspace-wide
+          # key. Avoids a full rebuild when unrelated Rust files change.
+          workspaces: ". -> target"
+          key: ffi-${{ hashFiles('Cargo.lock', 'livekit-portal-ffi/Cargo.toml') }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build FFI cdylib and generate Python bindings
+        run: bash scripts/build_ffi_python.sh release
+
+      - name: Install workspace (livekit-portal + dev deps)
+        working-directory: python
+        run: uv sync --group dev
+
+      - name: Run pytest
+        working-directory: python
+        run: uv run pytest packages/livekit-portal/tests -v
