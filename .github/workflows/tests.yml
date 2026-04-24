@@ -1,4 +1,4 @@
-name: Python tests
+name: tests
 
 on:
   push:
@@ -7,12 +7,28 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: python-tests-${{ github.ref }}
+  group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: pytest on ubuntu
+  rust:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key from the python job so a failure on one
+          # side doesn't poison the other's incremental artifacts.
+          key: rust-tests
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  python:
+    name: pytest
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -29,7 +45,6 @@ jobs:
           # uniffi is pinned to a git rev, so cache by the ffi crate's
           # Cargo.toml + the lockfile rather than the default workspace-wide
           # key. Avoids a full rebuild when unrelated Rust files change.
-          workspaces: ". -> target"
           key: ffi-${{ hashFiles('Cargo.lock', 'livekit-portal-ffi/Cargo.toml') }}
 
       - uses: astral-sh/setup-uv@v5
