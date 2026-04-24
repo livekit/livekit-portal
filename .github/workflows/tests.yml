@@ -1,0 +1,110 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Everything linked into the livekit Rust SDK's WebRTC pipeline needs these on
+# Ubuntu — `glib-sys` surfaces first via pkg-config (`glib-2.0.pc`), the rest
+# come from the media/capture transitive deps. Matches livekit/rust-sdks' own
+# CI recipe, minus the desktop-capture and NVIDIA bits we don't compile.
+env:
+  LINUX_SYSTEM_DEPS: >-
+    libssl-dev
+    libglib2.0-dev
+    libx11-dev
+    libxext-dev
+    libxfixes-dev
+    libxdamage-dev
+    libxrandr-dev
+    libxcomposite-dev
+    libgl1-mesa-dev
+    libgbm-dev
+    libdrm-dev
+    libva-dev
+
+jobs:
+  rust:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y $LINUX_SYSTEM_DEPS
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key from the python job so a failure on one
+          # side doesn't poison the other's incremental artifacts.
+          key: rust-tests
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  python:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y $LINUX_SYSTEM_DEPS
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Rust is needed to build the livekit-portal-ffi cdylib and regenerate
+      # the UniFFI-generated Python module (both live next to the package
+      # source; the wheel ships them together).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # uniffi is pinned to a git rev, so cache by the ffi crate's
+          # Cargo.toml + the lockfile rather than the default workspace-wide
+          # key. Avoids a full rebuild when unrelated Rust files change.
+          key: ffi-${{ hashFiles('Cargo.lock', 'livekit-portal-ffi/Cargo.toml') }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build FFI cdylib and generate Python bindings
+        run: bash scripts/build_ffi_python.sh release
+
+      - name: Install workspace (livekit-portal + dev deps)
+        working-directory: python
+        run: uv sync --group dev
+
+      - name: Run pytest
+        working-directory: python
+        run: uv run pytest packages/livekit-portal/tests -v
