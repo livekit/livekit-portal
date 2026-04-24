@@ -15,7 +15,13 @@ path = "uniffi-bindgen.rs"
 
 [dependencies]
 livekit-portal = { path = "../livekit-portal" }
-uniffi = { version = "0.29", features = ["cli", "tokio"] }
+# Pinned to main past PR #2824 ("Performance improvement by fixing python
+# loop over bytes"): the Python generator emits per-byte loops for
+# `_UniffiRustBufferBuilder.write` / `_pack_into`, which stalls the GIL
+# for tens of milliseconds per video frame. Fix is merged but not yet in
+# a crates.io release (latest published is 0.31.1, branched before the
+# fix). Drop this back to a version req once a release ships with it.
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", rev = "86a8c0041fc58bb43075dfde349a731d11711188", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 thiserror = "2"
 parking_lot = "0.12"
