@@ -34,6 +34,22 @@ impl SyncOutput {
     }
 }
 
+/// Per-track outcome of one `try_sync` iteration. `drain_to` controls buffer
+/// drainage and `last_emitted_frames` advancement; `stale` drives the
+/// `stale_observations_emitted` metric. The two are independent: a
+/// below-horizon frame is both drained (so it can't clog the buffer) and
+/// stale (the state is outside its tolerance).
+struct MatchSlot {
+    frame: Arc<VideoFrameData>,
+    // If `Some(idx)`, drain `video_buffers[track][0..=idx]` on emit and
+    // set `last_emitted_frames[track] = frame`. If `None`, the frame is
+    // the stored last-emitted fallback — buffer and pointer stay put.
+    drain_to: Option<usize>,
+    // True iff the frame's |delta| from state_ts exceeds `search_range_us`
+    // (pure reuse, or a below-horizon drain-match).
+    stale: bool,
+}
+
 pub(crate) struct SyncBuffer {
     track_names: Vec<String>,
     track_index: HashMap<String, usize>,
@@ -56,9 +72,7 @@ pub(crate) struct SyncBuffer {
     blocker: Option<usize>,
 
     // Reused across try_sync calls to avoid allocating a match map per iteration.
-    // `Some((Some(idx), frame))` = fresh match at buffer index `idx` (drain on emit).
-    // `Some((None, frame))`      = stale reuse of last-emitted frame (do not drain).
-    matched_scratch: Vec<Option<(Option<usize>, Arc<VideoFrameData>)>>,
+    matched_scratch: Vec<Option<MatchSlot>>,
 
     // Per-track: the most recent frame emitted in an observation. Used as a
     // stale fallback when the current state has no in-range match, so no
@@ -88,7 +102,8 @@ impl SyncBuffer {
             track_names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
         let video_buffers = (0..track_names.len()).map(|_| VecDeque::new()).collect();
         let cursors = vec![0; track_names.len()];
-        let matched_scratch = vec![None; track_names.len()];
+        let matched_scratch: Vec<Option<MatchSlot>> =
+            (0..track_names.len()).map(|_| None).collect();
         let last_emitted_frames = vec![None; track_names.len()];
         Self {
             track_names,
@@ -297,19 +312,46 @@ impl SyncBuffer {
                 }
 
                 if let Some(idx) = best_idx {
-                    self.matched_scratch[track_i] =
-                        Some((Some(idx), self.video_buffers[track_i][idx].clone()));
+                    self.matched_scratch[track_i] = Some(MatchSlot {
+                        frame: self.video_buffers[track_i][idx].clone(),
+                        drain_to: Some(idx),
+                        stale: false,
+                    });
                     continue;
                 }
 
-                // No fresh in-range match. If reuse is enabled and the track
-                // has emitted before, stale-reuse immediately — same rule for
-                // every "no fresh match" case (empty buffer, below horizon,
-                // past horizon). Keeps the policy consistent: video "freezes"
-                // on the last good frame while state keeps flowing.
+                // No fresh in-range match. Under reuse, prefer the newest
+                // below-horizon buffered frame (ts ≤ state_ts, |Δ| ≥ range)
+                // over the stored last-emitted fallback: it tracks forward
+                // with state_ts so match_delta stays bounded, and draining
+                // it keeps the buffer from wedging at cap while a track is
+                // systematically behind. Since state_ts advances monotonically,
+                // no future state could fresh-match a frame with ts ≤ current
+                // state_ts − range, so consuming it now is safe.
+                //
+                // Past-horizon frames (ts > state_ts) fall through to pure
+                // reuse so a later state can still claim them.
                 if self.config.reuse_stale_frames {
+                    if !frame_buf.is_empty() {
+                        let c = self.cursors[track_i];
+                        let cand = &frame_buf[c];
+                        if cand.timestamp_us <= state_ts
+                            && state_ts - cand.timestamp_us >= range
+                        {
+                            self.matched_scratch[track_i] = Some(MatchSlot {
+                                frame: cand.clone(),
+                                drain_to: Some(c),
+                                stale: true,
+                            });
+                            continue;
+                        }
+                    }
                     if let Some(stale) = self.last_emitted_frames[track_i].clone() {
-                        self.matched_scratch[track_i] = Some((None, stale));
+                        self.matched_scratch[track_i] = Some(MatchSlot {
+                            frame: stale,
+                            drain_to: None,
+                            stale: true,
+                        });
                         continue;
                     }
                 }
@@ -362,14 +404,15 @@ impl SyncBuffer {
             // Record worst-case per-track alignment (against whichever frame
             // got used, fresh or stale — stale deltas can be arbitrarily large
             // so this surfaces video-freeze duration in metrics). Separately
-            // flag observations that involved any stale reuse so ops can
-            // distinguish "video is silently frozen" from normal operation.
+            // flag observations that involved any stale match so ops can
+            // distinguish "video is silently frozen / behind" from normal
+            // operation.
             let mut worst_delta = 0u64;
             let mut any_stale = false;
             for slot in &self.matched_scratch {
-                if let Some((maybe_idx, frame)) = slot.as_ref() {
-                    worst_delta = worst_delta.max(state_ts.abs_diff(frame.timestamp_us));
-                    if maybe_idx.is_none() {
+                if let Some(s) = slot.as_ref() {
+                    worst_delta = worst_delta.max(state_ts.abs_diff(s.frame.timestamp_us));
+                    if s.stale {
                         any_stale = true;
                     }
                 }
@@ -384,23 +427,25 @@ impl SyncBuffer {
             let mut frames_map: HashMap<String, VideoFrameData> =
                 HashMap::with_capacity(self.track_names.len());
             for track_i in 0..self.track_names.len() {
-                if let Some((maybe_idx, frame)) = self.matched_scratch[track_i].take() {
-                    if let Some(idx) = maybe_idx {
-                        // Fresh match: drain the buffer up to and including
-                        // this frame and remember it as the stale fallback
-                        // for any later state that can't find a fresh match.
+                if let Some(slot) = self.matched_scratch[track_i].take() {
+                    if let Some(idx) = slot.drain_to {
+                        // Drain the buffer up to and including the chosen
+                        // frame and remember it as the stale fallback for
+                        // later states that can't find a fresh match. Done
+                        // for fresh matches AND for below-horizon reuse
+                        // matches, so `last_emitted_frames` always advances
+                        // with state_ts.
                         self.video_buffers[track_i].drain(0..=idx);
                         // Cursor was at or just past idx; after draining, shift it back.
                         self.cursors[track_i] = self.cursors[track_i].saturating_sub(idx + 1);
-                        self.last_emitted_frames[track_i] = Some(frame.clone());
+                        self.last_emitted_frames[track_i] = Some(slot.frame.clone());
                     }
-                    // Stale reuse (maybe_idx == None): leave buffer/cursor
-                    // untouched so a future in-range frame can still be used
-                    // by a later state; the stored last-emitted frame is
-                    // unchanged.
+                    // Pure reuse (drain_to == None): leave buffer / cursor /
+                    // last-emitted untouched so a future in-range frame can
+                    // still be claimed by a later state.
                     //
                     // Cheap clone: VideoFrameData carries Arc<[u8]>.
-                    frames_map.insert(self.track_names[track_i].clone(), (*frame).clone());
+                    frames_map.insert(self.track_names[track_i].clone(), (*slot.frame).clone());
                 }
             }
 
@@ -998,12 +1043,14 @@ mod tests {
         assert_eq!(out.drops.len(), 1);
     }
 
-    /// Below-horizon case: buffer holds only frames too old to match, newest
-    /// is still below `state_ts + range` (future frames could match under
-    /// strict). Under reuse, the state emits with the stale frame right
-    /// away instead of waiting — matches the rest of the reuse policy.
+    /// Below-horizon case: buffer holds only frames too old to fresh-match.
+    /// Under reuse, the state emits immediately with the newest below-horizon
+    /// frame (not the first-ever-emitted one), the buffer drains those old
+    /// frames, and `last_emitted_frames` advances so match_delta stays
+    /// bounded. No future state can fresh-match a frame with ts ≤ state_ts −
+    /// range (state_ts is monotonic), so consuming it is safe.
     #[test]
-    fn reuse_below_horizon_emits_with_last_frame() {
+    fn reuse_below_horizon_advances_to_best_buffered() {
         let tracks = vec!["cam1".to_string()];
         let fields = vec!["j1".to_string()];
         let mut buf = mk(&tracks, fields, reuse_config());
@@ -1013,17 +1060,69 @@ mod tests {
         let out = buf.push_state(10, vec![0.0]);
         assert_eq!(out.observations.len(), 1);
 
-        // Buffer holds f@200 (too old for state@5_000 under range=500) but
-        // newest_ts (200) < state_ts + range (5_500) — strict would wait.
-        // Reuse emits immediately with f@0, leaving f@200 in the buffer.
+        // f@200 is below state@5_000's horizon (Δ = 4_800 ≫ range=500) but
+        // newer than the stored last-emitted f@0. Reuse must prefer it and
+        // drain it — otherwise match_delta keeps growing against f@0 forever.
         let _ = push_f(&mut buf, "cam1", 200);
         let out = buf.push_state(5_000, vec![1.0]);
         assert_eq!(out.drops.len(), 0);
         assert_eq!(out.observations.len(), 1);
-        assert_eq!(out.observations[0].frames["cam1"].timestamp_us, 0);
-        // f@200 untouched — still in buffer for whoever can use it.
-        assert_eq!(buf.video_buffers[0].len(), 1);
-        assert_eq!(buf.video_buffers[0][0].timestamp_us, 200);
+        assert_eq!(
+            out.observations[0].frames["cam1"].timestamp_us,
+            200,
+            "stale reuse should advance to the newest below-horizon frame"
+        );
+        // Buffer drained; last-emitted advanced.
+        assert_eq!(buf.video_buffers[0].len(), 0);
+        assert_eq!(buf.last_emitted_frames[0].as_ref().unwrap().timestamp_us, 200);
+    }
+
+    /// Regression: under steady-state stale reuse, `last_emitted_frames` must
+    /// keep advancing with state_ts as long as frames keep arriving below
+    /// horizon. Before the fix, the first-ever-emitted frame became a
+    /// permanent fallback, causing match_delta to grow linearly with session
+    /// length and buf_vid_max to pin at cap.
+    #[test]
+    fn reuse_steady_state_advances_last_emitted_below_horizon() {
+        let tracks = vec!["cam1".to_string()];
+        let fields = vec!["j1".to_string()];
+        // Narrow range so incoming frames are never a fresh match.
+        let config = SyncConfig {
+            video_buffer_size: 5,
+            state_buffer_size: 5,
+            search_range_us: 100,
+            reuse_stale_frames: true,
+        };
+        let mut buf = mk(&tracks, fields, config);
+
+        // First emission establishes last_emitted = f@0.
+        let _ = push_f(&mut buf, "cam1", 0);
+        let out = buf.push_state(50, vec![0.0]);
+        assert_eq!(out.observations.len(), 1);
+        assert_eq!(buf.last_emitted_frames[0].as_ref().unwrap().timestamp_us, 0);
+
+        // Simulate a track that arrives consistently behind state_ts by more
+        // than `range` — every state stale-reuses. The pointer must still
+        // advance to the newest below-horizon frame each round.
+        for i in 1..=10u64 {
+            let frame_ts = i * 1_000; // behind state_ts by 500us, d=500 >= range
+            let state_ts = frame_ts + 500;
+            let _ = push_f(&mut buf, "cam1", frame_ts);
+            let out = buf.push_state(state_ts, vec![i as f64]);
+            assert_eq!(out.observations.len(), 1);
+            assert_eq!(out.drops.len(), 0);
+            assert_eq!(
+                out.observations[0].frames["cam1"].timestamp_us,
+                frame_ts,
+                "round #{i}: stale match should be the newest below-horizon frame"
+            );
+            // Buffer drains so it never pins at cap.
+            assert_eq!(buf.video_buffers[0].len(), 0);
+            assert_eq!(
+                buf.last_emitted_frames[0].as_ref().unwrap().timestamp_us,
+                frame_ts
+            );
+        }
     }
 
     /// `stale_observations_emitted` counts only observations that used a
