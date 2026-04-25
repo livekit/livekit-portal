@@ -16,9 +16,11 @@ and nested submetrics), the `PortalError` exception, and the
   * Adds frame-normalization on `send_video_frame` (accept bytes or
     `np.ndarray(H, W, 3)` uint8 and infer W/H from the array).
 
-Frame formats on the wire are unchanged: sends take RGB24, receives deliver
-I420 planar. Use `livekit.portal.i420_bytes_to_numpy_rgb` to convert received
-frames for display.
+Frame format is RGB24 in both directions: `send_video_frame` accepts RGB,
+and received `VideoFrameData.data` is packed RGB (`W*H*3` bytes) regardless
+of transport — WebRTC frames are color-converted from I420 in Rust before
+delivery, frame-video frames are codec-decoded to RGB. Use
+`livekit.portal.frame_bytes_to_numpy_rgb` for a typed `(H, W, 3)` view.
 """
 from __future__ import annotations
 
@@ -34,13 +36,15 @@ _log = logging.getLogger(__name__)
 
 from . import _frame
 from . import livekit_portal_ffi as _ffi
-from ._frame import i420_bytes_to_numpy_rgb
+from ._frame import frame_bytes_to_numpy_rgb
 
 # Re-export generated types that don't carry dtype-sensitive payload. The
 # UniFFI module is the source of truth for these.
 Role = _ffi.Role
 DType = _ffi.DType
+VideoCodec = _ffi.VideoCodec
 FieldSpec = _ffi.FieldSpec
+FrameVideoSpec = _ffi.FrameVideoSpec
 VideoFrameData = _ffi.VideoFrame
 PortalMetrics = _ffi.PortalMetrics
 SyncMetrics = _ffi.SyncMetrics
@@ -50,6 +54,10 @@ RttMetrics = _ffi.RttMetrics
 PortalError = _ffi.PortalError
 RpcInvocationData = _ffi.RpcInvocationData
 RpcError = _ffi.RpcError
+
+# Default JPEG quality for `add_frame_video` when no explicit value is given.
+# Mirrors the Rust core's `DEFAULT_MJPEG_QUALITY`.
+DEFAULT_MJPEG_QUALITY: int = 90
 
 # A schema entry accepted by add_state_typed/add_action_typed. Either a
 # FieldSpec (record passthrough) or a (name, dtype) tuple — the latter is
@@ -440,6 +448,7 @@ class PortalConfig:
         "_session",
         "_role",
         "_video_tracks",
+        "_frame_video_tracks",
         "_state_schema",
         "_action_schema",
     )
@@ -449,6 +458,7 @@ class PortalConfig:
         self._session = session
         self._role = role
         self._video_tracks: List[str] = []
+        self._frame_video_tracks: List[FrameVideoSpec] = []
         self._state_schema: List[FieldSpec] = []
         self._action_schema: List[FieldSpec] = []
 
@@ -463,6 +473,10 @@ class PortalConfig:
     @property
     def video_tracks(self) -> List[str]:
         return list(self._video_tracks)
+
+    @property
+    def frame_video_tracks(self) -> List[FrameVideoSpec]:
+        return list(self._frame_video_tracks)
 
     @property
     def state_fields(self) -> List[str]:
@@ -483,6 +497,37 @@ class PortalConfig:
     def add_video(self, name: str) -> None:
         self._inner.add_video(name)
         self._video_tracks.append(name)
+
+    def add_frame_video(
+        self,
+        name: str,
+        codec: VideoCodec = VideoCodec.MJPEG,
+        quality: int = DEFAULT_MJPEG_QUALITY,
+    ) -> None:
+        """Declare a frame-video track.
+
+        Frames travel over a reliable byte-stream channel rather than the
+        WebRTC media path, encoded per-frame with `codec`. The user-facing
+        send/receive API is identical to plain video — `send_video_frame`
+        accepts RGB, `on_video_frame` / `get_video_frame` deliver RGB.
+
+        `codec`:
+          * `VideoCodec.RAW` — uncompressed RGB24, largest payload, zero
+            encode cost.
+          * `VideoCodec.PNG` — lossless, ~2-3x compression on natural images.
+          * `VideoCodec.MJPEG` (default) — lossy per-frame JPEG, ~10-20x
+            compression at quality 90, sub-millisecond decode. Use for
+            inference where frame independence matters but bit-exactness
+            doesn't.
+
+        `quality` is in 1..=100 and is honored for `VideoCodec.MJPEG`. It is
+        ignored for `RAW` and `PNG`. Track names must be unique across all
+        `add_video` and `add_frame_video` calls; a duplicate raises.
+        """
+        self._inner.add_frame_video(name, codec, quality)
+        self._frame_video_tracks.append(
+            FrameVideoSpec(name=name, codec=codec, quality=quality)
+        )
 
     def add_state_typed(self, schema: Iterable[SchemaEntry]) -> None:
         """Declare state fields with per-field dtype.
@@ -742,8 +787,11 @@ class Portal:
 __all__ = [
     "Role",
     "DType",
+    "VideoCodec",
     "FieldSpec",
+    "FrameVideoSpec",
     "TypedScalar",
+    "DEFAULT_MJPEG_QUALITY",
     "PortalConfig",
     "Portal",
     "Observation",
@@ -758,5 +806,5 @@ __all__ = [
     "PortalError",
     "RpcInvocationData",
     "RpcError",
-    "i420_bytes_to_numpy_rgb",
+    "frame_bytes_to_numpy_rgb",
 ]

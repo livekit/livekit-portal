@@ -482,7 +482,7 @@ mod tests {
             Arc::new(VideoFrameData {
                 width: 2,
                 height: 2,
-                data: Arc::from(vec![0u8; 6]),
+                data: Arc::from(vec![0u8; 12]),
                 timestamp_us: ts,
             }),
         )
@@ -1138,13 +1138,13 @@ mod tests {
 
         // Fresh emission #1.
         let _ = buf.push_frame("cam1", Arc::new(VideoFrameData {
-            width: 2, height: 2, data: Arc::from(vec![0u8; 6]), timestamp_us: 1_000,
+            width: 2, height: 2, data: Arc::from(vec![0u8; 12]), timestamp_us: 1_000,
         }));
         let _ = buf.push_state(1_050, vec![1.0]);
 
         // Fresh emission #2.
         let _ = buf.push_frame("cam1", Arc::new(VideoFrameData {
-            width: 2, height: 2, data: Arc::from(vec![0u8; 6]), timestamp_us: 2_000,
+            width: 2, height: 2, data: Arc::from(vec![0u8; 12]), timestamp_us: 2_000,
         }));
         let _ = buf.push_state(2_050, vec![2.0]);
 

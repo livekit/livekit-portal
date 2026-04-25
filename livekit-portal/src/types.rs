@@ -145,7 +145,10 @@ pub struct Observation {
     pub timestamp_us: u64,
 }
 
-/// Decoded video frame data. The pixel buffer is shared via `Arc<[u8]>` so cloning is cheap.
+/// Decoded video frame. `data` is packed RGB24 (R,G,B byte order, `W*H*3`
+/// bytes) regardless of transport — WebRTC frames are color-converted from
+/// I420 on receive, frame-video frames are decoded back to RGB by the
+/// codec. The buffer is shared via `Arc<[u8]>` so cloning is cheap.
 #[derive(Debug, Clone)]
 pub struct VideoFrameData {
     pub width: u32,

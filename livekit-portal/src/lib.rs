@@ -1,3 +1,4 @@
+pub mod codec;
 pub mod config;
 mod data;
 pub mod dtype;
@@ -11,7 +12,8 @@ mod sync_buffer;
 pub mod types;
 mod video;
 
-pub use config::{FieldSpec, PortalConfig};
+pub use codec::{Codec, CodecError, CodecResult, DecodedFrame};
+pub use config::{FieldSpec, FrameVideoSpec, PortalConfig};
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
 pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};

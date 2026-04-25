@@ -189,34 +189,50 @@ impl VideoReceiver {
 
 // --- Helpers ---
 
+/// Convert a libwebrtc-decoded video frame into the RGB24 payload the user
+/// API hands back. WebRTC's H264 decoder emits I420; the user-facing
+/// `VideoFrameData.data` is packed RGB24 (R,G,B byte order, `W*H*3` bytes)
+/// so it round-trips cleanly with the RGB the publisher accepted on the
+/// other end. Frame-video tracks use the same RGB layout.
 fn convert_frame<T: AsRef<dyn VideoBuffer>>(
     frame: &VideoFrame<T>,
     timestamp_us: u64,
 ) -> VideoFrameData {
     let i420 = frame.buffer.as_ref().to_i420();
+    let (sy, su, sv) = i420.strides();
     let (y, u, v) = i420.data();
-    let total = y.len() + u.len() + v.len();
+    let width = i420.width();
+    let height = i420.height();
+    let total = (width as usize) * (height as usize) * 3;
+    let dst_stride = (width as i32) * 3;
 
-    // Build the Arc payload in a single allocation/copy. The naive
-    // `Vec::extend_from_slice * 3` followed by `Arc::from(vec)` allocates
-    // twice and copies twice — at 640x480 that's ~460KB doubled per frame.
+    // Single-allocation Arc — libyuv writes RGB24 directly into uninit memory.
     let mut data: Arc<[MaybeUninit<u8>]> = Arc::new_uninit_slice(total);
     {
         // SAFETY: freshly allocated Arc, no other references exist.
         let dst = Arc::get_mut(&mut data).expect("freshly allocated Arc has unique ownership");
-        // SAFETY: dst is exactly `total` bytes, sources are independent of
-        // dst, and MaybeUninit<u8> shares u8's layout.
+        // SAFETY: src planes are sized by libwebrtc per `width`/`height`;
+        // dst is exactly `width*height*3` bytes; libyuv reads/writes within
+        // the bounds described by the strides we pass.
         unsafe {
-            let p = dst.as_mut_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(y.as_ptr(), p, y.len());
-            std::ptr::copy_nonoverlapping(u.as_ptr(), p.add(y.len()), u.len());
-            std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(y.len() + u.len()), v.len());
+            yuv_sys::rs_I420ToRAW(
+                y.as_ptr(),
+                sy as i32,
+                u.as_ptr(),
+                su as i32,
+                v.as_ptr(),
+                sv as i32,
+                dst.as_mut_ptr() as *mut u8,
+                dst_stride,
+                width as i32,
+                height as i32,
+            );
         }
     }
-    // SAFETY: every byte was initialized by the three copies above.
+    // SAFETY: libyuv wrote width*height*3 bytes into `dst`.
     let data: Arc<[u8]> = unsafe { data.assume_init() };
 
-    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
+    VideoFrameData { width, height, data, timestamp_us }
 }
 
 // RGB24 (R,G,B byte order) -> I420 via libyuv. libyuv's `RAW` format is R,G,B;

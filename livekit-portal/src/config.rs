@@ -1,5 +1,11 @@
+use crate::codec::Codec;
 use crate::dtype::DType;
 use crate::types::{Role, SyncConfig};
+
+/// Default JPEG quality for `add_frame_video` when MJPEG is selected without an
+/// explicit value. Tuned for inference workloads: visually near-lossless on
+/// natural images, ~10-20x compression versus raw RGB.
+pub const DEFAULT_MJPEG_QUALITY: u8 = 90;
 
 /// A single schema entry: field name plus declared on-wire dtype.
 ///
@@ -31,12 +37,36 @@ impl From<FieldSpec> for (String, DType) {
     }
 }
 
+/// One frame-video track declaration: name, codec, and per-codec quality.
+///
+/// Frame-video tracks bypass the WebRTC media path and ride a reliable
+/// byte-stream channel instead. Each frame is encoded once on the sender
+/// (Raw / PNG / MJPEG) and decoded back to RGB on the receiver. The
+/// user-facing API is identical to plain video — `send_video_frame` /
+/// `on_video_frame` / `get_video_frame` — only the wire transport differs.
+///
+/// `quality` is honored for `Mjpeg` (1..=100) and ignored for `Raw` and
+/// `Png`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameVideoSpec {
+    pub name: String,
+    pub codec: Codec,
+    pub quality: u8,
+}
+
+impl FrameVideoSpec {
+    pub fn new(name: impl Into<String>, codec: Codec, quality: u8) -> Self {
+        Self { name: name.into(), codec, quality }
+    }
+}
+
 /// Configuration for a Portal session. Built incrementally before connecting.
 #[derive(Debug, Clone)]
 pub struct PortalConfig {
     pub(crate) session: String,
     pub(crate) role: Role,
     pub(crate) video_tracks: Vec<String>,
+    pub(crate) frame_video_tracks: Vec<FrameVideoSpec>,
     pub(crate) state_schema: Vec<FieldSpec>,
     pub(crate) action_schema: Vec<FieldSpec>,
     pub(crate) state_reliable: bool,
@@ -54,6 +84,7 @@ impl PortalConfig {
             session: session.into(),
             role,
             video_tracks: Vec::new(),
+            frame_video_tracks: Vec::new(),
             state_schema: Vec::new(),
             action_schema: Vec::new(),
             state_reliable: true,
@@ -67,7 +98,49 @@ impl PortalConfig {
     }
 
     pub fn add_video(&mut self, name: impl Into<String>) {
-        self.video_tracks.push(name.into());
+        let name = name.into();
+        assert!(
+            !self.has_track(&name),
+            "video track '{name}' already declared (each track name must be unique \
+             across add_video and add_frame_video)"
+        );
+        self.video_tracks.push(name);
+    }
+
+    /// Declare a frame-video track. Frame-video tracks deliver each frame
+    /// independently over a reliable byte-stream channel, encoded with
+    /// `codec`. The receiver decodes back to RGB so the user-facing
+    /// `on_video_frame` / `get_video_frame` API matches plain video.
+    ///
+    /// `quality` is in `1..=100` for `Codec::Mjpeg` and ignored for `Codec::Raw`
+    /// / `Codec::Png`. Use `DEFAULT_MJPEG_QUALITY` (90) when in doubt.
+    ///
+    /// Track names must be unique across all `add_video` and
+    /// `add_frame_video` calls; a duplicate panics.
+    pub fn add_frame_video(
+        &mut self,
+        name: impl Into<String>,
+        codec: Codec,
+        quality: u8,
+    ) {
+        let name = name.into();
+        assert!(
+            !self.has_track(&name),
+            "frame-video track '{name}' already declared (each track name must be \
+             unique across add_video and add_frame_video)"
+        );
+        if codec == Codec::Mjpeg {
+            assert!(
+                (1..=100).contains(&quality),
+                "MJPEG quality must be in 1..=100, got {quality}"
+            );
+        }
+        self.frame_video_tracks.push(FrameVideoSpec::new(name, codec, quality));
+    }
+
+    fn has_track(&self, name: &str) -> bool {
+        self.video_tracks.iter().any(|n| n == name)
+            || self.frame_video_tracks.iter().any(|s| s.name == name)
     }
 
     /// Declare state fields with per-field dtype. Order is significant and
@@ -175,6 +248,17 @@ impl PortalConfig {
 
     pub fn video_tracks(&self) -> &[String] {
         &self.video_tracks
+    }
+
+    /// Declared frame-video tracks (name + codec + quality), in declaration
+    /// order.
+    pub fn frame_video_tracks(&self) -> &[FrameVideoSpec] {
+        &self.frame_video_tracks
+    }
+
+    /// Frame-video track names, derived from `frame_video_tracks`.
+    pub fn frame_video_track_names(&self) -> impl Iterator<Item = &str> {
+        self.frame_video_tracks.iter().map(|s| s.name.as_str())
     }
 
     /// Ordered state field names. Derived from `state_schema`; does not
