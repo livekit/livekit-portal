@@ -136,6 +136,7 @@ def test_action_wrapper_values_are_typed_by_default():
             "counter": 42.0,
         },
         timestamp_us=100,
+        in_reply_to_ts_us=None,
     )
     action = _wrap_action(ffi_action, portal._action_schema)
     assert action.timestamp_us == 100
@@ -197,7 +198,9 @@ def test_wrapper_drops_fields_missing_from_payload():
     from livekit.portal import livekit_portal_ffi as _ffi
 
     portal = _mixed_schema_portal()
-    ffi_action = _ffi.Action(values={"shoulder": 0.25}, timestamp_us=0)
+    ffi_action = _ffi.Action(
+        values={"shoulder": 0.25}, timestamp_us=0, in_reply_to_ts_us=None
+    )
     action = _wrap_action(ffi_action, portal._action_schema)
     # Partial payload → wrapper returns only the fields that were sent.
     assert action.values == {"shoulder": 0.25}
@@ -300,3 +303,113 @@ def test_send_rejects_numpy_bool_for_int_field():
     portal = _mixed_schema_portal()
     with pytest.raises(PortalError.DtypeMismatch):
         portal.send_action({"mode": np.bool_(True)})
+
+
+# --- Action chunk schema + wrappers ----------------------------------------
+
+
+def test_add_action_chunk_records_spec():
+    cfg = PortalConfig("vla", Role.OPERATOR)
+    cfg.add_action_chunk(
+        "act",
+        horizon=10,
+        fields=[("j1", DType.F32), ("j2", DType.F32)],
+    )
+    chunks = cfg.action_chunks
+    assert len(chunks) == 1
+    assert chunks[0].name == "act"
+    assert chunks[0].horizon == 10
+    assert [f.name for f in chunks[0].fields] == ["j1", "j2"]
+
+
+def test_action_chunk_wrapper_reconstructs_numpy_arrays():
+    np = pytest.importorskip("numpy")
+    from livekit.portal import _wrap_action_chunk
+    from livekit.portal import livekit_portal_ffi as _ffi
+
+    cfg = PortalConfig("vla", Role.OPERATOR)
+    cfg.add_action_chunk(
+        "act",
+        horizon=4,
+        fields=[("j1", DType.F32), ("gripper", DType.BOOL)],
+    )
+    portal = Portal(cfg)
+    ffi_chunk = _ffi.ActionChunk(
+        name="act",
+        horizon=4,
+        data={"j1": [0.0, 0.5, 1.0, 1.5], "gripper": [0.0, 1.0, 1.0, 0.0]},
+        timestamp_us=42,
+        in_reply_to_ts_us=10,
+    )
+    chunk = _wrap_action_chunk(ffi_chunk, portal._chunk_schemas)
+    assert chunk.name == "act"
+    assert chunk.horizon == 4
+    assert chunk.timestamp_us == 42
+    assert chunk.in_reply_to_ts_us == 10
+    # Reconstructed columns are numpy arrays of declared dtype.
+    assert chunk.data["j1"].dtype == np.float32
+    assert chunk.data["gripper"].dtype == np.bool_
+    # Raw view stays as f64 lists.
+    assert chunk.raw_data["j1"] == [0.0, 0.5, 1.0, 1.5]
+
+
+def test_send_action_chunk_accepts_dict_columns():
+    np = pytest.importorskip("numpy")
+    cfg = PortalConfig("vla", Role.OPERATOR)
+    cfg.add_action_chunk(
+        "act",
+        horizon=3,
+        fields=[("j1", DType.F32)],
+    )
+    portal = Portal(cfg)
+    # Dict-of-arrays input — accepted, even though no peer is connected
+    # (PortalError on send is fine; we only care that the validator path
+    # didn't reject the shape).
+    try:
+        portal.send_action_chunk("act", {"j1": np.array([0.1, 0.2, 0.3])})
+    except PortalError.UnknownChunk:
+        pytest.fail("declared chunk name treated as unknown")
+    except PortalError:
+        # send may fail with a different PortalError because there's no
+        # connected peer — that's the expected path.
+        pass
+
+
+def test_send_action_chunk_accepts_2d_ndarray():
+    np = pytest.importorskip("numpy")
+    cfg = PortalConfig("vla", Role.OPERATOR)
+    cfg.add_action_chunk(
+        "act",
+        horizon=3,
+        fields=[("j1", DType.F32), ("j2", DType.F32)],
+    )
+    portal = Portal(cfg)
+    arr = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]], dtype=np.float32)
+    try:
+        portal.send_action_chunk("act", arr)
+    except PortalError.UnknownChunk:
+        pytest.fail("declared chunk name treated as unknown")
+    except PortalError:
+        pass
+
+
+def test_send_action_chunk_unknown_name_raises():
+    cfg = PortalConfig("vla", Role.OPERATOR)
+    cfg.add_action_chunk("act", horizon=3, fields=[("j1", DType.F32)])
+    portal = Portal(cfg)
+    with pytest.raises(PortalError.UnknownChunk):
+        portal.send_action_chunk("never_declared", {"j1": [0.0, 0.1, 0.2]})
+
+
+def test_send_action_passes_in_reply_to_ts_us_through_validator():
+    cfg = PortalConfig("act", Role.OPERATOR)
+    cfg.add_action_typed([("j1", DType.F32)])
+    portal = Portal(cfg)
+    # Passing the kwarg shouldn't trigger a DtypeMismatch path. We expect
+    # any non-mismatch PortalError (no peer) to be fine.
+    try:
+        portal.send_action({"j1": 0.5}, in_reply_to_ts_us=12345)
+    except PortalError.DtypeMismatch:
+        pytest.fail("in_reply_to_ts_us must not affect dtype validation")
+    except PortalError:
+        pass

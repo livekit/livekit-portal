@@ -149,7 +149,9 @@ def test_random_values_roundtrip_through_wrapper(dtype):
         delivered = _simulate_delivered_f64(dtype, value)
         expected = _expected_typed(dtype, value)
 
-        ffi_action = _ffi.Action(values={"v": delivered}, timestamp_us=0)
+        ffi_action = _ffi.Action(
+            values={"v": delivered}, timestamp_us=0, in_reply_to_ts_us=None
+        )
         got = _wrap_action(ffi_action, schema).values["v"]
 
         assert got == expected, (

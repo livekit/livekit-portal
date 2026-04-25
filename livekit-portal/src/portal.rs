@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,13 +8,16 @@ use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::{FieldSpec, PortalConfig};
-use crate::data::{handle_data_received, ActionSlot, DataPublisher, StateSlot};
+use crate::config::{ChunkSpec, FieldSpec, PortalConfig};
+use crate::data::{
+    dispatch_chunk_payload, handle_data_received, ActionSlot, ChunkPublisher, ChunkSlot,
+    DataPublisher, StateSlot, ACTION_CHUNK_TOPIC, ACTION_TOPIC, STATE_TOPIC,
+};
 use crate::error::{PortalError, PortalResult};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rpc::RpcHandler;
 use crate::rtt::RttService;
-use crate::serialization::schema_fingerprint;
+use crate::serialization::{action_fingerprint, schema_fingerprint};
 use crate::sync_buffer::{SyncBuffer, SyncOutput};
 use crate::types::*;
 use crate::video::{VideoPublisher, VideoReceiver, VideoTrackSlots};
@@ -125,6 +128,8 @@ pub struct Portal {
     video_publishers: Mutex<HashMap<String, Arc<VideoPublisher>>>,
     state_publisher: Mutex<Option<Arc<DataPublisher>>>,
     action_publisher: Mutex<Option<Arc<DataPublisher>>>,
+    /// Operator-side: one publisher per declared action chunk.
+    chunk_publishers: Mutex<HashMap<String, Arc<ChunkPublisher>>>,
 
     // Operator-side sync + dispatch.
     sync_buffer: Mutex<Option<Arc<Mutex<SyncBuffer>>>>,
@@ -133,6 +138,13 @@ pub struct Portal {
     // Push callback + pull latest-wins slot, bundled per stream.
     action: Arc<ActionSlot>,
     state: Arc<StateSlot>,
+    /// Robot-side: one slot per declared action chunk. Fixed at construction
+    /// (keyed by chunk name) so the receive path doesn't lock the map.
+    chunk_slots: HashMap<String, Arc<ChunkSlot>>,
+    /// Rate-limit set for unknown chunk fingerprints — the byte-stream
+    /// equivalent of `DataSlot::warned_mismatches`, but lives at the
+    /// dispatcher level because no slot owns "unknown" packets.
+    unknown_chunk_fp_warns: Arc<Mutex<HashSet<u32>>>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
 
@@ -160,6 +172,15 @@ impl Portal {
         let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
         let obs_sink = Arc::new(ObservationSink::new());
 
+        // Build chunk slots once at construction so the dispatch table is
+        // immutable for the Portal's lifetime — `handle_room_event` reads
+        // them without taking any Portal-level lock.
+        let chunk_slots: HashMap<String, Arc<ChunkSlot>> = config
+            .action_chunks
+            .iter()
+            .map(|spec| (spec.name.clone(), Arc::new(ChunkSlot::new(spec.clone()))))
+            .collect();
+
         Self {
             config,
             lifecycle: tokio::sync::Mutex::new(()),
@@ -173,10 +194,13 @@ impl Portal {
             video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
             action_publisher: Mutex::new(None),
+            chunk_publishers: Mutex::new(HashMap::new()),
             sync_buffer: Mutex::new(None),
             obs_sink,
             action: Arc::new(ActionSlot::new()),
             state: Arc::new(StateSlot::new()),
+            chunk_slots,
+            unknown_chunk_fp_warns: Arc::new(Mutex::new(HashSet::new())),
             video_tracks,
             metrics,
             peer_identity: Arc::new(Mutex::new(None)),
@@ -223,8 +247,14 @@ impl Portal {
 
         // Event dispatch runs off a snapshot of the fields it touches, not the
         // whole Portal, so it doesn't need any outer lock.
-        let action_schema_fp = schema_fingerprint(&self.config.action_schema);
+        let action_schema_fp = action_fingerprint(&self.config.action_schema);
         let state_schema_fp = schema_fingerprint(&self.config.state_schema);
+        // The dispatch path needs a slice for fingerprint lookup; the map
+        // form is for `get_action_chunk` / `on_action_chunk` name lookups.
+        // Build the slice once per connect so the event loop iterates a
+        // plain Vec, not a HashMap.
+        let chunk_slots_for_dispatch: Vec<Arc<ChunkSlot>> =
+            self.chunk_slots.values().cloned().collect();
         let ctx = EventContext {
             config: self.config.clone(),
             action_schema_fp,
@@ -233,6 +263,8 @@ impl Portal {
             obs_sink: self.obs_sink.clone(),
             action: self.action.clone(),
             state: self.state.clone(),
+            chunk_slots: chunk_slots_for_dispatch,
+            unknown_chunk_fp_warns: self.unknown_chunk_fp_warns.clone(),
             video_tracks: self.video_tracks.clone(),
             video_receivers: self.video_receivers.clone(),
             metrics: self.metrics.clone(),
@@ -285,18 +317,58 @@ impl Portal {
             .lock()
             .clone()
             .ok_or(PortalError::WrongRole(Role::Operator))?;
-        publisher.send_map(values, timestamp_us)
+        publisher.send_map(values, timestamp_us, None)
     }
 
-    /// Publish an action (operator only). Same ergonomics as `send_state`.
+    /// Publish an action (operator only).
+    ///
+    /// `in_reply_to_ts_us` is the timestamp of the observation this action
+    /// was produced from — pass `Some(obs.timestamp_us)` to give the
+    /// receiver the data it needs to compute true end-to-end policy
+    /// latency (`metrics.policy.e2e_us_*`). Pass `None` for unsolicited
+    /// publishes (teleop, idle commands).
     pub fn send_action(
         &self,
         values: &HashMap<String, TypedValue>,
         timestamp_us: Option<u64>,
+        in_reply_to_ts_us: Option<u64>,
     ) -> PortalResult<()> {
         let publisher =
             self.action_publisher.lock().clone().ok_or(PortalError::WrongRole(Role::Robot))?;
-        publisher.send_map(values, timestamp_us)
+        publisher.send_map(values, timestamp_us, in_reply_to_ts_us)
+    }
+
+    /// Publish an action chunk on the named chunk schema (operator only).
+    ///
+    /// `data` is `field -> column of length horizon`. Columns shorter than
+    /// `horizon` are zero-padded, longer columns are truncated, and unknown
+    /// keys are warned-and-ignored once each. Use `in_reply_to_ts_us` the
+    /// same way as `send_action` to feed `metrics.policy.e2e_us_*`.
+    pub fn send_action_chunk(
+        &self,
+        chunk_name: &str,
+        data: &HashMap<String, Vec<f64>>,
+        timestamp_us: Option<u64>,
+        in_reply_to_ts_us: Option<u64>,
+    ) -> PortalResult<()> {
+        let publisher = {
+            let map = self.chunk_publishers.lock();
+            map.get(chunk_name).cloned()
+        };
+        let Some(publisher) = publisher else {
+            // No publisher resolves to one of three precise errors so the
+            // caller sees the actual mistake instead of a generic refusal:
+            // wrong role, undeclared chunk name, or operator-but-not-yet
+            // connected (publishers are spawned in `setup_operator`).
+            return if self.config.role != Role::Operator {
+                Err(PortalError::WrongRole(Role::Robot))
+            } else if !self.chunk_slots.contains_key(chunk_name) {
+                Err(PortalError::UnknownChunk { name: chunk_name.to_string() })
+            } else {
+                Err(PortalError::NotConnected)
+            };
+        };
+        publisher.send(data, timestamp_us, in_reply_to_ts_us)
     }
 
     // --- RPC ---
@@ -439,6 +511,7 @@ impl Portal {
         self.video_publishers.lock().clear();
         *self.state_publisher.lock() = None;
         *self.action_publisher.lock() = None;
+        self.chunk_publishers.lock().clear();
 
         if let Some(sb) = self.sync_buffer.lock().take() {
             sb.lock().clear();
@@ -446,6 +519,9 @@ impl Portal {
         self.obs_sink.clear();
         self.action.clear();
         self.state.clear();
+        for slot in self.chunk_slots.values() {
+            slot.clear();
+        }
         for slots in self.video_tracks.values() {
             slots.clear();
         }
@@ -480,6 +556,17 @@ impl Portal {
         self.video_tracks.get(track_name).and_then(|s| s.latest.lock().clone())
     }
 
+    /// Clone of the latest chunk received for `chunk_name`, or `None` if
+    /// none received yet (or the chunk wasn't declared).
+    pub fn get_action_chunk(&self, chunk_name: &str) -> Option<ActionChunk> {
+        self.chunk_slots.get(chunk_name).and_then(|s| s.get())
+    }
+
+    /// All declared action chunk schemas, in declaration order.
+    pub fn action_chunks(&self) -> &[ChunkSpec] {
+        self.config.action_chunks()
+    }
+
     // --- Callback registration (push API) ---
 
     /// Fire on every received action. The `Action` record exposes typed
@@ -487,6 +574,23 @@ impl Portal {
     /// `f64` view.
     pub fn on_action(&self, callback: impl Fn(&Action) + Send + Sync + 'static) {
         *self.action.cb.lock() = Some(Box::new(callback));
+    }
+
+    /// Fire on every received chunk for the named declaration. Only one
+    /// callback per chunk; calling twice overwrites. Unknown names are
+    /// logged and ignored — they aren't a hard error because the chunk
+    /// schema may have been intentionally omitted on this peer.
+    pub fn on_action_chunk(
+        &self,
+        chunk_name: &str,
+        callback: impl Fn(&ActionChunk) + Send + Sync + 'static,
+    ) {
+        match self.chunk_slots.get(chunk_name) {
+            Some(slot) => slot.set_callback(Box::new(callback)),
+            None => log::warn!(
+                "on_action_chunk: chunk '{chunk_name}' is not declared — callback ignored"
+            ),
+        }
     }
 
     pub fn on_observation(&self, callback: impl Fn(&Observation) + Send + Sync + 'static) {
@@ -545,7 +649,7 @@ impl Portal {
         if !self.config.state_schema.is_empty() {
             let publisher = DataPublisher::new(
                 &self.config.state_schema,
-                "portal_state",
+                STATE_TOPIC,
                 self.config.state_reliable,
                 lp.clone(),
                 self.metrics.clone(),
@@ -583,13 +687,33 @@ impl Portal {
             );
             let publisher = DataPublisher::new(
                 &self.config.action_schema,
-                "portal_action",
+                ACTION_TOPIC,
                 self.config.action_reliable,
-                lp,
+                lp.clone(),
                 self.metrics.clone(),
                 DataStream::Action,
             );
             *self.action_publisher.lock() = Some(Arc::new(publisher));
+        }
+
+        if !self.config.action_chunks.is_empty() {
+            for spec in &self.config.action_chunks {
+                log::info!(
+                    "[{}] ready to publish chunk '{}' via byte stream (horizon={}, {} fields)",
+                    self.config.session,
+                    spec.name,
+                    spec.horizon,
+                    spec.fields.len()
+                );
+                let publisher = ChunkPublisher::new(
+                    spec.clone(),
+                    lp.clone(),
+                    self.metrics.clone(),
+                );
+                self.chunk_publishers
+                    .lock()
+                    .insert(spec.name.clone(), Arc::new(publisher));
+            }
         }
     }
 
@@ -637,6 +761,8 @@ struct EventContext {
     obs_sink: Arc<ObservationSink>,
     action: Arc<ActionSlot>,
     state: Arc<StateSlot>,
+    chunk_slots: Vec<Arc<ChunkSlot>>,
+    unknown_chunk_fp_warns: Arc<Mutex<HashSet<u32>>>,
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
     metrics: Arc<MetricsRegistry>,
@@ -702,8 +828,8 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             if let Some(p) = &participant {
                 if matches!(
                     (ctx.config.role, topic.as_str()),
-                    (Role::Robot, "portal_action")
-                        | (Role::Operator, "portal_state")
+                    (Role::Robot, ACTION_TOPIC)
+                        | (Role::Operator, STATE_TOPIC)
                         | (_, "portal_rtt")
                 ) {
                     latch_peer(&ctx.peer_identity, &ctx.config.session, p.identity());
@@ -726,6 +852,35 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             if !output.is_empty() {
                 ctx.obs_sink.dispatch(output);
             }
+        }
+        RoomEvent::ByteStreamOpened { reader, topic, participant_identity } => {
+            // Robot-side: the operator sends action chunks as byte streams
+            // because chunk payloads can exceed the 15 KB data-packet limit.
+            // We `take_if` on the topic so this Portal only consumes streams
+            // it owns; other applications using byte streams on different
+            // topics are left untouched.
+            if ctx.config.role != Role::Robot || topic != ACTION_CHUNK_TOPIC {
+                return;
+            }
+            let Some(reader) = reader.take_if(|info| info.topic == ACTION_CHUNK_TOPIC) else {
+                return;
+            };
+            latch_peer(&ctx.peer_identity, &ctx.config.session, participant_identity);
+            let chunk_slots = ctx.chunk_slots.clone();
+            let unknown_fp_warns = ctx.unknown_chunk_fp_warns.clone();
+            let metrics = ctx.metrics.clone();
+            tokio::spawn(async move {
+                use livekit::StreamReader;
+                match reader.read_all().await {
+                    Ok(payload) => dispatch_chunk_payload(
+                        &payload,
+                        &chunk_slots,
+                        &unknown_fp_warns,
+                        &metrics,
+                    ),
+                    Err(e) => log::warn!("failed to read chunk byte stream: {e}"),
+                }
+            });
         }
         RoomEvent::ParticipantDisconnected(participant) => {
             let mut slot = ctx.peer_identity.lock();
@@ -752,6 +907,9 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             ctx.obs_sink.clear();
             ctx.action.clear();
             ctx.state.clear();
+            for slot in &ctx.chunk_slots {
+                slot.clear();
+            }
             for slots in ctx.video_tracks.values() {
                 slots.clear();
             }

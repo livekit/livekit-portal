@@ -13,10 +13,14 @@ pub mod types;
 mod video;
 
 pub use codec::{Codec, CodecError, CodecResult, DecodedFrame};
-pub use config::{FieldSpec, FrameVideoSpec, PortalConfig};
+pub use config::{ChunkSpec, FieldSpec, FrameVideoSpec, PortalConfig};
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
-pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};
+pub use metrics::{
+    BufferMetrics, PolicyMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics,
+};
 pub use portal::Portal;
 pub use rpc::{RpcError, RpcHandler, RpcInvocationData};
-pub use types::{Action, Observation, Role, State, SyncConfig, TypedValue, VideoFrameData};
+pub use types::{
+    Action, ActionChunk, Observation, Role, State, SyncConfig, TypedValue, VideoFrameData,
+};

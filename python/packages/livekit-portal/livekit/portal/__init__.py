@@ -45,12 +45,14 @@ DType = _ffi.DType
 VideoCodec = _ffi.VideoCodec
 FieldSpec = _ffi.FieldSpec
 FrameVideoSpec = _ffi.FrameVideoSpec
+ChunkSpec = _ffi.ChunkSpec
 VideoFrameData = _ffi.VideoFrame
 PortalMetrics = _ffi.PortalMetrics
 SyncMetrics = _ffi.SyncMetrics
 TransportMetrics = _ffi.TransportMetrics
 BufferMetrics = _ffi.BufferMetrics
 RttMetrics = _ffi.RttMetrics
+PolicyMetrics = _ffi.PolicyMetrics
 PortalError = _ffi.PortalError
 RpcInvocationData = _ffi.RpcInvocationData
 RpcError = _ffi.RpcError
@@ -197,11 +199,38 @@ class Action:
     `values` holds Python-native types per the declared action schema.
     `raw_values` is the original `Dict[str, float]` with every dtype
     widened to `f64`, for callers that want to skip the per-field cast.
+
+    `in_reply_to_ts_us` is the observation timestamp this action was
+    produced from, when the operator passed one. Use it to compute true
+    end-to-end policy latency (`now_us - in_reply_to_ts_us`) instead of
+    network RTT.
     """
 
     values: Dict[str, TypedScalar]
     raw_values: Dict[str, float]
     timestamp_us: int
+    in_reply_to_ts_us: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActionChunk:
+    """An action chunk received from the operator.
+
+    `data` is `field -> numpy.ndarray` per the declared chunk schema.
+    Each array has length `horizon` and dtype matching the field's
+    declared `DType`. `raw_data` is the same payload as
+    `Dict[str, list[float]]` — the lossless f64 view, useful when you
+    want to skip the per-field numpy reconstruction.
+
+    `in_reply_to_ts_us` matches the same field on `Action`.
+    """
+
+    name: str
+    horizon: int
+    data: Dict[str, Any]
+    raw_data: Dict[str, List[float]]
+    timestamp_us: int
+    in_reply_to_ts_us: Optional[int] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +260,41 @@ class Observation:
     timestamp_us: int
 
 
+def _normalize_chunk_data(
+    data: Any, schema: List[FieldSpec]
+) -> Dict[str, List[float]]:
+    """Coerce send-side chunk data into the `Dict[str, list[float]]` the
+    FFI accepts. Two input shapes:
+
+    * `numpy.ndarray` of shape `(horizon, len(schema))` — split into
+      per-field columns in declared order. Convenient for uniform-dtype
+      VLA tensors.
+    * `Dict[str, ndarray | list]` — pass-through, with each column cast
+      to a `list[float]`. Unknown keys go through to the core, which
+      warns once each.
+    """
+    if _np is not None and isinstance(data, _np.ndarray):
+        if data.ndim != 2 or data.shape[1] != len(schema):
+            raise PortalError.Deserialization(
+                f"chunk ndarray must be shape (horizon, {len(schema)}); got {data.shape}"
+            )
+        cols: Dict[str, List[float]] = {}
+        for i, field in enumerate(schema):
+            cols[field.name] = data[:, i].astype(_np.float64).tolist()
+        return cols
+    if not isinstance(data, dict):
+        raise PortalError.Deserialization(
+            "chunk data must be a dict or 2D numpy array"
+        )
+    cols = {}
+    for name, column in data.items():
+        if _np is not None and isinstance(column, _np.ndarray):
+            cols[name] = column.astype(_np.float64).tolist()
+        else:
+            cols[name] = [float(v) for v in column]
+    return cols
+
+
 def _wrap_action(
     action: _ffi.Action, schema: List[FieldSpec]
 ) -> Action:
@@ -238,6 +302,60 @@ def _wrap_action(
         values=_cast_values(action.values, schema),
         raw_values=dict(action.values),
         timestamp_us=action.timestamp_us,
+        in_reply_to_ts_us=action.in_reply_to_ts_us,
+    )
+
+
+# Numpy dtype mapping for chunk reconstruction. Defined once at import so
+# the per-frame hot path doesn't re-allocate the lookup table.
+try:
+    import numpy as _np
+    _NUMPY_DTYPE_MAP = {
+        DType.F64: _np.float64,
+        DType.F32: _np.float32,
+        DType.I32: _np.int32,
+        DType.I16: _np.int16,
+        DType.I8: _np.int8,
+        DType.U32: _np.uint32,
+        DType.U16: _np.uint16,
+        DType.U8: _np.uint8,
+        DType.BOOL: _np.bool_,
+    }
+except ImportError:  # pragma: no cover
+    _np = None
+    _NUMPY_DTYPE_MAP = {}
+
+
+def _wrap_action_chunk(
+    chunk: _ffi.ActionChunk, schema_by_name: Dict[str, List[FieldSpec]]
+) -> ActionChunk:
+    """Reconstruct typed numpy arrays per field. The FFI hands us
+    `Dict[str, list[float]]` because the core pipeline is f64; we cast each
+    column back to its declared dtype so policies that emit `float32[H]`
+    don't pay an unwanted widening on receipt.
+    """
+    fields = schema_by_name.get(chunk.name, [])
+    raw_data: Dict[str, List[float]] = {k: list(v) for k, v in chunk.data.items()}
+    if _np is None:
+        # numpy is a hard runtime dep on this package, so this branch only
+        # exists for hypothetical embedded builds. Hand back the raw lists
+        # in `data` so callers can still consume the chunk.
+        data: Dict[str, Any] = dict(raw_data)
+    else:
+        data = {}
+        for field in fields:
+            column = chunk.data.get(field.name)
+            if column is None:
+                continue
+            np_dtype = _NUMPY_DTYPE_MAP.get(field.dtype, _np.float64)
+            data[field.name] = _np.asarray(column, dtype=np_dtype)
+    return ActionChunk(
+        name=chunk.name,
+        horizon=chunk.horizon,
+        data=data,
+        raw_data=raw_data,
+        timestamp_us=chunk.timestamp_us,
+        in_reply_to_ts_us=chunk.in_reply_to_ts_us,
     )
 
 
@@ -278,6 +396,7 @@ class _Dispatcher(_ffi.PortalCallbacks):
         self,
         action_schema: List[FieldSpec],
         state_schema: List[FieldSpec],
+        chunk_schemas: Dict[str, List[FieldSpec]],
     ) -> None:
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -287,10 +406,13 @@ class _Dispatcher(_ffi.PortalCallbacks):
         self._drop_cb: Optional[Callable[[List[Dict[str, Any]]], Any]] = None
         # Per-track video callback: track_name → callable(track_name, frame).
         self._video_cbs: Dict[str, Callable[[str, VideoFrameData], Any]] = {}
+        # Per-chunk callback: chunk_name → callable(chunk).
+        self._chunk_cbs: Dict[str, Callable[[ActionChunk], Any]] = {}
         # Schemas are frozen at Portal construction and read by the wrap
         # helpers below on every delivery.
         self._action_schema = action_schema
         self._state_schema = state_schema
+        self._chunk_schemas = chunk_schemas
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         with self._lock:
@@ -336,6 +458,11 @@ class _Dispatcher(_ffi.PortalCallbacks):
             typed = [_cast_values(d, self._state_schema) for d in dropped]
             self._schedule(cb, typed)
 
+    def on_action_chunk(self, chunk: _ffi.ActionChunk) -> None:
+        cb = self._chunk_cbs.get(chunk.name)
+        if cb is not None:
+            self._schedule(cb, _wrap_action_chunk(chunk, self._chunk_schemas))
+
     # --- Registration (from Python user thread) -----------------------------
 
     def set_action(self, cb: Callable[[Action], Any]) -> None:
@@ -352,6 +479,11 @@ class _Dispatcher(_ffi.PortalCallbacks):
 
     def set_video(self, track_name: str, cb: Callable[[str, VideoFrameData], Any]) -> None:
         self._video_cbs[track_name] = cb
+
+    def set_action_chunk(
+        self, chunk_name: str, cb: Callable[[ActionChunk], Any]
+    ) -> None:
+        self._chunk_cbs[chunk_name] = cb
 
 
 _uniffi_bound_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -451,6 +583,7 @@ class PortalConfig:
         "_frame_video_tracks",
         "_state_schema",
         "_action_schema",
+        "_action_chunks",
     )
 
     def __init__(self, session: str, role: Role) -> None:
@@ -461,6 +594,7 @@ class PortalConfig:
         self._frame_video_tracks: List[FrameVideoSpec] = []
         self._state_schema: List[FieldSpec] = []
         self._action_schema: List[FieldSpec] = []
+        self._action_chunks: List[ChunkSpec] = []
 
     @property
     def session(self) -> str:
@@ -493,6 +627,11 @@ class PortalConfig:
     @property
     def action_schema(self) -> List[FieldSpec]:
         return list(self._action_schema)
+
+    @property
+    def action_chunks(self) -> List[ChunkSpec]:
+        """All declared action chunks, in declaration order."""
+        return list(self._action_chunks)
 
     def add_video(self, name: str) -> None:
         self._inner.add_video(name)
@@ -548,6 +687,29 @@ class PortalConfig:
         specs = _to_field_specs(schema)
         self._inner.add_action_typed(specs)
         self._action_schema.extend(specs)
+
+    def add_action_chunk(
+        self,
+        name: str,
+        horizon: int,
+        fields: Iterable[SchemaEntry],
+    ) -> None:
+        """Declare a named action chunk: a fixed-horizon batch of typed
+        per-field values published as one byte stream.
+
+        Use this for VLA policies that emit a horizon of future actions
+        per inference step. Multiple chunks can be declared. Names must
+        be unique. The chunk's payload uses LiveKit byte streams (not
+        data packets), so it isn't bounded by the 15 KB packet limit.
+
+        Both peers must declare the same chunks (same name, horizon, and
+        ordered fields) — a fingerprint mismatch drops the packet.
+        """
+        specs = _to_field_specs(fields)
+        self._inner.add_action_chunk(name, horizon, specs)
+        self._action_chunks.append(
+            ChunkSpec(name=name, horizon=horizon, fields=specs)
+        )
 
     def set_fps(self, fps: int) -> None:
         self._inner.set_fps(fps)
@@ -607,6 +769,8 @@ class Portal:
         "_state_schema",
         "_action_schema",
         "_video_tracks",
+        "_action_chunks",
+        "_chunk_schemas",
     )
 
     def __init__(self, config: PortalConfig) -> None:
@@ -615,7 +779,13 @@ class Portal:
         # `Dict[str, float]` (the core pipeline is f64 throughout).
         self._state_schema: List[FieldSpec] = list(config.state_schema)
         self._action_schema: List[FieldSpec] = list(config.action_schema)
-        self._dispatcher = _Dispatcher(self._action_schema, self._state_schema)
+        self._action_chunks: List[ChunkSpec] = list(config.action_chunks)
+        self._chunk_schemas: Dict[str, List[FieldSpec]] = {
+            spec.name: list(spec.fields) for spec in self._action_chunks
+        }
+        self._dispatcher = _Dispatcher(
+            self._action_schema, self._state_schema, self._chunk_schemas
+        )
         self._inner = _ffi.Portal(config._inner, self._dispatcher)
         # Snapshot what the Rust side confirmed it was built with.
         self._state_fields: List[str] = list(self._inner.state_fields())
@@ -668,12 +838,45 @@ class Portal:
         self,
         values: Dict[str, Any],
         timestamp_us: Optional[int] = None,
+        in_reply_to_ts_us: Optional[int] = None,
     ) -> None:
         """Publish an action (operator role only). Same validation rules
         as `send_state`.
+
+        Pass `in_reply_to_ts_us=obs.timestamp_us` to give the receiver
+        the data needed to compute true end-to-end policy latency
+        (`metrics.policy.e2e_us_*`). Leave it `None` for unsolicited
+        publishes (teleop, idle commands).
         """
         _validate_send_values(values, self._action_schema, "action")
-        self._inner.send_action(values, timestamp_us)
+        self._inner.send_action(values, timestamp_us, in_reply_to_ts_us)
+
+    def send_action_chunk(
+        self,
+        chunk_name: str,
+        data: Any,
+        timestamp_us: Optional[int] = None,
+        in_reply_to_ts_us: Optional[int] = None,
+    ) -> None:
+        """Publish an action chunk on the named declaration.
+
+        `data` may be any of:
+          - `Dict[str, ndarray | list[float]]` — one column per field of
+            length `horizon`.
+          - `numpy.ndarray` of shape `(horizon, len(fields))` and a single
+            dtype — split into per-field columns by declared field order.
+            Convenient for VLA policies that emit a uniform tensor.
+
+        Wrong-length columns are zero-padded by the core. Unknown fields
+        are warned-and-ignored once each.
+        """
+        schema = self._chunk_schemas.get(chunk_name)
+        if schema is None:
+            raise PortalError.UnknownChunk(f"unknown action chunk: {chunk_name}")
+        ffi_data = _normalize_chunk_data(data, schema)
+        self._inner.send_action_chunk(
+            chunk_name, ffi_data, timestamp_us, in_reply_to_ts_us
+        )
 
     # -- pull (sync, latest-wins) --------------------------------------------
 
@@ -692,6 +895,15 @@ class Portal:
     def get_video_frame(self, track_name: str) -> Optional[VideoFrameData]:
         return self._inner.get_video_frame(track_name)
 
+    def get_action_chunk(self, chunk_name: str) -> Optional[ActionChunk]:
+        """Latest chunk received for `chunk_name`, or `None` if none has
+        arrived yet (or the chunk wasn't declared).
+        """
+        raw = self._inner.get_action_chunk(chunk_name)
+        if raw is None:
+            return None
+        return _wrap_action_chunk(raw, self._chunk_schemas)
+
     # -- push callbacks ------------------------------------------------------
 
     def on_action(self, callback: Callable[[Action], Any]) -> None:
@@ -709,6 +921,22 @@ class Portal:
         callback: Callable[[str, VideoFrameData], Any],
     ) -> None:
         self._dispatcher.set_video(track_name, callback)
+
+    def on_action_chunk(
+        self,
+        chunk_name: str,
+        callback: Callable[[ActionChunk], Any],
+    ) -> None:
+        """Register a callback for the named chunk declaration. Fires on
+        every chunk received for that name. Per-field columns in
+        `chunk.data` are reconstructed as numpy arrays of the declared
+        dtype; use `chunk.raw_data` for the f64 list view.
+        """
+        if chunk_name not in self._chunk_schemas:
+            raise PortalError.UnknownChunk(
+                f"unknown action chunk: {chunk_name}"
+            )
+        self._dispatcher.set_action_chunk(chunk_name, callback)
 
     def on_drop(
         self,
@@ -790,12 +1018,14 @@ __all__ = [
     "VideoCodec",
     "FieldSpec",
     "FrameVideoSpec",
+    "ChunkSpec",
     "TypedScalar",
     "DEFAULT_MJPEG_QUALITY",
     "PortalConfig",
     "Portal",
     "Observation",
     "Action",
+    "ActionChunk",
     "State",
     "VideoFrameData",
     "PortalMetrics",
@@ -803,6 +1033,7 @@ __all__ = [
     "TransportMetrics",
     "BufferMetrics",
     "RttMetrics",
+    "PolicyMetrics",
     "PortalError",
     "RpcInvocationData",
     "RpcError",

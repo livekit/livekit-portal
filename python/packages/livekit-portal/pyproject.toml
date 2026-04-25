@@ -21,6 +21,17 @@ examples = [
     "livekit-api>=0.7",
     "python-dotenv>=1",
 ]
+integration = [
+    "livekit-api>=0.7",
+]
+
+[tool.pytest.ini_options]
+# `asyncio_mode = "auto"` lets async test functions run without a
+# per-test `@pytest.mark.asyncio`. We still mark the integration module
+# (pytestmark) for clarity. `testpaths` keeps `pytest` from descending
+# into example directories at repo root.
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 # The Rust cdylib and generated UniFFI module are built out-of-band via
 # the repo-root `scripts/build_ffi_python.sh` and dropped into
