@@ -9,28 +9,58 @@
 | Video subscribe | `NativeVideoStream` (async `Stream` trait) | One per subscribed track. Yields `BoxVideoFrame` with `frame_metadata.user_timestamp`. |
 | State/action publish | `LocalParticipant::publish_data(DataPacket)` | Configurable reliability per topic (`state_reliable`, `action_reliable`, both default `true`). Topic-based routing (`portal_state`, `portal_action`). |
 | State/action receive | `RoomEvent::DataReceived` | Dispatched synchronously by topic in the room event handler. No async task needed. |
+| Action chunk publish | `LocalParticipant::send_bytes` (byte stream) | One stream per send. Topic `portal_action_chunk`. Reliable by design. Bypasses the 15 KB data-packet cap that small data packets impose. |
+| Action chunk receive | `RoomEvent::ByteStreamOpened` | Dispatcher takes the reader on a matching topic, spawns a task that calls `read_all().await` and routes the payload through the chunk-fingerprint table. |
 | Session | LiveKit Room | `session` param maps to room name. |
 | Role | Participant identity | `role` sets identity. Unique per room — prevents duplicate robots. |
 
 ## Serialization
 
-Both sides declare the same schema upfront (`add_state("joint1", "joint2", "joint3")`). Field names are agreed at config time, so we don't need to send them on every frame.
+Both sides declare the same schema upfront (`add_state("joint1", ...)`).
+Field names are agreed at config time, so we don't send them on every
+packet. Per-field dtype is declared too; the wire width is the dtype's
+byte size, not always 8.
 
-**Wire format for state/action**: ordered `f64` values as raw bytes. 3 joints = 24 bytes. No JSON, no msgpack, no overhead.
-
-```
-[f64 joint1][f64 joint2][f64 joint3]  // 8 bytes each, little-endian
-```
-
-The receiver maps bytes back to field names using the same declared order.
-
-Prefix with a `u64` timestamp (system time in microseconds), so every state/action frame is:
+### State wire format (data packet, topic `portal_state`)
 
 ```
-[u64 timestamp_us][f64 val1][f64 val2]...[f64 valN]
+[u32 schema_fingerprint][u64 timestamp_us][field0 bytes][field1 bytes]...
 ```
 
-Total overhead per state/action: 8 bytes for timestamp.
+Header is 12 bytes. `schema_fingerprint` is FNV-1a over ordered
+`(name, dtype_tag)` pairs — both peers compute the same number; mismatched
+fingerprints drop the packet with a one-shot warn.
+
+### Action wire format (data packet, topic `portal_action`)
+
+```
+[u32 action_fingerprint][u64 timestamp_us][u64 in_reply_to_ts_us][field0 bytes]...
+```
+
+Header is 20 bytes. `action_fingerprint = schema_fingerprint XOR ACTION_STREAM_TAG`
+so a v2 peer never silently mis-parses a v1 peer's 12-byte-header packet —
+the xor'd tag baked into the fingerprint forces SchemaMismatch on a version
+skew. `in_reply_to_ts_us = 0` is the wire sentinel for "no correlation"
+(epoch-µs timestamps are never literally zero in practice).
+
+### Chunk wire format (byte stream, topic `portal_action_chunk`)
+
+Chunks ship as LiveKit **byte streams** rather than data packets, because
+chunk payloads can exceed the 15 KB data-packet limit easily. Byte streams
+are reliable and ordered; we serialize sends through one in-flight stream
+per chunk publisher to keep receive order.
+
+```
+[u32 chunk_fingerprint][u64 timestamp_us][u64 in_reply_to_ts_us][row 0][row 1]...[row H-1]
+```
+
+Where each row is the per-field values in declared field order, packed at
+each field's dtype width. Total payload is `20 + horizon * sum(field.size_bytes)`.
+
+`chunk_fingerprint` hashes name + horizon + ordered fields, then xors a chunk
+stream tag. Multiple chunks on one Portal are dispatched by fingerprint —
+the receiver looks up the matching `ChunkSlot` and decodes against its
+schema.
 
 ## Components
 
@@ -223,11 +253,12 @@ This follows the same pattern as `livekit-ffi`. The Rust library is **not** awar
 
 | Tag | Event | Payload |
 |-----|-------|---------|
-| `0x01` | action | `[u8 tag][f64 val1][f64 val2]...` ordered by declared action fields |
+| `0x01` | action | `[u8 tag][f64 val1][f64 val2]...[u64 in_reply_to_ts_us]` ordered by declared action fields, with `0` sentinel for "no correlation" |
 | `0x02` | observation | `[u8 tag][u64 timestamp_us][u32 n_fields][f64 val1]...[u32 n_tracks][per track: u32 name_len][name bytes][u32 width][u32 height][u32 data_len][I420 bytes]...` |
 | `0x03` | state | `[u8 tag][f64 val1][f64 val2]...` ordered by declared state fields |
 | `0x04` | video | `[u8 tag][u32 name_len][name bytes][u32 width][u32 height][u32 data_len][I420 bytes][u64 timestamp_us]` |
 | `0x05` | drop | `[u8 tag][u32 n_dropped][per dropped: [f64 val1][f64 val2]...]` |
+| `0x06` | action_chunk | `[u8 tag][u32 name_len][name bytes][u32 horizon][per row of len `horizon`: [f64 val1]...[f64 valN]][u64 timestamp_us][u64 in_reply_to_ts_us]` |
 
 All values little-endian.
 

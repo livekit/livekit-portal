@@ -11,10 +11,14 @@ mod sync_buffer;
 pub mod types;
 mod video;
 
-pub use config::{FieldSpec, PortalConfig};
+pub use config::{ChunkSpec, FieldSpec, PortalConfig};
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
-pub use metrics::{BufferMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics};
+pub use metrics::{
+    BufferMetrics, PolicyMetrics, PortalMetrics, RttMetrics, SyncMetrics, TransportMetrics,
+};
 pub use portal::Portal;
 pub use rpc::{RpcError, RpcHandler, RpcInvocationData};
-pub use types::{Action, Observation, Role, State, SyncConfig, TypedValue, VideoFrameData};
+pub use types::{
+    Action, ActionChunk, Observation, Role, State, SyncConfig, TypedValue, VideoFrameData,
+};

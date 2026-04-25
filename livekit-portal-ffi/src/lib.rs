@@ -107,6 +107,16 @@ pub struct FieldSpec {
     pub dtype: DType,
 }
 
+/// A declared action chunk: name, fixed horizon, ordered field list. The
+/// chunk's payload travels as a LiveKit byte stream (not a data packet) so
+/// it isn't bounded by the 15 KB packet limit.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChunkSpec {
+    pub name: String,
+    pub horizon: u32,
+    pub fields: Vec<FieldSpec>,
+}
+
 /// Decoded video frame. Receive-side `data` is I420 planar bytes; send-side
 /// callers pass packed RGB24 directly to `send_video_frame`.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -128,6 +138,22 @@ pub struct Observation {
 pub struct Action {
     pub values: HashMap<String, f64>,
     pub timestamp_us: u64,
+    /// Sender-side observation timestamp this action was produced from,
+    /// or `None` for unsolicited publishes.
+    pub in_reply_to_ts_us: Option<u64>,
+}
+
+/// A received action chunk. `data` is `field -> column of length horizon`,
+/// each column widened to `f64` (lossless for every supported dtype).
+/// Bindings may re-cast columns into typed numpy arrays per the declared
+/// chunk schema.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ActionChunk {
+    pub name: String,
+    pub horizon: u32,
+    pub data: HashMap<String, Vec<f64>>,
+    pub timestamp_us: u64,
+    pub in_reply_to_ts_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -154,9 +180,19 @@ pub struct TransportMetrics {
     pub states_received: u64,
     pub actions_sent: u64,
     pub actions_received: u64,
+    pub action_chunks_sent: u64,
+    pub action_chunks_received: u64,
     pub frame_jitter_us: HashMap<String, u64>,
     pub state_jitter_us: u64,
     pub action_jitter_us: u64,
+    pub action_chunk_jitter_us: u64,
+}
+
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct PolicyMetrics {
+    pub e2e_us_p50: Option<u64>,
+    pub e2e_us_p95: Option<u64>,
+    pub correlated_received: u64,
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -181,6 +217,7 @@ pub struct PortalMetrics {
     pub transport: TransportMetrics,
     pub buffers: BufferMetrics,
     pub rtt: RttMetrics,
+    pub policy: PolicyMetrics,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +244,9 @@ pub enum PortalError {
 
     #[error("unknown video track: {0}")]
     UnknownVideoTrack(String),
+
+    #[error("unknown action chunk: {0}")]
+    UnknownChunk(String),
 
     #[error("wrong frame size: expected {expected} bytes, got {got}")]
     WrongFrameSize { expected: u64, got: u64 },
@@ -236,6 +276,7 @@ impl From<core::PortalError> for PortalError {
             core::PortalError::NoPeer => PortalError::NoPeer,
             core::PortalError::AmbiguousPeer => PortalError::AmbiguousPeer,
             core::PortalError::UnknownVideoTrack { name } => PortalError::UnknownVideoTrack(name),
+            core::PortalError::UnknownChunk { name } => PortalError::UnknownChunk(name),
             core::PortalError::WrongFrameSize { expected, got } => {
                 PortalError::WrongFrameSize { expected: expected as u64, got: got as u64 }
             }
@@ -327,6 +368,9 @@ pub trait PortalCallbacks: Send + Sync {
     fn on_observation(&self, observation: Observation);
     fn on_video_frame(&self, track_name: String, frame: VideoFrame);
     fn on_drop(&self, dropped: Vec<HashMap<String, f64>>);
+    /// Fires for every chunk received. Bindings dispatch by `chunk.name`
+    /// to per-chunk user callbacks if needed.
+    fn on_action_chunk(&self, chunk: ActionChunk);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +403,17 @@ impl PortalConfig {
         self.inner
             .lock()
             .add_action_typed(schema.into_iter().map(|f| (f.name, f.dtype.into())));
+    }
+
+    /// Declare a named action chunk: a fixed-horizon batch of typed
+    /// per-field values published as one byte stream. Use this for VLA
+    /// policies that emit a horizon of future actions per inference step.
+    pub fn add_action_chunk(&self, name: String, horizon: u32, fields: Vec<FieldSpec>) {
+        self.inner.lock().add_action_chunk(
+            name,
+            horizon,
+            fields.into_iter().map(|f| (f.name, f.dtype.into())),
+        );
     }
 
     pub fn set_fps(&self, fps: u32) {
@@ -403,6 +458,7 @@ pub struct Portal {
     state_fields: Vec<String>,
     action_fields: Vec<String>,
     video_tracks: Vec<String>,
+    action_chunks: Vec<ChunkSpec>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -416,6 +472,11 @@ impl Portal {
         let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
         let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
+        let action_chunks: Vec<ChunkSpec> = cfg
+            .action_chunks()
+            .iter()
+            .map(chunkspec_from_core)
+            .collect();
 
         let inner = core::Portal::new(cfg);
 
@@ -427,6 +488,7 @@ impl Portal {
             cb.on_action(Action {
                 values: action.raw_values.clone(),
                 timestamp_us: action.timestamp_us,
+                in_reply_to_ts_us: action.in_reply_to_ts_us,
             });
         });
         let cb = callbacks.clone();
@@ -459,12 +521,20 @@ impl Portal {
             });
         }
 
+        for chunk_spec in &action_chunks {
+            let cb = callbacks.clone();
+            inner.on_action_chunk(&chunk_spec.name, move |chunk| {
+                cb.on_action_chunk(actionchunk_from_core(chunk));
+            });
+        }
+
         Arc::new(Self {
             inner,
             _callbacks: callbacks,
             state_fields,
             action_fields,
             video_tracks,
+            action_chunks,
         })
     }
 
@@ -505,9 +575,26 @@ impl Portal {
         &self,
         values: HashMap<String, f64>,
         timestamp_us: Option<u64>,
+        in_reply_to_ts_us: Option<u64>,
     ) -> PortalResult<()> {
         let typed = f64_to_typed(&values, self.inner.action_schema());
-        self.inner.send_action(&typed, timestamp_us).map_err(Into::into)
+        self.inner
+            .send_action(&typed, timestamp_us, in_reply_to_ts_us)
+            .map_err(Into::into)
+    }
+
+    /// Publish an action chunk on the named declaration. `data` is
+    /// `field -> column of length horizon` widened to `f64`.
+    pub fn send_action_chunk(
+        &self,
+        chunk_name: String,
+        data: HashMap<String, Vec<f64>>,
+        timestamp_us: Option<u64>,
+        in_reply_to_ts_us: Option<u64>,
+    ) -> PortalResult<()> {
+        self.inner
+            .send_action_chunk(&chunk_name, &data, timestamp_us, in_reply_to_ts_us)
+            .map_err(Into::into)
     }
 
     pub fn get_observation(&self) -> Option<Observation> {
@@ -518,7 +605,12 @@ impl Portal {
         self.inner.get_action().map(|a| Action {
             values: a.raw_values,
             timestamp_us: a.timestamp_us,
+            in_reply_to_ts_us: a.in_reply_to_ts_us,
         })
+    }
+
+    pub fn get_action_chunk(&self, chunk_name: String) -> Option<ActionChunk> {
+        self.inner.get_action_chunk(&chunk_name).map(|c| actionchunk_from_core(&c))
     }
 
     pub fn get_state(&self) -> Option<State> {
@@ -550,6 +642,10 @@ impl Portal {
 
     pub fn video_tracks(&self) -> Vec<String> {
         self.video_tracks.clone()
+    }
+
+    pub fn action_chunks(&self) -> Vec<ChunkSpec> {
+        self.action_chunks.clone()
     }
 
     // --- RPC ---
@@ -600,6 +696,28 @@ fn frame_from_core(f: &core::VideoFrameData) -> VideoFrame {
         height: f.height,
         data: f.data.to_vec(),
         timestamp_us: f.timestamp_us,
+    }
+}
+
+fn chunkspec_from_core(c: &core::ChunkSpec) -> ChunkSpec {
+    ChunkSpec {
+        name: c.name.clone(),
+        horizon: c.horizon,
+        fields: c
+            .fields
+            .iter()
+            .map(|f| FieldSpec { name: f.name.clone(), dtype: f.dtype.into() })
+            .collect(),
+    }
+}
+
+fn actionchunk_from_core(c: &core::ActionChunk) -> ActionChunk {
+    ActionChunk {
+        name: c.name.clone(),
+        horizon: c.horizon,
+        data: c.data.clone(),
+        timestamp_us: c.timestamp_us,
+        in_reply_to_ts_us: c.in_reply_to_ts_us,
     }
 }
 
@@ -665,9 +783,12 @@ fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {
             states_received: m.transport.states_received,
             actions_sent: m.transport.actions_sent,
             actions_received: m.transport.actions_received,
+            action_chunks_sent: m.transport.action_chunks_sent,
+            action_chunks_received: m.transport.action_chunks_received,
             frame_jitter_us: m.transport.frame_jitter_us,
             state_jitter_us: m.transport.state_jitter_us,
             action_jitter_us: m.transport.action_jitter_us,
+            action_chunk_jitter_us: m.transport.action_chunk_jitter_us,
         },
         buffers: BufferMetrics {
             video_fill: m.buffers.video_fill.into_iter().map(|(k, v)| (k, v as u64)).collect(),
@@ -680,6 +801,11 @@ fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {
             rtt_us_p95: m.rtt.rtt_us_p95,
             pings_sent: m.rtt.pings_sent,
             pongs_received: m.rtt.pongs_received,
+        },
+        policy: PolicyMetrics {
+            e2e_us_p50: m.policy.e2e_us_p50,
+            e2e_us_p95: m.policy.e2e_us_p95,
+            correlated_received: m.policy.correlated_received,
         },
     }
 }

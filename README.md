@@ -37,9 +37,11 @@
 
 **Synced observations out of the box.** Cameras and joint state arrive fused into `Observation(frames, state, timestamp_us)`. That is the shape robotics policies already consume. No matching logic on your side.
 
+**Built for VLA inference.** First-class **action chunks** ship a `(horizon, n_fields)` tensor in one packet via byte streams (no 15 KB cap). Tag every action with `in_reply_to_ts_us` and `metrics.policy.e2e_us_p50/p95` derives true observation→action latency — not just ping. See [`examples/python/inference/`](examples/python/inference) for a runnable VLA-style loop.
+
 **Works with any stack.** A direct `Portal` API in Python and Rust. An optional [lerobot](https://github.com/huggingface/lerobot) plugin for a one-line wrap around your existing `Robot` or `Teleoperator`.
 
-**Low-latency transport.** WebRTC video (SIMD RGB→I420). SCTP data channels with reliable or unreliable delivery per stream. RPC for one-shots like `home` or `calibrate`. Rust core, Python bindings via UniFFI.
+**Low-latency transport.** WebRTC video (SIMD RGB→I420). SCTP data channels with reliable or unreliable delivery per stream. Byte streams for arbitrary-size payloads. RPC for one-shots like `home` or `calibrate`. Rust core, Python bindings via UniFFI.
 
 ---
 
@@ -159,7 +161,9 @@ async def main():
     # Cameras, state, and a sender timestamp arrive fused as one tuple.
     def on_observation(obs):
         # obs.frames["front"], obs.state, obs.timestamp_us
-        portal.send_action(policy(obs))
+        # Pass in_reply_to_ts_us so metrics.policy.e2e_us_* measures
+        # true observation→action latency on the robot side.
+        portal.send_action(policy(obs), in_reply_to_ts_us=obs.timestamp_us)
 
     portal.on_observation(on_observation)
     await portal.connect(url, token)
@@ -236,6 +240,23 @@ cp .env.example .env            # fill in LIVEKIT_URL / API_KEY / API_SECRET
 uv sync
 uv run robot.py                 # terminal 1
 uv run teleoperator.py          # terminal 2
+```
+
+**[`examples/python/inference/`](examples/python/inference)**
+
+VLA-style remote inference. The robot streams obs to a remote "policy"
+which emits a `(horizon, n_fields)` **action chunk** per inference step.
+The robot unrolls the chunk locally between rounds. Demonstrates the two
+inference-shaped features: `add_action_chunk` and `in_reply_to_ts_us`.
+Reports live `metrics.policy.e2e_us_p50/p95` — the actual
+observation→action latency, not network ping.
+
+```bash
+cd examples/python/inference
+cp .env.example .env
+uv sync
+uv run robot.py                 # terminal 1
+uv run policy.py                # terminal 2
 ```
 
 **[`examples/python/so101/`](examples/python/so101)**

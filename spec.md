@@ -94,9 +94,45 @@ inference_portal.send_video_frame("camera3", frame3)
 # State is tagged with system time
 inference_portal.send_state({"joint1": 0.0, "joint2": 0.0, "joint3": 0.0})  # optional: custom timestamp
 
-# On operator side
-inference_portal.send_action({"joint1": 0.0, "joint2": 0.0, "joint3": 0.0})  # optional: custom timestamp
+# On operator side. Pass in_reply_to_ts_us to correlate the action back to
+# the observation it was produced from — required for metrics.policy.e2e_us_*.
+inference_portal.send_action(
+    {"joint1": 0.0, "joint2": 0.0, "joint3": 0.0},
+    in_reply_to_ts_us=obs.timestamp_us,
+)
 ```
+
+### Action chunks (VLA inference)
+
+Modern VLA policies emit a horizon of future actions per inference step. Portal
+handles these as a first-class wire type instead of forcing a stream of scalar
+sends. Declare the chunk with its horizon and per-field dtypes; the wire format
+ships the whole tensor in one packet.
+
+```python
+# Both peers declare the chunk.
+cfg.add_action_chunk(
+    "act",
+    horizon=50,
+    fields=[("j1", DType.F32), ("j2", DType.F32), ("j3", DType.F32)],
+)
+
+# Operator side — accepts numpy `(horizon, n_fields)` arrays for uniform
+# dtype, or `Dict[str, ndarray]` for mixed dtypes. Pass in_reply_to_ts_us
+# the same way as send_action.
+portal.send_action_chunk("act", policy_output, in_reply_to_ts_us=obs.timestamp_us)
+
+# Robot side — register a per-chunk callback. chunk.data is reconstructed
+# as numpy arrays of the declared dtype; chunk.raw_data keeps the f64 view.
+def on_chunk(chunk: ActionChunk) -> None:
+    for t in range(chunk.horizon):
+        robot.send_action({k: float(v[t]) for k, v in chunk.data.items()})
+
+portal.on_action_chunk("act", on_chunk)
+```
+
+Chunks travel as **LiveKit byte streams**, not data packets — so the 15 KB
+data-packet ceiling does not apply. Delivery is reliable and ordered.
 
 ### Receiving
 
@@ -168,8 +204,9 @@ metrics.transport
   frames_sent / frames_received   # per video track
   states_sent / states_received
   actions_sent / actions_received
+  action_chunks_sent / action_chunks_received
   frame_jitter_us                 # per video track, RFC 3550 inter-arrival jitter (EWMA, α=1/16)
-  state_jitter_us / action_jitter_us
+  state_jitter_us / action_jitter_us / action_chunk_jitter_us
 
 metrics.buffers                   # fill gauges + overflow counters
   video_fill                      # gauge, per video track
@@ -179,7 +216,23 @@ metrics.buffers                   # fill gauges + overflow counters
 metrics.rtt
   rtt_us_last / rtt_us_mean / rtt_us_p95
   pings_sent / pongs_received
+
+metrics.policy
+  e2e_us_p50 / e2e_us_p95     # observation → action latency, derived from
+                              # in_reply_to_ts_us on received actions/chunks
+  correlated_received          # how many actions/chunks carried correlation
 ```
+
+`metrics.policy` populates only once correlated traffic arrives. When the
+operator passes `in_reply_to_ts_us=obs.timestamp_us` into `send_action` /
+`send_action_chunk`, the robot derives `now_us - in_reply_to_ts_us` on receive
+and feeds it into a 256-sample rolling window. Both sides observe the *same*
+clock here (the original observation timestamp originated as the robot's state
+send time), so this is a true single-clock measurement — no NTP required.
+
+Use this instead of `metrics.rtt` when the question is "how long does my
+policy take, end to end?" — `rtt_*` is just the network ping; the policy's
+inference time, queueing, and serialization don't show up there.
 
 RTT is measured on a reserved `portal_rtt` data topic. Each side sends an unreliable ping at `ping_ms`; the other side echoes it as a pong carrying the original timestamp. The pinging side computes RTT = `now − ping_ts` when the pong arrives. Unreliable delivery is deliberate: reliable retransmits would inflate the measurement. Echo is always active, so one side can disable pinging and still let the other measure.
 

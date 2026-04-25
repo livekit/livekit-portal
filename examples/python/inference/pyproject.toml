@@ -1,0 +1,14 @@
+[project]
+name = "livekit-portal-inference-example"
+version = "0.1.0"
+description = "VLA-style remote inference: action chunks + observation-correlated actions over LiveKit Portal"
+requires-python = ">=3.12"
+dependencies = [
+    "livekit-portal",
+    "livekit-api>=0.7",
+    "python-dotenv>=1",
+    "numpy>=1.24",
+]
+
+[tool.uv.sources]
+livekit-portal = { path = "../../../python/packages/livekit-portal", editable = true }
