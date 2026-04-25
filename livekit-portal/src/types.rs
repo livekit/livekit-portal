@@ -122,6 +122,39 @@ pub struct Action {
     /// a numeric buffer without matching on each variant.
     pub raw_values: HashMap<String, f64>,
     pub timestamp_us: u64,
+    /// Sender-side observation timestamp this action was produced from,
+    /// when the operator passed one to `send_action`. `None` means the
+    /// action was published unsolicited (no observation it answers to).
+    /// Used to derive end-to-end policy latency (`metrics.policy.e2e_us_*`).
+    pub in_reply_to_ts_us: Option<u64>,
+}
+
+/// One action chunk received from the operator. Surfaces in
+/// `on_action_chunk` / `Portal::get_action_chunk`.
+///
+/// The shape is `[horizon, fields]` row-major: timestep `t` of field `f` is at
+/// `data[&f][t as usize]`. Each per-field column has length `horizon`. Fields
+/// keep their declared dtype on the wire and are widened to `f64` here for
+/// uniformity — bindings re-cast at egress.
+///
+/// **Why a chunk type, not just an Action?** VLA policies emit a horizon of
+/// future actions per inference step. Packing them as scalars would either
+/// require many `send_action` calls (one per timestep) or hand-rolled
+/// side-channel binary, defeating the schema. A first-class chunk lets the
+/// schema describe the tensor and lets the wire ship it as one packet.
+#[derive(Debug, Clone)]
+pub struct ActionChunk {
+    /// Chunk name as declared in `add_action_chunk`.
+    pub name: String,
+    /// Number of timesteps (length of every per-field column).
+    pub horizon: u32,
+    /// Per-field column, length `horizon`, dtype widened to `f64`.
+    pub data: HashMap<String, Vec<f64>>,
+    pub timestamp_us: u64,
+    /// Sender-side observation timestamp this chunk was produced from, when
+    /// the operator passed one to `send_action_chunk`. `None` means the
+    /// chunk was published unsolicited.
+    pub in_reply_to_ts_us: Option<u64>,
 }
 
 /// One state sample received from the robot. Surfaces in `on_state` and

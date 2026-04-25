@@ -12,6 +12,7 @@ pub struct PortalMetrics {
     pub transport: TransportMetrics,
     pub buffers: BufferMetrics,
     pub rtt: RttMetrics,
+    pub policy: PolicyMetrics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,10 +42,27 @@ pub struct TransportMetrics {
     pub states_received: u64,
     pub actions_sent: u64,
     pub actions_received: u64,
+    pub action_chunks_sent: u64,
+    pub action_chunks_received: u64,
     /// Per-stream RFC 3550 inter-arrival jitter estimate (EWMA, α=1/16).
     pub frame_jitter_us: HashMap<String, u64>,
     pub state_jitter_us: u64,
     pub action_jitter_us: u64,
+    pub action_chunk_jitter_us: u64,
+}
+
+/// End-to-end policy latency, measured from the observation timestamp the
+/// peer correlates against (`in_reply_to_ts_us`) to the local receive
+/// time of the resulting action or chunk. Both percentiles populate only
+/// once at least one correlated action/chunk has been received.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyMetrics {
+    pub e2e_us_p50: Option<u64>,
+    pub e2e_us_p95: Option<u64>,
+    /// Cumulative count of correlated actions/chunks received — useful as
+    /// a denominator if the user wants to know how many of the actions
+    /// arriving carry timing data versus uncorrelated.
+    pub correlated_received: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +90,7 @@ const SAMPLE_RING_CAP: usize = 256;
 pub(crate) enum DataStream {
     State,
     Action,
+    Chunk,
 }
 
 pub(crate) struct MetricsRegistry {
@@ -82,8 +101,13 @@ pub(crate) struct MetricsRegistry {
     states_received: AtomicU64,
     actions_sent: AtomicU64,
     actions_received: AtomicU64,
+    action_chunks_sent: AtomicU64,
+    action_chunks_received: AtomicU64,
     state_jitter: Mutex<JitterState>,
     action_jitter: Mutex<JitterState>,
+    chunk_jitter: Mutex<JitterState>,
+    e2e_samples: Mutex<SampleRing>,
+    correlated_received: AtomicU64,
 
     observations_emitted: AtomicU64,
     stale_observations_emitted: AtomicU64,
@@ -113,8 +137,13 @@ impl MetricsRegistry {
             states_received: AtomicU64::new(0),
             actions_sent: AtomicU64::new(0),
             actions_received: AtomicU64::new(0),
+            action_chunks_sent: AtomicU64::new(0),
+            action_chunks_received: AtomicU64::new(0),
             state_jitter: Mutex::new(JitterState::default()),
             action_jitter: Mutex::new(JitterState::default()),
+            chunk_jitter: Mutex::new(JitterState::default()),
+            e2e_samples: Mutex::new(SampleRing::new(SAMPLE_RING_CAP)),
+            correlated_received: AtomicU64::new(0),
             observations_emitted: AtomicU64::new(0),
             stale_observations_emitted: AtomicU64::new(0),
             states_dropped: AtomicU64::new(0),
@@ -135,17 +164,42 @@ impl MetricsRegistry {
         match stream {
             DataStream::State => self.states_sent.fetch_add(1, Ordering::Relaxed),
             DataStream::Action => self.actions_sent.fetch_add(1, Ordering::Relaxed),
+            DataStream::Chunk => self.action_chunks_sent.fetch_add(1, Ordering::Relaxed),
         };
     }
 
-    pub fn record_state_received(&self, send_ts_us: u64, recv_ts_us: u64) {
-        self.states_received.fetch_add(1, Ordering::Relaxed);
-        self.state_jitter.lock().sample(send_ts_us, recv_ts_us);
+    /// Bump the appropriate received counter and feed the per-stream
+    /// inter-arrival jitter sampler. Mirrors `bump_sent`'s dispatch shape
+    /// so all three streams share one entry point.
+    pub fn record_received(&self, stream: DataStream, send_ts_us: u64, recv_ts_us: u64) {
+        match stream {
+            DataStream::State => {
+                self.states_received.fetch_add(1, Ordering::Relaxed);
+                self.state_jitter.lock().sample(send_ts_us, recv_ts_us);
+            }
+            DataStream::Action => {
+                self.actions_received.fetch_add(1, Ordering::Relaxed);
+                self.action_jitter.lock().sample(send_ts_us, recv_ts_us);
+            }
+            DataStream::Chunk => {
+                self.action_chunks_received.fetch_add(1, Ordering::Relaxed);
+                self.chunk_jitter.lock().sample(send_ts_us, recv_ts_us);
+            }
+        }
     }
 
-    pub fn record_action_received(&self, send_ts_us: u64, recv_ts_us: u64) {
-        self.actions_received.fetch_add(1, Ordering::Relaxed);
-        self.action_jitter.lock().sample(send_ts_us, recv_ts_us);
+    /// Record an observation→action e2e latency from the action's
+    /// `in_reply_to_ts_us`. Skips when `None` (uncorrelated publish) or
+    /// when local receive time isn't strictly after `reply_ts` (rare
+    /// clock skew on loopback runs — we'd rather drop the sample than
+    /// log a wrapped u64).
+    pub fn record_e2e(&self, in_reply_to_ts_us: Option<u64>, recv_ts_us: u64) {
+        let Some(reply_ts) = in_reply_to_ts_us else { return };
+        if recv_ts_us <= reply_ts {
+            return;
+        }
+        self.correlated_received.fetch_add(1, Ordering::Relaxed);
+        self.e2e_samples.lock().push(recv_ts_us - reply_ts);
     }
 
     pub fn record_observation(&self, worst_delta_us: u64) {
@@ -205,6 +259,11 @@ impl MetricsRegistry {
         let rtt_last_raw = self.rtt_last.load(Ordering::Relaxed);
         let rtt_us_last = (rtt_last_raw != 0).then_some(rtt_last_raw);
 
+        let (e2e_p50, e2e_p95) = {
+            let ring = self.e2e_samples.lock();
+            (ring.percentile(0.50), ring.percentile(0.95))
+        };
+
         let last_blocker_track = {
             let idx = self.last_blocker_track.load(Ordering::Relaxed);
             (idx != usize::MAX).then(|| self.track_order.get(idx).cloned()).flatten()
@@ -228,9 +287,12 @@ impl MetricsRegistry {
                 states_received: self.states_received.load(Ordering::Relaxed),
                 actions_sent: self.actions_sent.load(Ordering::Relaxed),
                 actions_received: self.actions_received.load(Ordering::Relaxed),
+                action_chunks_sent: self.action_chunks_sent.load(Ordering::Relaxed),
+                action_chunks_received: self.action_chunks_received.load(Ordering::Relaxed),
                 frame_jitter_us,
                 state_jitter_us: self.state_jitter.lock().jitter_us,
                 action_jitter_us: self.action_jitter.lock().jitter_us,
+                action_chunk_jitter_us: self.chunk_jitter.lock().jitter_us,
             },
             buffers: BufferMetrics { video_fill, state_fill, evictions },
             rtt: RttMetrics {
@@ -240,6 +302,11 @@ impl MetricsRegistry {
                 pings_sent: self.pings_sent.load(Ordering::Relaxed),
                 pongs_received: self.pongs_received.load(Ordering::Relaxed),
             },
+            policy: PolicyMetrics {
+                e2e_us_p50: e2e_p50,
+                e2e_us_p95: e2e_p95,
+                correlated_received: self.correlated_received.load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -248,8 +315,13 @@ impl MetricsRegistry {
         self.states_received.store(0, Ordering::Relaxed);
         self.actions_sent.store(0, Ordering::Relaxed);
         self.actions_received.store(0, Ordering::Relaxed);
+        self.action_chunks_sent.store(0, Ordering::Relaxed);
+        self.action_chunks_received.store(0, Ordering::Relaxed);
         *self.state_jitter.lock() = JitterState::default();
         *self.action_jitter.lock() = JitterState::default();
+        *self.chunk_jitter.lock() = JitterState::default();
+        self.e2e_samples.lock().clear();
+        self.correlated_received.store(0, Ordering::Relaxed);
         self.observations_emitted.store(0, Ordering::Relaxed);
         self.stale_observations_emitted.store(0, Ordering::Relaxed);
         self.states_dropped.store(0, Ordering::Relaxed);

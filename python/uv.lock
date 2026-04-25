@@ -917,16 +917,20 @@ examples = [
     { name = "livekit-api" },
     { name = "python-dotenv" },
 ]
+integration = [
+    { name = "livekit-api" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "livekit-api", marker = "extra == 'examples'", specifier = ">=0.7" },
+    { name = "livekit-api", marker = "extra == 'integration'", specifier = ">=0.7" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-dotenv", marker = "extra == 'examples'", specifier = ">=1" },
 ]
-provides-extras = ["dev", "examples"]
+provides-extras = ["dev", "examples", "integration"]
 
 [[package]]
 name = "livekit-portal-workspace"
