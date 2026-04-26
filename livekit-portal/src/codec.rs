@@ -10,6 +10,7 @@
 
 use std::io::Cursor;
 
+use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
@@ -19,7 +20,7 @@ use image::{ExtendedColorType, ImageEncoder};
 /// Selected per-track at config time (see `PortalConfig::add_frame_video`).
 /// Choice drives the wire size and CPU cost; the user-facing payload is RGB
 /// in every case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     /// Uncompressed RGB24. Largest payload, zero encode cost. Use when CPU is
     /// scarce or you want bit-exact frames with no codec dependency.
@@ -33,19 +34,13 @@ pub enum Codec {
     Mjpeg,
 }
 
-impl Codec {
-    /// Whether `quality` is meaningful for this codec. `false` means the
-    /// caller's value is ignored on encode.
-    pub fn uses_quality(self) -> bool {
-        matches!(self, Codec::Mjpeg)
-    }
-}
-
-/// Decoded frame: RGB24 bytes plus the dimensions parsed from the payload (or
-/// echoed back, in `Raw`'s case).
+/// Decoded frame: RGB24 bytes plus the dimensions parsed from the payload
+/// (or echoed back, in `Raw`'s case). `rgb` is `Bytes` so the `Raw` decode
+/// can hand back a zero-copy slice of the wire payload — refcount bump
+/// only, no memcpy. PNG and MJPEG own their decoded buffer.
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
-    pub rgb: Vec<u8>,
+    pub rgb: Bytes,
     pub width: u32,
     pub height: u32,
 }
@@ -58,8 +53,6 @@ pub enum CodecError {
         "wrong RGB buffer size for {width}x{height}: expected {expected} bytes, got {got}"
     )]
     WrongRgbSize { width: u32, height: u32, expected: usize, got: usize },
-    #[error("invalid quality {0}: must be in 1..=100")]
-    InvalidQuality(u8),
     #[error("encode failed: {0}")]
     EncodeFailed(String),
     #[error("decode failed: {0}")]
@@ -77,7 +70,9 @@ pub enum CodecError {
 
 pub type CodecResult<T> = Result<T, CodecError>;
 
-fn check_rgb(rgb: &[u8], width: u32, height: u32) -> CodecResult<usize> {
+/// Validate that `rgb` matches `width × height × 3` and dimensions are
+/// non-zero / non-overflowing.
+fn check_rgb(rgb: &[u8], width: u32, height: u32) -> CodecResult<()> {
     if width == 0 || height == 0 {
         return Err(CodecError::InvalidDimensions { width, height });
     }
@@ -93,11 +88,38 @@ fn check_rgb(rgb: &[u8], width: u32, height: u32) -> CodecResult<usize> {
             got: rgb.len(),
         });
     }
-    Ok(expected)
+    Ok(())
+}
+
+/// Rough encoded-size estimate for capacity hints. Picked to over-allocate
+/// slightly more often than under-allocate, so the buffer doesn't grow
+/// during encode. Only used as a `Vec::with_capacity` hint — the actual
+/// payload size is whatever the encoder produces.
+///
+///   * Raw   = exact (`W*H*3`)
+///   * Png   = same as raw (high-entropy frames sit near the raw size)
+///   * Mjpeg = raw / 8 (≈ q90 ratio on natural images; loose, but avoids
+///     the common case of `Vec` doubling-from-zero during encode)
+pub fn estimated_encoded_size(width: u32, height: u32, codec: Codec) -> usize {
+    let raw = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(3);
+    match codec {
+        Codec::Raw => raw,
+        Codec::Png => raw,
+        Codec::Mjpeg => (raw / 8).max(1024),
+    }
 }
 
 /// Encode an RGB24 frame to the wire payload for `codec`. `quality` is in
 /// `1..=100` for `Mjpeg` and is ignored for `Raw` and `Png`.
+///
+/// Quality range is enforced at config time by `PortalConfig::add_frame_video`,
+/// so this hot-path encode skips re-validation.
+///
+/// Allocates a fresh `Vec`. Prefer `encode_frame_into` when you already
+/// own the destination buffer (publishers do, to bake the framing header
+/// and the codec output into a single allocation).
 pub fn encode_frame(
     rgb: &[u8],
     width: u32,
@@ -105,67 +127,88 @@ pub fn encode_frame(
     codec: Codec,
     quality: u8,
 ) -> CodecResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(estimated_encoded_size(width, height, codec));
+    encode_frame_into(&mut out, rgb, width, height, codec, quality)?;
+    Ok(out)
+}
+
+/// Encode an RGB24 frame into `out`, appending to whatever's already
+/// there. Used by the frame-video publisher to fold the wire-framing
+/// header and the codec payload into one buffer — saves a Vec
+/// allocation and a full payload memcpy versus encoding into a
+/// temporary and copying.
+pub fn encode_frame_into(
+    out: &mut Vec<u8>,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    codec: Codec,
+    quality: u8,
+) -> CodecResult<()> {
     check_rgb(rgb, width, height)?;
     match codec {
-        Codec::Raw => Ok(rgb.to_vec()),
+        Codec::Raw => {
+            out.extend_from_slice(rgb);
+            Ok(())
+        }
         Codec::Png => {
-            // Default filter + fast compression. PNG's strength is "good
-            // enough lossless"; cranking compression past Default doesn't
-            // change the bitstream-level losslessness, only the encode cost.
-            let mut out = Vec::new();
+            // `Fast` instead of `Default` — for streaming inference video,
+            // encode latency matters more than the last 10% of compression.
+            // Bitstream-level losslessness is unaffected. Bumping the
+            // compression dial would add ~30% encode time per 480p frame
+            // for ~10% smaller payloads — wrong trade for a 5-30 Hz
+            // realtime path. `Adaptive` filter still picks the best filter
+            // per scanline.
             let encoder = PngEncoder::new_with_quality(
-                &mut out,
-                CompressionType::Default,
+                &mut *out,
+                CompressionType::Fast,
                 PngFilterType::Adaptive,
             );
             encoder
                 .write_image(rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|e| CodecError::EncodeFailed(e.to_string()))?;
-            Ok(out)
+            Ok(())
         }
         Codec::Mjpeg => {
-            if !(1..=100).contains(&quality) {
-                return Err(CodecError::InvalidQuality(quality));
-            }
-            let mut out = Vec::new();
-            let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
+            let mut encoder = JpegEncoder::new_with_quality(&mut *out, quality);
             encoder
                 .encode(rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|e| CodecError::EncodeFailed(e.to_string()))?;
-            Ok(out)
+            Ok(())
         }
     }
 }
 
 /// Decode a wire payload to RGB24 plus its dimensions. For `Raw`, dimensions
 /// must be supplied by the caller via `declared_width` / `declared_height`
-/// (the byte stream carries them in the framing header). For `Png` /
-/// `Mjpeg`, the encoded bitstream carries its own dimensions; the declared
-/// values, when non-zero, are checked against the decoded values and a
-/// mismatch returns `DimensionMismatch`.
+/// (the byte stream carries them in the framing header) — the `Bytes` is
+/// returned untouched (zero-copy refcount bump). For `Png` / `Mjpeg`, the
+/// encoded bitstream carries its own dimensions; the declared values, when
+/// non-zero, are checked against the decoded values and a mismatch returns
+/// `DimensionMismatch`.
 pub fn decode_frame(
-    bytes: &[u8],
+    bytes: Bytes,
     codec: Codec,
     declared_width: u32,
     declared_height: u32,
 ) -> CodecResult<DecodedFrame> {
     match codec {
         Codec::Raw => {
-            check_rgb(bytes, declared_width, declared_height)?;
+            check_rgb(&bytes, declared_width, declared_height)?;
             Ok(DecodedFrame {
-                rgb: bytes.to_vec(),
+                rgb: bytes,
                 width: declared_width,
                 height: declared_height,
             })
         }
         Codec::Png => decode_with_image_crate(
-            bytes,
+            &bytes,
             image::ImageFormat::Png,
             declared_width,
             declared_height,
         ),
         Codec::Mjpeg => decode_with_image_crate(
-            bytes,
+            &bytes,
             image::ImageFormat::Jpeg,
             declared_width,
             declared_height,
@@ -196,7 +239,7 @@ fn decode_with_image_crate(
             declared_height,
         });
     }
-    Ok(DecodedFrame { rgb: decoded.into_raw(), width: w, height: h })
+    Ok(DecodedFrame { rgb: Bytes::from(decoded.into_raw()), width: w, height: h })
 }
 
 #[cfg(test)]
@@ -220,9 +263,26 @@ mod tests {
         let rgb = gradient(64, 48);
         let bytes = encode_frame(&rgb, 64, 48, Codec::Raw, 0).unwrap();
         assert_eq!(bytes, rgb, "raw encode is identity");
-        let decoded = decode_frame(&bytes, Codec::Raw, 64, 48).unwrap();
-        assert_eq!(decoded.rgb, rgb);
+        let decoded = decode_frame(Bytes::from(bytes), Codec::Raw, 64, 48).unwrap();
+        assert_eq!(decoded.rgb.as_ref(), rgb.as_slice());
         assert_eq!((decoded.width, decoded.height), (64, 48));
+    }
+
+    #[test]
+    fn raw_decode_is_zero_copy() {
+        // Raw decode must hand back a `Bytes` that aliases the input — no
+        // memcpy of the payload. We can't directly observe the heap
+        // pointer, but `Bytes::ptr_eq` (via the addr of the slice) tells
+        // us whether two views share the same allocation.
+        let rgb = gradient(64, 48);
+        let payload = Bytes::from(rgb.clone());
+        let payload_ptr = payload.as_ptr();
+        let decoded = decode_frame(payload, Codec::Raw, 64, 48).unwrap();
+        assert_eq!(
+            decoded.rgb.as_ptr(),
+            payload_ptr,
+            "Raw decode must reuse the input buffer (zero-copy)"
+        );
     }
 
     #[test]
@@ -230,8 +290,8 @@ mod tests {
         let rgb = gradient(64, 48);
         let bytes = encode_frame(&rgb, 64, 48, Codec::Png, 0).unwrap();
         assert!(bytes.len() < rgb.len() * 2, "png shouldn't grow much over raw");
-        let decoded = decode_frame(&bytes, Codec::Png, 64, 48).unwrap();
-        assert_eq!(decoded.rgb, rgb, "PNG is lossless");
+        let decoded = decode_frame(Bytes::from(bytes), Codec::Png, 64, 48).unwrap();
+        assert_eq!(decoded.rgb.as_ref(), rgb.as_slice(), "PNG is lossless");
         assert_eq!((decoded.width, decoded.height), (64, 48));
     }
 
@@ -240,11 +300,14 @@ mod tests {
         let rgb = gradient(64, 48);
         let bytes = encode_frame(&rgb, 64, 48, Codec::Mjpeg, 95).unwrap();
         assert!(bytes.len() < rgb.len(), "jpeg should shrink the payload");
-        let decoded = decode_frame(&bytes, Codec::Mjpeg, 64, 48).unwrap();
+        let decoded = decode_frame(Bytes::from(bytes), Codec::Mjpeg, 64, 48).unwrap();
         assert_eq!((decoded.width, decoded.height), (64, 48));
         // JPEG is lossy; check the average per-pixel error is small.
-        let total: u64 =
-            rgb.iter().zip(decoded.rgb.iter()).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64).sum();
+        let total: u64 = rgb
+            .iter()
+            .zip(decoded.rgb.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
+            .sum();
         let avg = total as f64 / rgb.len() as f64;
         assert!(avg < 5.0, "avg pixel error {avg} should be small at q=95");
     }
@@ -256,7 +319,7 @@ mod tests {
         // out-of-band hint.
         let rgb = gradient(32, 32);
         let bytes = encode_frame(&rgb, 32, 32, Codec::Png, 0).unwrap();
-        let decoded = decode_frame(&bytes, Codec::Png, 0, 0).unwrap();
+        let decoded = decode_frame(Bytes::from(bytes), Codec::Png, 0, 0).unwrap();
         assert_eq!((decoded.width, decoded.height), (32, 32));
     }
 
@@ -264,21 +327,8 @@ mod tests {
     fn dimension_mismatch_rejected() {
         let rgb = gradient(32, 32);
         let bytes = encode_frame(&rgb, 32, 32, Codec::Png, 0).unwrap();
-        let err = decode_frame(&bytes, Codec::Png, 64, 64).unwrap_err();
+        let err = decode_frame(Bytes::from(bytes), Codec::Png, 64, 64).unwrap_err();
         assert!(matches!(err, CodecError::DimensionMismatch { .. }));
-    }
-
-    #[test]
-    fn invalid_jpeg_quality_rejected() {
-        let rgb = gradient(8, 8);
-        assert!(matches!(
-            encode_frame(&rgb, 8, 8, Codec::Mjpeg, 0),
-            Err(CodecError::InvalidQuality(0))
-        ));
-        assert!(matches!(
-            encode_frame(&rgb, 8, 8, Codec::Mjpeg, 101),
-            Err(CodecError::InvalidQuality(101))
-        ));
     }
 
     #[test]
@@ -286,12 +336,5 @@ mod tests {
         let rgb = vec![0u8; 100]; // not 32*32*3
         let err = encode_frame(&rgb, 32, 32, Codec::Raw, 0).unwrap_err();
         assert!(matches!(err, CodecError::WrongRgbSize { .. }));
-    }
-
-    #[test]
-    fn quality_only_meaningful_for_mjpeg() {
-        assert!(!Codec::Raw.uses_quality());
-        assert!(!Codec::Png.uses_quality());
-        assert!(Codec::Mjpeg.uses_quality());
     }
 }

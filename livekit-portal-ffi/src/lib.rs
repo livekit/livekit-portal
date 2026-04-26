@@ -54,6 +54,10 @@ impl From<core::Role> for Role {
 
 /// Frame-video codec. Selected per-track at config time (see
 /// `PortalConfig::add_frame_video`). Mirrors `livekit_portal::Codec`.
+///
+/// **Foreign binding casing**: UniFFI emits enum variants in the host
+/// language's idiomatic case. Python code uses `VideoCodec.RAW` /
+/// `VideoCodec.PNG` / `VideoCodec.MJPEG` (UPPER), not the Rust spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum VideoCodec {
     /// Uncompressed RGB24. Largest payload, zero encode cost.
@@ -222,6 +226,17 @@ pub struct SyncMetrics {
 pub struct TransportMetrics {
     pub frames_sent: HashMap<String, u64>,
     pub frames_received: HashMap<String, u64>,
+    /// Per-track count of frames the publisher dropped because its in-flight
+    /// queue was at the cap. Frame-video tracks only — WebRTC frames flow
+    /// through libwebrtc's own backpressure pipeline. Non-zero at steady
+    /// state means the publisher is offering frames faster than the link
+    /// can ship them.
+    pub frames_dropped_publisher_full: HashMap<String, u64>,
+    /// Per-track cumulative on-wire bytes sent (header + codec payload).
+    /// Frame-video only. Average frame size = `bytes_sent / frames_sent`.
+    pub bytes_sent: HashMap<String, u64>,
+    /// Per-track cumulative on-wire bytes received. Frame-video only.
+    pub bytes_received: HashMap<String, u64>,
     pub states_sent: u64,
     pub states_received: u64,
     pub actions_sent: u64,
@@ -303,6 +318,9 @@ pub enum PortalError {
     #[error("deserialization error: {0}")]
     Deserialization(String),
 
+    #[error("frame codec error: {0}")]
+    Codec(String),
+
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
 
@@ -330,6 +348,7 @@ impl From<core::PortalError> for PortalError {
                 PortalError::InvalidFrameDimensions { width, height }
             }
             core::PortalError::Deserialization(s) => PortalError::Deserialization(s),
+            core::PortalError::Codec(s) => PortalError::Codec(s),
             core::PortalError::WrongRole(r) => PortalError::WrongRole(r.into()),
             core::PortalError::DtypeMismatch { field, expected, got } => {
                 PortalError::DtypeMismatch {
@@ -578,7 +597,12 @@ impl Portal {
                 .collect();
             cb.on_drop(raw);
         });
-        for track in &video_tracks {
+        // Register `on_video_frame` for every declared track regardless of
+        // transport. Frame-video tracks share the same `VideoTrackSlots` map
+        // with WebRTC tracks on the core side, so a single registration
+        // surface works for both — the foreign side only sees one
+        // `on_video_frame(track, frame)` event stream per Portal.
+        for track in video_tracks.iter().chain(frame_video_tracks.iter().map(|s| &s.name)) {
             let cb = callbacks.clone();
             let track_name = track.clone();
             inner.on_video_frame(track, move |_name, frame| {
@@ -852,6 +876,9 @@ fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {
         transport: TransportMetrics {
             frames_sent: m.transport.frames_sent,
             frames_received: m.transport.frames_received,
+            frames_dropped_publisher_full: m.transport.frames_dropped_publisher_full,
+            bytes_sent: m.transport.bytes_sent,
+            bytes_received: m.transport.bytes_received,
             states_sent: m.transport.states_sent,
             states_received: m.transport.states_received,
             actions_sent: m.transport.actions_sent,

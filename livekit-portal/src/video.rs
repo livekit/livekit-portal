@@ -1,8 +1,8 @@
-use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use livekit::options::{PacketTrailerFeatures, TrackPublishOptions, VideoCodec, VideoEncoding};
 use livekit::prelude::*;
@@ -171,7 +171,7 @@ impl VideoReceiver {
                         );
                     }
                 }
-                // VideoFrameData clone is cheap — pixel buffer is Arc<[u8]>.
+                // VideoFrameData clone is cheap — pixel buffer is `Bytes`.
                 *slots.latest.lock() = Some((*frame_arc).clone());
                 let output = sync_buffer.lock().push_frame(&name, frame_arc);
                 if !output.is_empty() {
@@ -206,33 +206,32 @@ fn convert_frame<T: AsRef<dyn VideoBuffer>>(
     let total = (width as usize) * (height as usize) * 3;
     let dst_stride = (width as i32) * 3;
 
-    // Single-allocation Arc — libyuv writes RGB24 directly into uninit memory.
-    let mut data: Arc<[MaybeUninit<u8>]> = Arc::new_uninit_slice(total);
-    {
-        // SAFETY: freshly allocated Arc, no other references exist.
-        let dst = Arc::get_mut(&mut data).expect("freshly allocated Arc has unique ownership");
-        // SAFETY: src planes are sized by libwebrtc per `width`/`height`;
-        // dst is exactly `width*height*3` bytes; libyuv reads/writes within
-        // the bounds described by the strides we pass.
-        unsafe {
-            yuv_sys::rs_I420ToRAW(
-                y.as_ptr(),
-                sy as i32,
-                u.as_ptr(),
-                su as i32,
-                v.as_ptr(),
-                sv as i32,
-                dst.as_mut_ptr() as *mut u8,
-                dst_stride,
-                width as i32,
-                height as i32,
-            );
-        }
+    // Single-allocation buffer with no zero-init — libyuv writes RGB24
+    // directly into the reserved capacity, then we move ownership into
+    // `Bytes`. `set_len(total)` after libyuv is the only way to avoid a
+    // `vec![0; total]` zero-pass that would cost ~6 MB of writes per
+    // 1080p frame for nothing.
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    // SAFETY: src planes are sized by libwebrtc per `width`/`height`;
+    // libyuv writes exactly `width*height*3` bytes within `dst_stride`
+    // bounds; we then `set_len(total)` to publish those bytes as
+    // initialized. The capacity was reserved above.
+    unsafe {
+        yuv_sys::rs_I420ToRAW(
+            y.as_ptr(),
+            sy as i32,
+            u.as_ptr(),
+            su as i32,
+            v.as_ptr(),
+            sv as i32,
+            buf.as_mut_ptr(),
+            dst_stride,
+            width as i32,
+            height as i32,
+        );
+        buf.set_len(total);
     }
-    // SAFETY: libyuv wrote width*height*3 bytes into `dst`.
-    let data: Arc<[u8]> = unsafe { data.assume_init() };
-
-    VideoFrameData { width, height, data, timestamp_us }
+    VideoFrameData { width, height, data: Bytes::from(buf), timestamp_us }
 }
 
 // RGB24 (R,G,B byte order) -> I420 via libyuv. libyuv's `RAW` format is R,G,B;

@@ -3,6 +3,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use livekit::prelude::*;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex;
@@ -14,6 +15,9 @@ use crate::data::{
     DataPublisher, StateSlot, ACTION_CHUNK_TOPIC, ACTION_TOPIC, STATE_TOPIC,
 };
 use crate::error::{PortalError, PortalResult};
+use crate::frame_video::{
+    dispatch_frame_payload, FrameVideoPublisher, FrameVideoTrackEntry, FRAME_VIDEO_TOPIC,
+};
 use crate::metrics::{DataStream, MetricsRegistry, PortalMetrics};
 use crate::rpc::RpcHandler;
 use crate::rtt::RttService;
@@ -126,6 +130,10 @@ pub struct Portal {
     // Hot-path publishers. Each is guarded by its own mutex so send methods
     // can clone the Arc out and drop the lock before doing any IO.
     video_publishers: Mutex<HashMap<String, Arc<VideoPublisher>>>,
+    /// Robot-side: one publisher per declared frame-video track. Frame-video
+    /// frames travel as byte streams (per-frame RGB encode), bypassing the
+    /// WebRTC media path.
+    frame_video_publishers: Mutex<HashMap<String, Arc<FrameVideoPublisher>>>,
     state_publisher: Mutex<Option<Arc<DataPublisher>>>,
     action_publisher: Mutex<Option<Arc<DataPublisher>>>,
     /// Operator-side: one publisher per declared action chunk.
@@ -147,6 +155,17 @@ pub struct Portal {
     unknown_chunk_fp_warns: Arc<Mutex<HashSet<u32>>>,
     // Fixed at construction (keyed by declared video_tracks) — no lock on the map itself.
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
+    /// Names of all video tracks (WebRTC + frame video) in declaration
+    /// order. Used by `setup_operator` to size the sync buffer over the
+    /// union of transports. Computed once at `Portal::new` so the connect
+    /// hot path doesn't re-walk the config.
+    all_track_names: Vec<String>,
+    /// Per-track frame-video entries (spec + slots + metrics fused). Fixed
+    /// at construction and shared as an `Arc<HashMap>` so the receive
+    /// dispatch can fan out to per-frame spawn tasks via a refcount bump
+    /// instead of cloning the whole map (which would allocate one `String`
+    /// per declared track per received frame).
+    frame_video_entries: Arc<HashMap<String, Arc<FrameVideoTrackEntry>>>,
 
     metrics: Arc<MetricsRegistry>,
 
@@ -163,13 +182,16 @@ pub struct Portal {
 
 impl Portal {
     pub fn new(config: PortalConfig) -> Self {
-        let video_tracks: HashMap<_, _> = config
-            .video_tracks
+        // Slots and metrics cover both transports. Frame-video and WebRTC
+        // tracks share the same VideoFrameData / VideoTrackSlots / sync
+        // buffer, so the consumer-facing API is identical.
+        let all_track_names = combined_track_names(&config);
+        let video_tracks: HashMap<String, Arc<VideoTrackSlots>> = all_track_names
             .iter()
             .map(|name| (name.clone(), Arc::new(VideoTrackSlots::new())))
             .collect();
 
-        let metrics = Arc::new(MetricsRegistry::new(&config.video_tracks));
+        let metrics = Arc::new(MetricsRegistry::new(&all_track_names));
         let obs_sink = Arc::new(ObservationSink::new());
 
         // Build chunk slots once at construction so the dispatch table is
@@ -180,6 +202,36 @@ impl Portal {
             .iter()
             .map(|spec| (spec.name.clone(), Arc::new(ChunkSlot::new(spec.clone()))))
             .collect();
+
+        // Same idea for frame-video entries: the dispatch path reads them
+        // per packet, so freezing the map at construction lets the hot path
+        // skip a Portal-level lock and the per-connect rebuild. Each entry
+        // bundles spec + slots + metrics so dispatch is a single lookup.
+        // Wrapped in `Arc<HashMap>` so per-frame fan-out is a refcount bump
+        // rather than a `String`-cloning map clone.
+        let frame_video_entries: Arc<HashMap<String, Arc<FrameVideoTrackEntry>>> = Arc::new(
+            config
+                .frame_video_tracks
+                .iter()
+                .map(|spec| {
+                    let slots = video_tracks
+                        .get(&spec.name)
+                        .expect("video_tracks contains every frame-video name")
+                        .clone();
+                    let track_metrics = metrics
+                        .track(&spec.name)
+                        .expect("track metrics registered for every frame-video name");
+                    (
+                        spec.name.clone(),
+                        Arc::new(FrameVideoTrackEntry {
+                            spec: spec.clone(),
+                            metrics: track_metrics,
+                            slots,
+                        }),
+                    )
+                })
+                .collect(),
+        );
 
         Self {
             config,
@@ -192,6 +244,7 @@ impl Portal {
             }),
             video_receivers: Arc::new(Mutex::new(HashMap::new())),
             video_publishers: Mutex::new(HashMap::new()),
+            frame_video_publishers: Mutex::new(HashMap::new()),
             state_publisher: Mutex::new(None),
             action_publisher: Mutex::new(None),
             chunk_publishers: Mutex::new(HashMap::new()),
@@ -202,6 +255,8 @@ impl Portal {
             chunk_slots,
             unknown_chunk_fp_warns: Arc::new(Mutex::new(HashSet::new())),
             video_tracks,
+            all_track_names,
+            frame_video_entries,
             metrics,
             peer_identity: Arc::new(Mutex::new(None)),
             rpc_handlers: Arc::new(Mutex::new(HashMap::new())),
@@ -267,6 +322,7 @@ impl Portal {
             unknown_chunk_fp_warns: self.unknown_chunk_fp_warns.clone(),
             video_tracks: self.video_tracks.clone(),
             video_receivers: self.video_receivers.clone(),
+            frame_video_entries: self.frame_video_entries.clone(),
             metrics: self.metrics.clone(),
             rtt: rtt.clone(),
             peer_identity: self.peer_identity.clone(),
@@ -294,13 +350,33 @@ impl Portal {
         height: u32,
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
-        let publisher = {
-            let map = self.video_publishers.lock();
-            map.get(track_name).cloned().ok_or_else(|| PortalError::UnknownVideoTrack {
-                name: track_name.to_string(),
-            })?
-        };
-        publisher.send_frame(rgb_data, width, height, timestamp_us)
+        // Two transports, one user-facing method. WebRTC publishers and
+        // frame-video publishers are populated by the corresponding
+        // `add_video` / `add_frame_video` declarations at config time, and
+        // names are unique across both, so a track lives in exactly one
+        // map.
+        if let Some(publisher) = self.video_publishers.lock().get(track_name).cloned() {
+            return publisher.send_frame(rgb_data, width, height, timestamp_us);
+        }
+        if let Some(publisher) = self.frame_video_publishers.lock().get(track_name).cloned() {
+            return publisher.send_frame(rgb_data, width, height, timestamp_us);
+        }
+        // Distinguish wrong-role (track is declared but no publisher exists
+        // because send is operator-side) from genuinely unknown-track. The
+        // operator never spawns video publishers, so a declared name with
+        // no publisher means "wrong role" — same shape as `send_state` /
+        // `send_action_chunk`.
+        if self.config.role != Role::Robot
+            && (self.config.video_tracks.iter().any(|n| n == track_name)
+                || self
+                    .config
+                    .frame_video_tracks
+                    .iter()
+                    .any(|s| s.name == track_name))
+        {
+            return Err(PortalError::WrongRole(self.config.role));
+        }
+        Err(PortalError::UnknownVideoTrack { name: track_name.to_string() })
     }
 
     /// Publish a state sample (robot only). Values are typed — build the
@@ -509,6 +585,7 @@ impl Portal {
         }
 
         self.video_publishers.lock().clear();
+        self.frame_video_publishers.lock().clear();
         *self.state_publisher.lock() = None;
         *self.action_publisher.lock() = None;
         self.chunk_publishers.lock().clear();
@@ -646,6 +723,28 @@ impl Portal {
             self.video_publishers.lock().insert(track_name.clone(), Arc::new(publisher));
         }
 
+        // Frame-video publishers don't go through `LocalParticipant.publish_track`
+        // — they emit one byte stream per frame instead. So no async setup
+        // here, just spawn the per-track drainer task.
+        for spec in &self.config.frame_video_tracks {
+            let track_metrics = self
+                .metrics
+                .track(&spec.name)
+                .expect("track metrics registered at construction");
+            let publisher =
+                FrameVideoPublisher::new(spec.clone(), lp.clone(), track_metrics);
+            log::info!(
+                "[{}] ready to publish frame-video track '{}' via byte stream (codec={:?}, quality={})",
+                self.config.session,
+                spec.name,
+                spec.codec,
+                spec.quality
+            );
+            self.frame_video_publishers
+                .lock()
+                .insert(spec.name.clone(), Arc::new(publisher));
+        }
+
         if !self.config.state_schema.is_empty() {
             let publisher = DataPublisher::new(
                 &self.config.state_schema,
@@ -670,8 +769,12 @@ impl Portal {
     fn setup_operator(&self, room: &Room) {
         let lp = room.local_participant();
 
+        // Sync buffer treats both transports the same way — it tracks frame
+        // arrivals by name, regardless of whether they came from a WebRTC
+        // RTP track or a frame-video byte stream. `all_track_names` was
+        // computed once at construction.
         let sync_buffer = Arc::new(Mutex::new(SyncBuffer::new(
-            &self.config.video_tracks,
+            &self.all_track_names,
             self.config.state_schema.clone(),
             self.config.sync_config(),
             self.metrics.clone(),
@@ -738,6 +841,15 @@ impl Portal {
 /// it on the given LocalParticipant. Payload types are converted at the
 /// boundary — the SDK's `RpcInvocationData` / `RpcError` never leak into
 /// caller-facing code.
+/// Names of every video track on a config, regardless of transport. Used
+/// when registering metrics and sync-buffer slots, since the consumer-facing
+/// API doesn't distinguish WebRTC and frame-video tracks.
+fn combined_track_names(config: &PortalConfig) -> Vec<String> {
+    let mut names: Vec<String> = config.video_tracks.clone();
+    names.extend(config.frame_video_tracks.iter().map(|s| s.name.clone()));
+    names
+}
+
 fn register_handler_on(lp: &LocalParticipant, method: String, handler: RpcHandler) {
     lp.register_rpc_method(method, move |data| {
         let handler = handler.clone();
@@ -765,6 +877,10 @@ struct EventContext {
     unknown_chunk_fp_warns: Arc<Mutex<HashSet<u32>>>,
     video_tracks: HashMap<String, Arc<VideoTrackSlots>>,
     video_receivers: Arc<Mutex<HashMap<String, VideoReceiver>>>,
+    /// Frame-video entries (spec + slots + metrics fused) keyed by track
+    /// name. Shared as `Arc<HashMap>` so per-frame fan-out into spawn
+    /// tasks bumps a refcount instead of cloning the map.
+    frame_video_entries: Arc<HashMap<String, Arc<FrameVideoTrackEntry>>>,
     metrics: Arc<MetricsRegistry>,
     rtt: Arc<RttService>,
     peer_identity: Arc<Mutex<Option<ParticipantIdentity>>>,
@@ -854,33 +970,90 @@ fn handle_room_event(ctx: &EventContext, event: RoomEvent) {
             }
         }
         RoomEvent::ByteStreamOpened { reader, topic, participant_identity } => {
-            // Robot-side: the operator sends action chunks as byte streams
-            // because chunk payloads can exceed the 15 KB data-packet limit.
+            // Two Portal byte-stream topics, each owned by a different role:
+            //   * `portal_action_chunk` — operator → robot. Action chunks
+            //     too big to fit in a 15 KB data packet.
+            //   * `portal_frame_video`  — robot → operator. Per-frame
+            //     RGB/PNG/MJPEG payloads that bypass the WebRTC media path.
             // We `take_if` on the topic so this Portal only consumes streams
-            // it owns; other applications using byte streams on different
+            // it owns; other applications using byte streams on unrelated
             // topics are left untouched.
-            if ctx.config.role != Role::Robot || topic != ACTION_CHUNK_TOPIC {
-                return;
-            }
-            let Some(reader) = reader.take_if(|info| info.topic == ACTION_CHUNK_TOPIC) else {
-                return;
-            };
-            latch_peer(&ctx.peer_identity, &ctx.config.session, participant_identity);
-            let chunk_slots = ctx.chunk_slots.clone();
-            let unknown_fp_warns = ctx.unknown_chunk_fp_warns.clone();
-            let metrics = ctx.metrics.clone();
-            tokio::spawn(async move {
-                use livekit::StreamReader;
-                match reader.read_all().await {
-                    Ok(payload) => dispatch_chunk_payload(
-                        &payload,
-                        &chunk_slots,
-                        &unknown_fp_warns,
-                        &metrics,
-                    ),
-                    Err(e) => log::warn!("failed to read chunk byte stream: {e}"),
+            match (ctx.config.role, topic.as_str()) {
+                (Role::Robot, ACTION_CHUNK_TOPIC) => {
+                    let Some(reader) =
+                        reader.take_if(|info| info.topic == ACTION_CHUNK_TOPIC)
+                    else {
+                        return;
+                    };
+                    latch_peer(
+                        &ctx.peer_identity,
+                        &ctx.config.session,
+                        participant_identity,
+                    );
+                    let chunk_slots = ctx.chunk_slots.clone();
+                    let unknown_fp_warns = ctx.unknown_chunk_fp_warns.clone();
+                    let metrics = ctx.metrics.clone();
+                    tokio::spawn(async move {
+                        use livekit::StreamReader;
+                        match reader.read_all().await {
+                            Ok(payload) => dispatch_chunk_payload(
+                                &payload,
+                                &chunk_slots,
+                                &unknown_fp_warns,
+                                &metrics,
+                            ),
+                            Err(e) => {
+                                log::warn!("failed to read chunk byte stream: {e}")
+                            }
+                        }
+                    });
                 }
-            });
+                (Role::Operator, FRAME_VIDEO_TOPIC) => {
+                    // Operator-side: each byte stream carries one frame for
+                    // some declared frame-video track. The header in the
+                    // payload routes it to the right entry (spec + slots
+                    // + metrics fused; one HashMap lookup at dispatch).
+                    if ctx.frame_video_entries.is_empty() {
+                        return;
+                    }
+                    let Some(reader) =
+                        reader.take_if(|info| info.topic == FRAME_VIDEO_TOPIC)
+                    else {
+                        return;
+                    };
+                    let Some(sync_buffer) = ctx.sync_buffer.clone() else {
+                        return;
+                    };
+                    latch_peer(
+                        &ctx.peer_identity,
+                        &ctx.config.session,
+                        participant_identity,
+                    );
+                    // Refcount bumps only — no map or HashMap clone.
+                    let entries = ctx.frame_video_entries.clone();
+                    let obs_sink = ctx.obs_sink.clone();
+                    tokio::spawn(async move {
+                        use livekit::StreamReader;
+                        match reader.read_all().await {
+                            // `Bytes::from(Vec)` is a move. Subsequent
+                            // `Bytes::slice(...)` in the dispatch path is a
+                            // refcount bump, so the `Raw` codec gets a
+                            // zero-copy view of the wire payload all the
+                            // way to `VideoFrameData.data`.
+                            Ok(payload) => dispatch_frame_payload(
+                                Bytes::from(payload),
+                                &entries,
+                                &sync_buffer,
+                                &obs_sink,
+                            ),
+                            Err(e) => log::warn!(
+                                "failed to read frame_video byte stream: {e}"
+                            ),
+                        }
+                    });
+                }
+                _ => {}
+            }
         }
         RoomEvent::ParticipantDisconnected(participant) => {
             let mut slot = ctx.peer_identity.lock();

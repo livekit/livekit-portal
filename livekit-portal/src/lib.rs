@@ -3,6 +3,7 @@ pub mod config;
 mod data;
 pub mod dtype;
 pub mod error;
+mod frame_video;
 pub mod metrics;
 mod portal;
 pub mod rpc;
@@ -12,8 +13,9 @@ mod sync_buffer;
 pub mod types;
 mod video;
 
-pub use codec::{Codec, CodecError, CodecResult, DecodedFrame};
+pub use codec::Codec;
 pub use config::{ChunkSpec, FieldSpec, FrameVideoSpec, PortalConfig};
+pub use frame_video::BYTE_STREAM_CHUNK_SIZE;
 pub use dtype::DType;
 pub use error::{PortalError, PortalResult};
 pub use metrics::{

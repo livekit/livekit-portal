@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+
+use bytes::Bytes;
 
 use crate::config::FieldSpec;
 use crate::dtype::DType;
@@ -181,12 +182,17 @@ pub struct Observation {
 /// Decoded video frame. `data` is packed RGB24 (R,G,B byte order, `W*H*3`
 /// bytes) regardless of transport — WebRTC frames are color-converted from
 /// I420 on receive, frame-video frames are decoded back to RGB by the
-/// codec. The buffer is shared via `Arc<[u8]>` so cloning is cheap.
+/// codec.
+///
+/// `data` is `bytes::Bytes` rather than `Arc<[u8]>` so that frame-video
+/// receive can carry a zero-copy view into the byte-stream payload (Raw
+/// codec — `Bytes::slice` is a refcount bump, not a memcpy). Cloning a
+/// `Bytes` is the same single-atomic refcount bump `Arc<[u8]>` would do.
 #[derive(Debug, Clone)]
 pub struct VideoFrameData {
     pub width: u32,
     pub height: u32,
-    pub data: Arc<[u8]>,
+    pub data: Bytes,
     pub timestamp_us: u64,
 }
 

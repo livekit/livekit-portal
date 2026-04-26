@@ -37,6 +37,9 @@ pub enum PortalError {
     #[error("deserialization error: {0}")]
     Deserialization(String),
 
+    #[error("frame codec error: {0}")]
+    Codec(String),
+
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
 
