@@ -33,7 +33,11 @@ API_KEY = os.environ.get("LIVEKIT_API_KEY", "devkey")
 API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "secret")
 
 
-collect_ignore = [] if URL else ["test_chunks.py"]
+collect_ignore = (
+    []
+    if URL
+    else ["test_chunks.py", "test_frame_video.py", "test_frame_video_stress.py"]
+)
 
 
 def _make_token(identity: str, room: str) -> str:
