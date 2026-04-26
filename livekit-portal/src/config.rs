@@ -147,6 +147,13 @@ impl PortalConfig {
     ///
     /// Track names must be unique across all `add_video` and
     /// `add_frame_video` calls; a duplicate panics.
+    ///
+    /// **Latency**: byte-stream frames pay roughly `1 ms + 2 ms × ⌈size /
+    /// BYTE_STREAM_CHUNK_SIZE⌉` per frame, set by the SCTP data channel
+    /// drain rate (not Portal's encode cost). Pick a codec whose
+    /// encoded size fits in one chunk for low-latency closed-loop work.
+    /// MJPEG at 224×224 to 480p typically does. Raw at anything above
+    /// ~70×70 spills into multiple chunks.
     pub fn add_frame_video(
         &mut self,
         name: impl Into<String>,

@@ -11,6 +11,8 @@
 | State/action receive | `RoomEvent::DataReceived` | Dispatched synchronously by topic in the room event handler. No async task needed. |
 | Action chunk publish | `LocalParticipant::send_bytes` (byte stream) | One stream per send. Topic `portal_action_chunk`. Reliable by design. Bypasses the 15 KB data-packet cap that small data packets impose. |
 | Action chunk receive | `RoomEvent::ByteStreamOpened` | Dispatcher takes the reader on a matching topic, spawns a task that calls `read_all().await` and routes the payload through the chunk-fingerprint table. |
+| Frame video publish | `LocalParticipant::send_bytes` (byte stream) | One stream per frame. Topic `portal_frame_video`. Per-track `FrameVideoPublisher` owns an mpsc-fed drainer task; encode + framing fold into one `Vec<u8>` allocation per frame. |
+| Frame video receive | `RoomEvent::ByteStreamOpened` | Same shape as chunks. Dispatcher routes the payload through `FrameVideoTrackEntry` (spec + slots + metrics fused, one HashMap lookup per frame). For RAW the codec payload is a `Bytes::slice` of the byte-stream Vec — zero-copy through to `VideoFrameData.data`. |
 | Session | LiveKit Room | `session` param maps to room name. |
 | Role | Participant identity | `role` sets identity. Unique per room — prevents duplicate robots. |
 
@@ -61,6 +63,38 @@ each field's dtype width. Total payload is `20 + horizon * sum(field.size_bytes)
 stream tag. Multiple chunks on one Portal are dispatched by fingerprint —
 the receiver looks up the matching `ChunkSlot` and decodes against its
 schema.
+
+### Frame video wire format (byte stream, topic `portal_frame_video`)
+
+One byte stream per frame. The header carries the codec id, dimensions,
+timestamp, and track name; the rest of the payload is whatever the codec
+emitted.
+
+```
+[u8 version = 1][u8 codec_id][u16 width][u16 height][u64 timestamp_us]
+[u16 track_name_len][u8 × track_name_len name][u8 × N codec payload]
+```
+
+Header is 16 bytes plus the name. `codec_id` is `0=RAW`, `1=PNG`, `2=MJPEG`.
+A single topic multiplexes every declared frame-video track on a Portal —
+dispatch is by track-name lookup into `frame_video_entries`, not by
+fingerprint, because the receiver can fail-fast on undeclared names rather
+than tolerate schema drift the way action chunks do.
+
+Track-name length is capped at 256 bytes on send and receive, so a
+malformed/forged header cannot make the receiver burn CPU on a 64 KB-name
+parse before bailing.
+
+For RAW, the codec payload is byte-for-byte the input RGB. The receiver
+slices the byte-stream `Bytes` at the post-header offset to yield
+`VideoFrameData.data` with zero extra allocation. PNG and MJPEG go
+through `image` crate decoders.
+
+The byte-stream transport has a latency floor of `~1ms + 2ms × ⌈size /
+15KB⌉` set by the SCTP data channel drain rate inside libwebrtc. Each
+chunk is one `tx.send_receive(packet).await` round-trip into the
+engine. See [docs/frame-video.md](docs/frame-video.md) for the
+codec/fps trade-off table.
 
 ## Components
 

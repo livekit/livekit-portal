@@ -134,6 +134,35 @@ portal.on_action_chunk("act", on_chunk)
 Chunks travel as **LiveKit byte streams**, not data packets — so the 15 KB
 data-packet ceiling does not apply. Delivery is reliable and ordered.
 
+### Frame video (lossless or codec-of-your-choice)
+
+WebRTC video is I420 plus a lossy temporal codec. For policies that read
+the pixels — VLA inference, behavior cloning, training-data capture —
+that introduces a silent input-distribution shift. `add_frame_video`
+declares a track that ships each frame independently over a byte stream,
+encoded with `RAW`, `PNG`, or `MJPEG`, and decoded back to RGB on the
+receiver. The user-facing API stays the same as `add_video`.
+
+```python
+# Both peers declare the track.
+cfg.add_frame_video("front", codec=VideoCodec.MJPEG, quality=90)
+
+# Sender uses the same call as a regular video track.
+portal.send_video_frame("front", rgb_array)
+
+# Receiver gets RGB the same way too.
+def on_frame(name, frame):
+    arr = frame_bytes_to_numpy_rgb(bytes(frame.data), frame.width, frame.height)
+portal.on_video_frame("front", on_frame)
+```
+
+Track names are unique across `add_video` and `add_frame_video` — a
+declared track lives on exactly one transport. Latency floor on the
+byte-stream path is set by SCTP drain rate inside libwebrtc:
+`latency ≈ 1ms + 2ms × ⌈encoded_size / 15KB⌉`. Pick a codec whose
+output fits in one chunk for low-latency closed-loop work — see
+[docs/frame-video.md](docs/frame-video.md).
+
 ### Receiving
 
 State and action format: `Dict[str, float]`. Both a push API (callbacks, fire on every receive) and a pull API (latest-wins peek) are provided. Use the callback if you want every sample (with your own history buffer). Use the pull API if you only care about the most recent value per inference tick.

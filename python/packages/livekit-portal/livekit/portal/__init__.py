@@ -662,6 +662,14 @@ class PortalConfig:
         `quality` is in 1..=100 and is honored for `VideoCodec.MJPEG`. It is
         ignored for `RAW` and `PNG`. Track names must be unique across all
         `add_video` and `add_frame_video` calls; a duplicate raises.
+
+        **Latency**: each frame's byte-stream payload is fragmented at the
+        LiveKit chunk size (15 KB) and shipped over a single SCTP data
+        channel. Per-frame latency is roughly `1 ms + 2 ms × ⌈encoded_size
+        / 15 KB⌉` on localhost, set by the data-channel drain rate (not
+        Portal's encode cost). Pick a codec whose encoded output fits in
+        one chunk for low-latency closed-loop work — at typical inference
+        resolutions (224×224 to 480p) MJPEG q=80–95 usually does.
         """
         self._inner.add_frame_video(name, codec, quality)
         self._frame_video_tracks.append(
