@@ -4,10 +4,10 @@ Send side (`normalize_rgb`): the Rust FFI takes packed RGB24 (W*H*3 bytes).
 We accept either raw `bytes` / `bytearray` / memoryview, or a numpy array of
 shape `(H, W, 3)` dtype uint8 and infer W/H from the array.
 
-Receive side: `VideoFrameData.data` carries planar I420 bytes (Y plane, then
-U plane at quarter size, then V plane). `i420_bytes_to_numpy_rgb` provides a
-best-effort conversion for display. not performance-critical; users in the
-hot path should parse the planes directly.
+Receive side: `VideoFrameData.data` carries packed RGB24 (R,G,B byte order)
+regardless of transport. WebRTC frames are color-converted from I420 by the
+Rust core before delivery, frame-video frames are codec-decoded back to RGB.
+`frame_bytes_to_numpy_rgb` turns the bytes into a typed `(H, W, 3)` view.
 """
 from __future__ import annotations
 
@@ -54,41 +54,16 @@ def normalize_rgb(
     )
 
 
-def i420_bytes_to_numpy_rgb(data: bytes, width: int, height: int) -> np.ndarray:
-    """Decode I420 planar bytes → (H, W, 3) uint8 RGB.
+def frame_bytes_to_numpy_rgb(data: bytes, width: int, height: int) -> np.ndarray:
+    """Wrap a `VideoFrameData.data` byte string as a `(H, W, 3)` uint8 RGB array.
 
-    Best-effort, pure-numpy conversion suitable for preview/display. If you
-    need speed or colorimetric accuracy, decode the planes yourself or feed
-    them to a tuned converter (opencv, av, libyuv).
+    Zero-copy: the returned array views the input bytes directly. If you plan
+    to mutate the array, copy it first (`arr.copy()`).
     """
-    w, h = width, height
-    if w % 2 or h % 2:
-        raise ValueError(f"I420 requires even dimensions; got {w}x{h}")
-
-    y_size = w * h
-    uv_size = (w // 2) * (h // 2)
-    expected = y_size + 2 * uv_size
+    expected = width * height * 3
     if len(data) != expected:
         raise ValueError(
-            f"I420 size mismatch: expected {expected} bytes (Y={y_size}, U=V={uv_size}), "
-            f"got {len(data)}"
+            f"RGB frame size mismatch: expected {expected} bytes "
+            f"(W*H*3 = {width}*{height}*3), got {len(data)}"
         )
-
-    buf = np.frombuffer(data, dtype=np.uint8)
-    y = buf[:y_size].reshape(h, w).astype(np.float32)
-    u = buf[y_size : y_size + uv_size].reshape(h // 2, w // 2).astype(np.float32)
-    v = buf[y_size + uv_size :].reshape(h // 2, w // 2).astype(np.float32)
-
-    # Upsample chroma via nearest-neighbor repeat (cheapest correct option).
-    u_full = u.repeat(2, axis=0).repeat(2, axis=1)
-    v_full = v.repeat(2, axis=0).repeat(2, axis=1)
-
-    # BT.601 full-range → RGB
-    c = y - 16.0
-    d = u_full - 128.0
-    e = v_full - 128.0
-    r = 1.164 * c + 1.596 * e
-    g = 1.164 * c - 0.392 * d - 0.813 * e
-    b = 1.164 * c + 2.017 * d
-    rgb = np.stack([r, g, b], axis=-1)
-    return np.clip(rgb, 0, 255).astype(np.uint8)
+    return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)

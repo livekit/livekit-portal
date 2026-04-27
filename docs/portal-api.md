@@ -200,6 +200,34 @@ type.
 uint8. Width and height must both be even. Full details in
 [concepts.md](concepts.md#video-frame-format).
 
+## Frame video (lossless or codec-of-your-choice)
+
+`add_video` uses the WebRTC media path (H.264, lossy). For policies that
+read the pixels — VLA inference, behavior cloning, any case where
+colorspace shift breaks the policy distribution — declare a frame-video
+track instead:
+
+```python
+from livekit.portal import VideoCodec
+
+cfg.add_frame_video("front", codec=VideoCodec.MJPEG, quality=90)
+cfg.add_frame_video("wrist", codec=VideoCodec.PNG)
+cfg.add_frame_video("debug", codec=VideoCodec.RAW)
+```
+
+The user-facing API is identical — `send_video_frame`, `on_video_frame`,
+`get_video_frame`, observations all work the same way. The frames travel
+over a reliable byte stream (not WebRTC media), encoded with the chosen
+codec, and arrive as RGB on the other end.
+
+Latency scales with encoded payload size: the byte-stream path costs
+roughly `1 ms + 2 ms × ⌈encoded_size / 15 KB⌉` per frame on localhost.
+Pick a codec whose output fits in one chunk for low-latency inference.
+At typical inference resolutions (224×224 to 480p) MJPEG q=80–95 fits.
+
+See [frame-video.md](frame-video.md) for the codec/fps tables, wire
+format, and metrics surface.
+
 ## What else is on `Portal`
 
 - `portal.on_observation(cb)`: synced observations (operator only).
@@ -220,6 +248,8 @@ uint8. Width and height must both be even. Full details in
 ## Reference
 
 - [Concepts](concepts.md). Roles, observation model, frame format.
+- [Frame video](frame-video.md). Codec choice, latency math, wire format
+  for byte-stream-based per-frame video.
 - [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates.
 - [Synchronization deep dive](synchronization.md). The match algorithm.
 - [RPC](rpc.md). Imperative commands on top of LiveKit RPC.

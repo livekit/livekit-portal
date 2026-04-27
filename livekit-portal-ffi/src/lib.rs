@@ -52,6 +52,43 @@ impl From<core::Role> for Role {
     }
 }
 
+/// Frame-video codec. Selected per-track at config time (see
+/// `PortalConfig::add_frame_video`). Mirrors `livekit_portal::Codec`.
+///
+/// **Foreign binding casing**: UniFFI emits enum variants in the host
+/// language's idiomatic case. Python code uses `VideoCodec.RAW` /
+/// `VideoCodec.PNG` / `VideoCodec.MJPEG` (UPPER), not the Rust spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VideoCodec {
+    /// Uncompressed RGB24. Largest payload, zero encode cost.
+    Raw,
+    /// PNG, lossless. ~2-3x compression on natural images.
+    Png,
+    /// Motion JPEG, lossy. ~10-20x compression at quality 90. Each frame is
+    /// an independent JPEG so frame loss is contained.
+    Mjpeg,
+}
+
+impl From<VideoCodec> for core::Codec {
+    fn from(c: VideoCodec) -> Self {
+        match c {
+            VideoCodec::Raw => core::Codec::Raw,
+            VideoCodec::Png => core::Codec::Png,
+            VideoCodec::Mjpeg => core::Codec::Mjpeg,
+        }
+    }
+}
+
+impl From<core::Codec> for VideoCodec {
+    fn from(c: core::Codec) -> Self {
+        match c {
+            core::Codec::Raw => VideoCodec::Raw,
+            core::Codec::Png => VideoCodec::Png,
+            core::Codec::Mjpeg => VideoCodec::Mjpeg,
+        }
+    }
+}
+
 /// Per-field dtype declared in state/action schemas. Mirrors
 /// `livekit_portal::DType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -107,6 +144,17 @@ pub struct FieldSpec {
     pub dtype: DType,
 }
 
+/// One declared frame-video track: name, codec, and per-codec quality.
+/// Crosses the FFI boundary so bindings can pass these to
+/// `PortalConfig.add_frame_video`. `quality` is meaningful for
+/// `VideoCodec.Mjpeg` (1..=100) and ignored for `Raw` / `Png`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FrameVideoSpec {
+    pub name: String,
+    pub codec: VideoCodec,
+    pub quality: u8,
+}
+
 /// A declared action chunk: name, fixed horizon, ordered field list. The
 /// chunk's payload travels as a LiveKit byte stream (not a data packet) so
 /// it isn't bounded by the 15 KB packet limit.
@@ -117,8 +165,10 @@ pub struct ChunkSpec {
     pub fields: Vec<FieldSpec>,
 }
 
-/// Decoded video frame. Receive-side `data` is I420 planar bytes; send-side
-/// callers pass packed RGB24 directly to `send_video_frame`.
+/// Decoded video frame. `data` is packed RGB24 (R,G,B byte order, `W*H*3`
+/// bytes) on both sides — `send_video_frame` accepts RGB, and receive-side
+/// frames are color-converted from I420 (WebRTC) or codec-decoded (frame
+/// video) back to RGB before delivery.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct VideoFrame {
     pub width: u32,
@@ -176,6 +226,17 @@ pub struct SyncMetrics {
 pub struct TransportMetrics {
     pub frames_sent: HashMap<String, u64>,
     pub frames_received: HashMap<String, u64>,
+    /// Per-track count of frames the publisher dropped because its in-flight
+    /// queue was at the cap. Frame-video tracks only — WebRTC frames flow
+    /// through libwebrtc's own backpressure pipeline. Non-zero at steady
+    /// state means the publisher is offering frames faster than the link
+    /// can ship them.
+    pub frames_dropped_publisher_full: HashMap<String, u64>,
+    /// Per-track cumulative on-wire bytes sent (header + codec payload).
+    /// Frame-video only. Average frame size = `bytes_sent / frames_sent`.
+    pub bytes_sent: HashMap<String, u64>,
+    /// Per-track cumulative on-wire bytes received. Frame-video only.
+    pub bytes_received: HashMap<String, u64>,
     pub states_sent: u64,
     pub states_received: u64,
     pub actions_sent: u64,
@@ -257,6 +318,9 @@ pub enum PortalError {
     #[error("deserialization error: {0}")]
     Deserialization(String),
 
+    #[error("frame codec error: {0}")]
+    Codec(String),
+
     #[error("operation not available for role {0:?}")]
     WrongRole(Role),
 
@@ -284,6 +348,7 @@ impl From<core::PortalError> for PortalError {
                 PortalError::InvalidFrameDimensions { width, height }
             }
             core::PortalError::Deserialization(s) => PortalError::Deserialization(s),
+            core::PortalError::Codec(s) => PortalError::Codec(s),
             core::PortalError::WrongRole(r) => PortalError::WrongRole(r.into()),
             core::PortalError::DtypeMismatch { field, expected, got } => {
                 PortalError::DtypeMismatch {
@@ -393,6 +458,15 @@ impl PortalConfig {
         self.inner.lock().add_video(name);
     }
 
+    /// Declare a frame-video track. Frames go over a reliable byte-stream
+    /// channel (not the WebRTC media path), encoded with `codec`. The
+    /// receiver decodes back to RGB so the user-facing frame API is
+    /// identical to plain video. `quality` is `1..=100` for `Mjpeg` and
+    /// ignored for `Raw` / `Png`.
+    pub fn add_frame_video(&self, name: String, codec: VideoCodec, quality: u8) {
+        self.inner.lock().add_frame_video(name, codec.into(), quality);
+    }
+
     pub fn add_state_typed(&self, schema: Vec<FieldSpec>) {
         self.inner
             .lock()
@@ -458,6 +532,7 @@ pub struct Portal {
     state_fields: Vec<String>,
     action_fields: Vec<String>,
     video_tracks: Vec<String>,
+    frame_video_tracks: Vec<FrameVideoSpec>,
     action_chunks: Vec<ChunkSpec>,
 }
 
@@ -472,6 +547,15 @@ impl Portal {
         let state_fields: Vec<String> = cfg.state_fields().map(String::from).collect();
         let action_fields: Vec<String> = cfg.action_fields().map(String::from).collect();
         let video_tracks = cfg.video_tracks().to_vec();
+        let frame_video_tracks: Vec<FrameVideoSpec> = cfg
+            .frame_video_tracks()
+            .iter()
+            .map(|s| FrameVideoSpec {
+                name: s.name.clone(),
+                codec: s.codec.into(),
+                quality: s.quality,
+            })
+            .collect();
         let action_chunks: Vec<ChunkSpec> = cfg
             .action_chunks()
             .iter()
@@ -513,7 +597,12 @@ impl Portal {
                 .collect();
             cb.on_drop(raw);
         });
-        for track in &video_tracks {
+        // Register `on_video_frame` for every declared track regardless of
+        // transport. Frame-video tracks share the same `VideoTrackSlots` map
+        // with WebRTC tracks on the core side, so a single registration
+        // surface works for both — the foreign side only sees one
+        // `on_video_frame(track, frame)` event stream per Portal.
+        for track in video_tracks.iter().chain(frame_video_tracks.iter().map(|s| &s.name)) {
             let cb = callbacks.clone();
             let track_name = track.clone();
             inner.on_video_frame(track, move |_name, frame| {
@@ -534,6 +623,7 @@ impl Portal {
             state_fields,
             action_fields,
             video_tracks,
+            frame_video_tracks,
             action_chunks,
         })
     }
@@ -642,6 +732,13 @@ impl Portal {
 
     pub fn video_tracks(&self) -> Vec<String> {
         self.video_tracks.clone()
+    }
+
+    /// Declared frame-video tracks (name + codec + quality), in declaration
+    /// order. Frame-video tracks ride a byte-stream channel rather than the
+    /// WebRTC media path; the user-facing send/receive API is the same.
+    pub fn frame_video_tracks(&self) -> Vec<FrameVideoSpec> {
+        self.frame_video_tracks.clone()
     }
 
     pub fn action_chunks(&self) -> Vec<ChunkSpec> {
@@ -779,6 +876,9 @@ fn metrics_from_core(m: core::PortalMetrics) -> PortalMetrics {
         transport: TransportMetrics {
             frames_sent: m.transport.frames_sent,
             frames_received: m.transport.frames_received,
+            frames_dropped_publisher_full: m.transport.frames_dropped_publisher_full,
+            bytes_sent: m.transport.bytes_sent,
+            bytes_received: m.transport.bytes_received,
             states_sent: m.transport.states_sent,
             states_received: m.transport.states_received,
             actions_sent: m.transport.actions_sent,

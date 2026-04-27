@@ -38,6 +38,21 @@ pub struct SyncMetrics {
 pub struct TransportMetrics {
     pub frames_sent: HashMap<String, u64>,
     pub frames_received: HashMap<String, u64>,
+    /// Per-track count of frames the publisher dropped because its in-flight
+    /// queue was at the cap (slow link, SFU backpressure). Currently only
+    /// frame-video tracks can drop here — WebRTC frames flow through libwebrtc's
+    /// own backpressure pipeline. A non-zero value at steady state means the
+    /// publisher is offering frames faster than the link can ship them.
+    pub frames_dropped_publisher_full: HashMap<String, u64>,
+    /// Per-track cumulative bytes encoded and queued for send (full
+    /// on-wire payload including the framing header). Frame-video tracks
+    /// only — WebRTC frames are encoded by libwebrtc inside its own
+    /// transport, so we cannot observe their byte count from here.
+    /// Average frame size on the wire is `bytes_sent / frames_sent`.
+    pub bytes_sent: HashMap<String, u64>,
+    /// Per-track cumulative bytes received as on-wire payload (header +
+    /// codec). Symmetric to `bytes_sent`. Frame-video only.
+    pub bytes_received: HashMap<String, u64>,
     pub states_sent: u64,
     pub states_received: u64,
     pub actions_sent: u64,
@@ -239,12 +254,21 @@ impl MetricsRegistry {
         let mut frames_received = HashMap::with_capacity(n);
         let mut frame_jitter_us = HashMap::with_capacity(n);
         let mut evictions = HashMap::with_capacity(n);
+        let mut frames_dropped_publisher_full = HashMap::with_capacity(n);
+        let mut bytes_sent = HashMap::with_capacity(n);
+        let mut bytes_received = HashMap::with_capacity(n);
         for name in &self.track_order {
             if let Some(t) = self.per_track.get(name) {
                 frames_sent.insert(name.clone(), t.frames_sent.load(Ordering::Relaxed));
                 frames_received.insert(name.clone(), t.frames_received.load(Ordering::Relaxed));
                 frame_jitter_us.insert(name.clone(), t.jitter.lock().jitter_us);
                 evictions.insert(name.clone(), t.evictions.load(Ordering::Relaxed));
+                frames_dropped_publisher_full.insert(
+                    name.clone(),
+                    t.frames_dropped_publisher_full.load(Ordering::Relaxed),
+                );
+                bytes_sent.insert(name.clone(), t.bytes_sent.load(Ordering::Relaxed));
+                bytes_received.insert(name.clone(), t.bytes_received.load(Ordering::Relaxed));
             }
         }
 
@@ -283,6 +307,9 @@ impl MetricsRegistry {
             transport: TransportMetrics {
                 frames_sent,
                 frames_received,
+                frames_dropped_publisher_full,
+                bytes_sent,
+                bytes_received,
                 states_sent: self.states_sent.load(Ordering::Relaxed),
                 states_received: self.states_received.load(Ordering::Relaxed),
                 actions_sent: self.actions_sent.load(Ordering::Relaxed),
@@ -341,6 +368,9 @@ pub(crate) struct TrackMetrics {
     pub frames_sent: AtomicU64,
     pub frames_received: AtomicU64,
     pub evictions: AtomicU64,
+    pub frames_dropped_publisher_full: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
     pub jitter: Mutex<JitterState>,
 }
 
@@ -350,6 +380,9 @@ impl TrackMetrics {
             frames_sent: AtomicU64::new(0),
             frames_received: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            frames_dropped_publisher_full: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
             jitter: Mutex::new(JitterState::default()),
         }
     }
@@ -358,8 +391,24 @@ impl TrackMetrics {
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Frame-video only: record the wire-payload byte count alongside
+    /// the send count, so the avg frame size is derivable. WebRTC tracks
+    /// don't surface this — libwebrtc owns their encode + transport.
+    pub fn record_sent_bytes(&self, n: usize) {
+        self.frames_sent.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     pub fn record_received(&self, send_ts_us: u64, recv_ts_us: u64) {
         self.frames_received.fetch_add(1, Ordering::Relaxed);
+        self.jitter.lock().sample(send_ts_us, recv_ts_us);
+    }
+
+    /// Frame-video only: like `record_received` but also bumps the wire
+    /// byte counter.
+    pub fn record_received_bytes(&self, send_ts_us: u64, recv_ts_us: u64, n: usize) {
+        self.frames_received.fetch_add(1, Ordering::Relaxed);
+        self.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
         self.jitter.lock().sample(send_ts_us, recv_ts_us);
     }
 
@@ -367,10 +416,17 @@ impl TrackMetrics {
         self.evictions.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn record_dropped_publisher_full(&self) {
+        self.frames_dropped_publisher_full.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn reset(&self) {
         self.frames_sent.store(0, Ordering::Relaxed);
         self.frames_received.store(0, Ordering::Relaxed);
         self.evictions.store(0, Ordering::Relaxed);
+        self.frames_dropped_publisher_full.store(0, Ordering::Relaxed);
+        self.bytes_sent.store(0, Ordering::Relaxed);
+        self.bytes_received.store(0, Ordering::Relaxed);
         *self.jitter.lock() = JitterState::default();
     }
 }

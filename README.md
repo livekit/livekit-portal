@@ -39,6 +39,8 @@
 
 **Built for VLA inference.** First-class **action chunks** ship a `(horizon, n_fields)` tensor in one packet via byte streams (no 15 KB cap). Tag every action with `in_reply_to_ts_us` and `metrics.policy.e2e_us_p50/p95` derives true observation→action latency — not just ping. See [`examples/python/inference/`](examples/python/inference) for a runnable VLA-style loop.
 
+**Frame video for policies.** WebRTC video is lossy and resamples colorspace. For inference where pixels matter, [`add_frame_video`](docs/frame-video.md) ships each frame independently over a byte stream with `RAW`, `PNG`, or `MJPEG` codecs. Same `send_video_frame` / `on_video_frame` API, RGB on both ends. MJPEG q=90 sustains 30 fps at 720p.
+
 **Works with any stack.** A direct `Portal` API in Python and Rust. An optional [lerobot](https://github.com/huggingface/lerobot) plugin for a one-line wrap around your existing `Robot` or `Teleoperator`.
 
 **Low-latency transport.** WebRTC video (SIMD RGB→I420). SCTP data channels with reliable or unreliable delivery per stream. Byte streams for arbitrary-size payloads. RPC for one-shots like `home` or `calibrate`. Rust core, Python bindings via UniFFI.

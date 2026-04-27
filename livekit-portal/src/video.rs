@@ -1,8 +1,8 @@
-use std::mem::MaybeUninit;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use livekit::options::{PacketTrailerFeatures, TrackPublishOptions, VideoCodec, VideoEncoding};
 use livekit::prelude::*;
@@ -171,7 +171,7 @@ impl VideoReceiver {
                         );
                     }
                 }
-                // VideoFrameData clone is cheap — pixel buffer is Arc<[u8]>.
+                // VideoFrameData clone is cheap — pixel buffer is `Bytes`.
                 *slots.latest.lock() = Some((*frame_arc).clone());
                 let output = sync_buffer.lock().push_frame(&name, frame_arc);
                 if !output.is_empty() {
@@ -189,34 +189,49 @@ impl VideoReceiver {
 
 // --- Helpers ---
 
+/// Convert a libwebrtc-decoded video frame into the RGB24 payload the user
+/// API hands back. WebRTC's H264 decoder emits I420; the user-facing
+/// `VideoFrameData.data` is packed RGB24 (R,G,B byte order, `W*H*3` bytes)
+/// so it round-trips cleanly with the RGB the publisher accepted on the
+/// other end. Frame-video tracks use the same RGB layout.
 fn convert_frame<T: AsRef<dyn VideoBuffer>>(
     frame: &VideoFrame<T>,
     timestamp_us: u64,
 ) -> VideoFrameData {
     let i420 = frame.buffer.as_ref().to_i420();
+    let (sy, su, sv) = i420.strides();
     let (y, u, v) = i420.data();
-    let total = y.len() + u.len() + v.len();
+    let width = i420.width();
+    let height = i420.height();
+    let total = (width as usize) * (height as usize) * 3;
+    let dst_stride = (width as i32) * 3;
 
-    // Build the Arc payload in a single allocation/copy. The naive
-    // `Vec::extend_from_slice * 3` followed by `Arc::from(vec)` allocates
-    // twice and copies twice — at 640x480 that's ~460KB doubled per frame.
-    let mut data: Arc<[MaybeUninit<u8>]> = Arc::new_uninit_slice(total);
-    {
-        // SAFETY: freshly allocated Arc, no other references exist.
-        let dst = Arc::get_mut(&mut data).expect("freshly allocated Arc has unique ownership");
-        // SAFETY: dst is exactly `total` bytes, sources are independent of
-        // dst, and MaybeUninit<u8> shares u8's layout.
-        unsafe {
-            let p = dst.as_mut_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(y.as_ptr(), p, y.len());
-            std::ptr::copy_nonoverlapping(u.as_ptr(), p.add(y.len()), u.len());
-            std::ptr::copy_nonoverlapping(v.as_ptr(), p.add(y.len() + u.len()), v.len());
-        }
+    // Single-allocation buffer with no zero-init — libyuv writes RGB24
+    // directly into the reserved capacity, then we move ownership into
+    // `Bytes`. `set_len(total)` after libyuv is the only way to avoid a
+    // `vec![0; total]` zero-pass that would cost ~6 MB of writes per
+    // 1080p frame for nothing.
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
+    // SAFETY: src planes are sized by libwebrtc per `width`/`height`;
+    // libyuv writes exactly `width*height*3` bytes within `dst_stride`
+    // bounds; we then `set_len(total)` to publish those bytes as
+    // initialized. The capacity was reserved above.
+    unsafe {
+        yuv_sys::rs_I420ToRAW(
+            y.as_ptr(),
+            sy as i32,
+            u.as_ptr(),
+            su as i32,
+            v.as_ptr(),
+            sv as i32,
+            buf.as_mut_ptr(),
+            dst_stride,
+            width as i32,
+            height as i32,
+        );
+        buf.set_len(total);
     }
-    // SAFETY: every byte was initialized by the three copies above.
-    let data: Arc<[u8]> = unsafe { data.assume_init() };
-
-    VideoFrameData { width: i420.width(), height: i420.height(), data, timestamp_us }
+    VideoFrameData { width, height, data: Bytes::from(buf), timestamp_us }
 }
 
 // RGB24 (R,G,B byte order) -> I420 via libyuv. libyuv's `RAW` format is R,G,B;
