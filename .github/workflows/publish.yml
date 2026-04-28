@@ -149,17 +149,32 @@ jobs:
       id-token: write  # required for OIDC trusted publisher
 
     steps:
-      - name: Download all distribution artifacts
+      - name: Download livekit-portal artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
-          path: dist
+          pattern: dist-native-*
+          path: dist/livekit-portal
           merge-multiple: true
 
-      - name: Show collected distributions
-        run: ls -lh dist/
+      - name: Download lerobot artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-pure
+          path: dist/lerobot
 
-      - name: Publish to PyPI
+      - name: Show collected distributions
+        run: ls -lhR dist/
+
+      # Published separately so a missing pending publisher on one package
+      # does not block the others. skip-existing makes re-runs safe.
+      - name: Publish livekit-portal
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist/
+          packages-dir: dist/livekit-portal/
+          skip-existing: true
+
+      - name: Publish lerobot packages
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/lerobot/
+          skip-existing: true
