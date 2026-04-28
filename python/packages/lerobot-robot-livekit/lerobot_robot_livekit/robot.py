@@ -17,7 +17,7 @@ from typing import Any
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 
-from livekit.portal import DType, Portal, PortalConfig, Role, i420_bytes_to_numpy_rgb
+from livekit.portal import DType, Portal, PortalConfig, Role, frame_bytes_to_numpy_rgb
 
 
 @RobotConfig.register_subclass("livekit")
@@ -189,7 +189,7 @@ class LiveKitRobot(Robot):
         for cam in self._camera_names:
             frame = obs.frames.get(cam)
             if frame is not None:
-                out[cam] = i420_bytes_to_numpy_rgb(
+                out[cam] = frame_bytes_to_numpy_rgb(
                     frame.data, frame.width, frame.height
                 )
         return out
