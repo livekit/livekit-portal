@@ -56,5 +56,5 @@ exclude = ["tests", "examples", ".venv", ".pytest_cache"]
 
 [tool.hatch.version]
 source = "vcs"
-# Strip the leading "v" from the tag (v0.3.0 → 0.3.0).
 tag-pattern = "^v(?P<version>.+)$"
+raw-options = { search_parent_directories = true }
