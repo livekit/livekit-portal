@@ -50,7 +50,6 @@ jobs:
         os:
           - ubuntu-22.04        # Linux x86_64  (glibc 2.35)
           - ubuntu-24.04-arm    # Linux aarch64 (glibc 2.39)
-          - macos-13            # macOS x86_64  (Intel)
           - macos-latest        # macOS arm64   (Apple Silicon)
 
     steps:
