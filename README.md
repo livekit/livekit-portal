@@ -8,9 +8,9 @@
 
 <p align="center">
   <a href="https://github.com/livekit/livekit-portal/actions/workflows/tests.yml"><img src="https://github.com/livekit/livekit-portal/actions/workflows/tests.yml/badge.svg?branch=main" alt="tests"></a>
+  <a href="https://pypi.org/project/livekit-portal/"><img src="https://img.shields.io/pypi/v/livekit-portal" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust"></a>
 </p>
 
 <p align="center">
@@ -51,56 +51,41 @@
 
 ### Install
 
-Portal is not on PyPI yet, and there are no prebuilt native binaries.
-Today you build from source. The flow is one clone, one build, one sync.
+```bash
+pip install livekit-portal
+```
 
-**Prerequisites:**
+Or with uv:
 
-- A [Rust toolchain](https://rustup.rs/) (stable `cargo`)
-- Python 3.10+
-- [`uv`](https://docs.astral.sh/uv/)
+```bash
+uv add livekit-portal
+```
+
+Prebuilt wheels are available for Linux (x86\_64, aarch64), macOS (Intel and Apple Silicon), and Windows (x86\_64). Python 3.10+ is required.
+
+**lerobot plugin.** If your stack uses [lerobot](https://github.com/huggingface/lerobot), install the matching plugin instead:
+
+```bash
+pip install lerobot-robot-livekit          # robot side
+pip install lerobot-teleoperator-livekit   # operator side
+```
+
+<details>
+<summary>Build from source</summary>
+
+You need a [Rust toolchain](https://rustup.rs/) (stable `cargo`) and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/livekit/livekit-portal.git
 cd livekit-portal
 
-bash scripts/build_ffi_python.sh release   # compile cdylib + generate UniFFI bindings
-cd python/packages/livekit-portal && uv sync   # install Python deps into .venv
+bash scripts/build_ffi_python.sh release
+cd python && uv sync
 ```
 
-`build_ffi_python.sh` calls `cargo build -p livekit-portal-ffi`, drops the
-resulting `liblivekit_portal_ffi.{dylib,so,dll}` next to the Python
-sources, and runs `uniffi-bindgen` to emit the matching Python module. On
-a cold machine this takes a couple of minutes.
+`build_ffi_python.sh` compiles the `livekit-portal-ffi` cdylib and generates the UniFFI Python bindings. On a cold machine this takes a few minutes. Rerun it whenever the Rust code changes.
 
-`from livekit.portal import Portal` now works inside that `.venv`.
-
-**Use from another project.** After the native build, depend on the
-package by path. The [shipped examples](examples/python/basic/pyproject.toml)
-do this with relative paths because they sit inside the repo. From any
-other project, use an absolute path:
-
-```bash
-# uv
-uv add --editable /absolute/path/to/livekit-portal/python/packages/livekit-portal
-
-# pip
-pip install -e /absolute/path/to/livekit-portal/python/packages/livekit-portal
-```
-
-Or wire it directly into your `pyproject.toml`:
-
-```toml
-[project]
-dependencies = ["livekit-portal"]
-
-[tool.uv.sources]
-livekit-portal = { path = "/absolute/path/to/livekit-portal/python/packages/livekit-portal", editable = true }
-```
-
-Rerun `build_ffi_python.sh` whenever the Rust code changes. The editable
-install picks up the refreshed cdylib on the next import. Prebuilt
-wheels are on the roadmap.
+</details>
 
 ### Code
 
