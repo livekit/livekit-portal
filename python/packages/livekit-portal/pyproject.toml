@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.20"]
+requires = ["hatchling>=1.20", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "livekit-portal"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python bindings for livekit-portal. robot ↔ operator sync over LiveKit"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -53,3 +53,8 @@ artifacts = [
 
 [tool.hatch.build]
 exclude = ["tests", "examples", ".venv", ".pytest_cache"]
+
+[tool.hatch.version]
+source = "vcs"
+# Strip the leading "v" from the tag (v0.3.0 → 0.3.0).
+tag-pattern = "^v(?P<version>.+)$"
