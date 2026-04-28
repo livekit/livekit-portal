@@ -42,6 +42,8 @@ testpaths = ["tests"]
 # coexist with livekit-api (`livekit.api`), livekit-protocol (`livekit.protocol`),
 # etc. Listing `livekit` as the package keeps hatchling's editable .pth pointed
 # at the package root so `from livekit.portal import ...` resolves.
+[tool.hatch.build.hooks.custom]
+
 [tool.hatch.build.targets.wheel]
 packages = ["livekit"]
 artifacts = [
