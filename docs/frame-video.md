@@ -5,20 +5,23 @@ codec. Use this when the frames feeding your policy must arrive as the
 same RGB bytes the camera produced — no I420 conversion, no temporal
 codec, no quality drift.
 
+Selected by passing a non-`H264` codec to `add_video`. The default
+codec is `VideoCodec.H264` (WebRTC); the byte-stream codecs are `RAW`,
+`PNG`, and `MJPEG`.
+
 ## When to use it
 
 | Goal | Pick |
 |------|------|
-| Live preview, teleop, video monitoring | `add_video` (WebRTC media path, lossy, low CPU) |
-| Closed-loop policy inference | `add_frame_video(codec=MJPEG)` |
-| Bit-exact frames for benchmarks or training data | `add_frame_video(codec=PNG)` |
-| Sub-15 KB frames you want byte-for-byte | `add_frame_video(codec=RAW)` |
+| Live preview, teleop, video monitoring | `add_video(name)` (default H264, WebRTC media path) |
+| Closed-loop policy inference | `add_video(name, codec=VideoCodec.MJPEG)` |
+| Bit-exact frames for benchmarks or training data | `add_video(name, codec=VideoCodec.PNG)` |
+| Sub-15 KB frames you want byte-for-byte | `add_video(name, codec=VideoCodec.RAW)` |
 
-`add_video` and `add_frame_video` use the **same** user-facing API:
-`send_video_frame(name, rgb)`, `on_video_frame(name, frame)`,
-`get_video_frame(name)`. `frame.data` is packed RGB24 in both directions
-regardless of transport. Track names must be unique across both
-declarations.
+Every codec uses the **same** user-facing API: `send_video_frame(name,
+rgb)`, `on_video_frame(name, frame)`, `get_video_frame(name)`.
+`frame.data` is packed RGB24 in both directions regardless of transport.
+Track names must be unique across all `add_video` calls.
 
 ## Quickstart
 
@@ -30,13 +33,13 @@ from livekit.portal import (
 
 cfg = PortalConfig("session", Role.ROBOT)
 
-# Lossy WebRTC video — adaptive bitrate, low CPU.
+# Lossy WebRTC video — adaptive bitrate, low CPU. Default codec is H264.
 cfg.add_video("preview")
 
-# Frame video — byte-stream transport, per-frame codec.
-cfg.add_frame_video("front", codec=VideoCodec.MJPEG, quality=90)
-cfg.add_frame_video("wrist", codec=VideoCodec.PNG)
-cfg.add_frame_video("debug", codec=VideoCodec.RAW)
+# Byte-stream video — reliable per-frame transport, per-frame codec.
+cfg.add_video("front", codec=VideoCodec.MJPEG, quality=90)
+cfg.add_video("wrist", codec=VideoCodec.PNG)
+cfg.add_video("debug", codec=VideoCodec.RAW)
 
 cfg.add_state_typed([("j1", DType.F32)])
 
@@ -117,10 +120,11 @@ drop fps, or drop a track.
 
 ## What about the regular WebRTC video path?
 
-`add_video` uses the WebRTC media channel: H.264 over RTP, adaptive
-bitrate, hardware-accelerated where available. It is the right call
-for live preview and teleop, where the operator is watching the video
-and bandwidth adapts to the link.
+`add_video(name)` defaults to `VideoCodec.H264` and uses the WebRTC
+media channel: H.264 over RTP, adaptive bitrate, hardware-accelerated
+where available. It is the right call for live preview and teleop,
+where the operator is watching the video and bandwidth adapts to the
+link.
 
 It is the wrong call when:
 
@@ -130,26 +134,28 @@ It is the wrong call when:
 - Frame rate must be deterministic. WebRTC's encoder will drop frames
   silently to fit a bitrate target.
 
-Frame video gives up adaptive bitrate in exchange for deterministic
-per-frame delivery and bit-exact RGB.
+Picking a non-H264 codec on the same `add_video` call routes the track
+through the byte-stream transport, trading adaptive bitrate for
+deterministic per-frame delivery and bit-exact RGB.
 
 ## Configuration
 
 ```python
-PortalConfig.add_frame_video(
+PortalConfig.add_video(
     name: str,
-    codec: VideoCodec = VideoCodec.MJPEG,
+    codec: VideoCodec = VideoCodec.H264,
     quality: int = 90,
 )
 ```
 
-- `codec` is one of `VideoCodec.RAW`, `VideoCodec.PNG`, `VideoCodec.MJPEG`.
-- `quality` is `1..=100` for MJPEG, ignored for RAW and PNG. Quality
-  90 is visually near-lossless on natural images and produces 10-20×
-  compression. Quality 70 trades visible artifacts for ~2× more
+- `codec` is one of `VideoCodec.H264` (WebRTC), `VideoCodec.RAW`,
+  `VideoCodec.PNG`, `VideoCodec.MJPEG` (byte-stream).
+- `quality` is `1..=100` for MJPEG, ignored for every other codec.
+  Quality 90 is visually near-lossless on natural images and produces
+  10-20× compression. Quality 70 trades visible artifacts for ~2× more
   compression. Quality below 50 is unusable for inference.
-- Track names are unique across `add_video` and `add_frame_video`. A
-  duplicate raises.
+- Track names must be unique across all `add_video` calls regardless
+  of codec. A duplicate raises.
 
 ## Metrics
 
@@ -191,7 +197,7 @@ One byte stream per frame on topic `portal_frame_video`. Header is
 Width and height fit in `u16` (max 65535×65535 — far beyond any real
 camera). Track name is capped at 256 bytes on send and receive. The
 receiver dispatches frames by track name in the header, so multiple
-frame-video tracks share one topic.
+byte-stream tracks share one topic.
 
 Frame loss is contained: byte streams are TCP-like, frames either
 arrive whole or do not arrive at all. A dropped frame does not affect

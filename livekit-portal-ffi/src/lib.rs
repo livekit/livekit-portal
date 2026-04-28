@@ -52,26 +52,36 @@ impl From<core::Role> for Role {
     }
 }
 
-/// Frame-video codec. Selected per-track at config time (see
-/// `PortalConfig::add_frame_video`). Mirrors `livekit_portal::Codec`.
+/// Video codec. Selected per-track at config time via
+/// `PortalConfig::add_video`. Codec choice picks both the encoding and the
+/// wire transport: `H264` rides the WebRTC media path; the rest ride a
+/// reliable per-frame byte-stream channel. Mirrors `livekit_portal::Codec`.
 ///
 /// **Foreign binding casing**: UniFFI emits enum variants in the host
-/// language's idiomatic case. Python code uses `VideoCodec.RAW` /
-/// `VideoCodec.PNG` / `VideoCodec.MJPEG` (UPPER), not the Rust spelling.
+/// language's idiomatic case. Python code uses `VideoCodec.H264` /
+/// `VideoCodec.RAW` / `VideoCodec.PNG` / `VideoCodec.MJPEG` (UPPER), not
+/// the Rust spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum VideoCodec {
-    /// Uncompressed RGB24. Largest payload, zero encode cost.
+    /// WebRTC H.264. Real-time RTP/SRTP transport, lossy, best-effort.
+    /// `quality` is ignored — libwebrtc picks the operating bitrate.
+    H264,
+    /// Uncompressed RGB24. Largest payload, zero encode cost. Byte-stream
+    /// transport.
     Raw,
-    /// PNG, lossless. ~2-3x compression on natural images.
+    /// PNG, lossless. ~2-3x compression on natural images. Byte-stream
+    /// transport.
     Png,
     /// Motion JPEG, lossy. ~10-20x compression at quality 90. Each frame is
-    /// an independent JPEG so frame loss is contained.
+    /// an independent JPEG so frame loss is contained. Byte-stream
+    /// transport.
     Mjpeg,
 }
 
 impl From<VideoCodec> for core::Codec {
     fn from(c: VideoCodec) -> Self {
         match c {
+            VideoCodec::H264 => core::Codec::H264,
             VideoCodec::Raw => core::Codec::Raw,
             VideoCodec::Png => core::Codec::Png,
             VideoCodec::Mjpeg => core::Codec::Mjpeg,
@@ -82,6 +92,7 @@ impl From<VideoCodec> for core::Codec {
 impl From<core::Codec> for VideoCodec {
     fn from(c: core::Codec) -> Self {
         match c {
+            core::Codec::H264 => VideoCodec::H264,
             core::Codec::Raw => VideoCodec::Raw,
             core::Codec::Png => VideoCodec::Png,
             core::Codec::Mjpeg => VideoCodec::Mjpeg,
@@ -144,10 +155,11 @@ pub struct FieldSpec {
     pub dtype: DType,
 }
 
-/// One declared frame-video track: name, codec, and per-codec quality.
-/// Crosses the FFI boundary so bindings can pass these to
-/// `PortalConfig.add_frame_video`. `quality` is meaningful for
-/// `VideoCodec.Mjpeg` (1..=100) and ignored for `Raw` / `Png`.
+/// One declared byte-stream video track: name, codec, and per-codec
+/// quality. Crosses the FFI boundary so bindings can introspect tracks
+/// declared via `PortalConfig.add_video` with a non-`H264` codec.
+/// `quality` is meaningful for `VideoCodec.Mjpeg` (1..=100) and ignored for
+/// `Raw` / `Png`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FrameVideoSpec {
     pub name: String,
@@ -454,17 +466,14 @@ impl PortalConfig {
         Arc::new(Self { inner: Mutex::new(core::PortalConfig::new(session, role.into())) })
     }
 
-    pub fn add_video(&self, name: String) {
-        self.inner.lock().add_video(name);
-    }
-
-    /// Declare a frame-video track. Frames go over a reliable byte-stream
-    /// channel (not the WebRTC media path), encoded with `codec`. The
+    /// Declare a video track. `codec` picks both the encoding and the wire
+    /// transport: `H264` rides the WebRTC media path; `Mjpeg`, `Png`, and
+    /// `Raw` ride a reliable per-frame byte-stream channel and the
     /// receiver decodes back to RGB so the user-facing frame API is
-    /// identical to plain video. `quality` is `1..=100` for `Mjpeg` and
-    /// ignored for `Raw` / `Png`.
-    pub fn add_frame_video(&self, name: String, codec: VideoCodec, quality: u8) {
-        self.inner.lock().add_frame_video(name, codec.into(), quality);
+    /// identical. `quality` is `1..=100` for `Mjpeg` and ignored for
+    /// `H264` / `Raw` / `Png`.
+    pub fn add_video(&self, name: String, codec: VideoCodec, quality: u8) {
+        self.inner.lock().add_video(name, codec.into(), quality);
     }
 
     pub fn add_state_typed(&self, schema: Vec<FieldSpec>) {
