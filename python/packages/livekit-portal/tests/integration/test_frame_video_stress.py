@@ -79,8 +79,8 @@ async def test_4k_frame_roundtrip(pair, codec):
       * Dimensions match.
       * For lossless codecs (Raw, PNG), bytes are exact.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=codec, quality=90)
-    pair.operator_cfg.add_frame_video("cam", codec=codec, quality=90)
+    pair.robot_cfg.add_video("cam", codec=codec, quality=90)
+    pair.operator_cfg.add_video("cam", codec=codec, quality=90)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -122,8 +122,8 @@ async def test_sustained_30fps_mjpeg_540p_for_5s(pair):
       * No publisher-queue drops at this rate.
       * No more than 1 dropped frame at the publisher under steady state.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=85)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=85)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=85)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=85)
 
     received: list[int] = []  # store timestamps to detect ordering / loss
     await pair.start()
@@ -182,8 +182,8 @@ async def test_three_tracks_concurrent(pair):
         ("over",  VideoCodec.RAW,   0),
     ]
     for name, codec, q in cams:
-        pair.robot_cfg.add_frame_video(name, codec=codec, quality=q)
-        pair.operator_cfg.add_frame_video(name, codec=codec, quality=q)
+        pair.robot_cfg.add_video(name, codec=codec, quality=q)
+        pair.operator_cfg.add_video(name, codec=codec, quality=q)
 
     received: dict[str, list[VideoFrameData]] = {n: [] for n, _, _ in cams}
     await pair.start()
@@ -223,8 +223,8 @@ async def test_three_tracks_concurrent(pair):
 async def test_minimal_dims_lossless(pair, w, h):
     """1×1 RGB roundtrip — codec must not have a hidden block-size floor.
     Lossless only, since MJPEG's 8×8 DCT block can't represent a 1×1 sample."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -250,8 +250,8 @@ async def test_minimal_dims_lossless(pair, w, h):
 async def test_extreme_aspect_ratio(pair, w, h):
     """Very wide / very tall frames. Stresses the codec's stride
     handling and the wire format's u16 width/height fields."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -280,8 +280,8 @@ async def test_operator_joins_after_robot_starts_sending():
     from integration.conftest import URL, _make_token, Pair
 
     p = Pair()
-    p.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    p.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    p.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    p.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     try:
         # Robot connects first, sends a few "pre-operator" frames.
@@ -331,8 +331,8 @@ async def test_sustained_overrate_drops_bounded(pair):
     in the metric. Memory must not balloon (heap-bounded by queue cap +
     in-flight payload).
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.RAW)
     await pair.start()
 
     rgb = _gradient(640, 480)
@@ -374,8 +374,8 @@ async def test_dim_above_u16_rejected_at_send(pair):
     silently truncate or panic. This is a property of the wire format,
     so the actual server flow doesn't matter — we just want a clean
     error from `send_video_frame`."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.RAW)
     await pair.start()
 
     # Construct a frame whose dimensions fit Python ints but exceed u16.
@@ -425,8 +425,8 @@ async def test_raw_latency_vs_chunk_count(pair, w, h):
     Prints chunk count + p50/p95 + cumulative bytes_sent so the
     relationship is visible. No tight upper bound — networks vary.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.RAW)
 
     samples_us: list[int] = []
     arrival_event = asyncio.Event()
@@ -497,8 +497,8 @@ async def test_latency_profile_640x480(pair, codec, quality):
     a bottleneck. Asserts a soft ceiling so a regression that doubles
     latency would be loud.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=codec, quality=quality)
-    pair.operator_cfg.add_frame_video("cam", codec=codec, quality=quality)
+    pair.robot_cfg.add_video("cam", codec=codec, quality=quality)
+    pair.operator_cfg.add_video("cam", codec=codec, quality=quality)
 
     samples_us: list[int] = []
     arrival_event = asyncio.Event()
@@ -571,8 +571,8 @@ async def test_rss_does_not_balloon_under_sustained_load(pair):
     A real leak would make the second delta similar to or bigger than
     the first because each frame keeps allocating without ever freeing.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=85)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=85)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=85)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=85)
 
     received_count = 0
 
@@ -647,8 +647,8 @@ async def test_repeated_reconnect_no_leak():
 
     for cycle in range(5):
         p = Pair()
-        p.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=80)
-        p.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=80)
+        p.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=80)
+        p.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=80)
         try:
             p.robot = Portal(p.robot_cfg)
             p.operator = Portal(p.operator_cfg)

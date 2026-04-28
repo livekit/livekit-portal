@@ -1,16 +1,17 @@
-"""Integration tests for frame-video tracks against a live LiveKit server.
+"""Integration tests for byte-stream video tracks against a live LiveKit server.
 
-Frame video bypasses the WebRTC media path and ships each frame as a
-byte-stream payload (codec=Raw|Png|Mjpeg). The receiver decodes back to
-RGB so consumer code calls `on_video_frame` / `get_video_frame` /
-`on_observation` exactly the same way as plain `add_video`.
+Selecting a non-H264 codec on `add_video` bypasses the WebRTC media path
+and ships each frame as a byte-stream payload (Raw, Png, Mjpeg). The
+receiver decodes back to RGB so consumer code calls `on_video_frame` /
+`get_video_frame` / `on_observation` exactly the same way as the H264
+WebRTC path.
 
 These scenarios exercise the parts most likely to misbehave in production:
   * RGB roundtrip integrity (Raw, Png byte-exact; Mjpeg close enough)
   * Codec mismatch — wrong codec on receive must drop, not crash
   * Track name mismatch — frames for an undeclared track must drop
-  * Mixed transports — `add_video` and `add_frame_video` cohabiting one
-    Portal both feed the sync buffer
+  * Mixed transports — H264 and byte-stream tracks cohabiting one Portal
+    both feed the sync buffer
   * Pre-first-frame state buffering and observation emission
   * Burst publish — overflow path drops newest frames without hanging
   * Boundary dimensions (8x8 floor, multi-megapixel ceiling)
@@ -70,8 +71,8 @@ def _gradient(width: int, height: int, seed: int = 0) -> np.ndarray:
 @pytest.mark.parametrize("codec", [VideoCodec.RAW, VideoCodec.PNG])
 async def test_lossless_codec_roundtrip_byte_exact(pair, codec):
     """Raw and PNG must deliver the publisher's bytes verbatim."""
-    pair.robot_cfg.add_frame_video("cam", codec=codec)
-    pair.operator_cfg.add_frame_video("cam", codec=codec)
+    pair.robot_cfg.add_video("cam", codec=codec)
+    pair.operator_cfg.add_video("cam", codec=codec)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -93,8 +94,8 @@ async def test_lossless_codec_roundtrip_byte_exact(pair, codec):
 
 async def test_mjpeg_roundtrip_close(pair):
     """MJPEG is lossy by design; assert avg per-pixel error is small."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=95)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=95)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=95)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=95)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -125,8 +126,8 @@ async def test_codec_mismatch_drops(pair):
     the header disagrees with the operator's spec; the dispatcher must
     drop the frame and not call the callback.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -148,8 +149,8 @@ async def test_unknown_track_drops_silently(pair):
     track-name header doesn't match any operator spec; receiver drops,
     no callback fires on either name.
     """
-    pair.robot_cfg.add_frame_video("cam_a", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam_b", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam_a", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam_b", codec=VideoCodec.RAW)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -170,8 +171,8 @@ async def test_unknown_track_drops_silently(pair):
 async def test_observation_emits_for_frame_video_track(pair):
     """A frame-video track behaves exactly like a webrtc track from the
     sync buffer's POV: state + matching frame → one observation."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
     # state schema from conftest is `[("j", F32)]`.
 
     obs: list[Observation] = []
@@ -195,9 +196,9 @@ async def test_mixed_transports_in_one_portal(pair):
     frames once both arrive within tolerance.
     """
     pair.robot_cfg.add_video("cam_webrtc")
-    pair.robot_cfg.add_frame_video("cam_data", codec=VideoCodec.MJPEG, quality=80)
+    pair.robot_cfg.add_video("cam_data", codec=VideoCodec.MJPEG, quality=80)
     pair.operator_cfg.add_video("cam_webrtc")
-    pair.operator_cfg.add_frame_video("cam_data", codec=VideoCodec.MJPEG, quality=80)
+    pair.operator_cfg.add_video("cam_data", codec=VideoCodec.MJPEG, quality=80)
 
     obs: list[Observation] = []
     await pair.start()
@@ -231,8 +232,8 @@ async def test_mixed_transports_in_one_portal(pair):
 async def test_tiny_frame_8x8(pair):
     """8x8 RGB — smallest sensible frame. Verifies the wire format
     survives below typical block boundaries that codecs assume."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -254,8 +255,8 @@ async def test_large_frame_above_data_packet_cap(pair):
     Byte streams fragment under the hood, so the receive side should
     reassemble cleanly.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.RAW)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -277,8 +278,8 @@ async def test_odd_dimensions_supported(pair):
     """Frame video has no parity constraint (unlike I420 → libwebrtc).
     Odd-on-both-axes frames must encode and roundtrip cleanly.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -296,8 +297,8 @@ async def test_odd_dimensions_supported(pair):
 async def test_mjpeg_quality_boundaries(pair, quality):
     """MJPEG accepts 1..=100. Both endpoints must encode without panic
     and decode to a frame of the right dimensions."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=quality)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=quality)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=quality)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=quality)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -319,8 +320,8 @@ async def test_burst_does_not_hang(pair):
     """Send 200 frames as fast as possible. Some may drop at the
     publish-queue boundary (cap=60) — the rest must arrive without the
     publisher hanging or panicking."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=70)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.MJPEG, quality=70)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=70)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.MJPEG, quality=70)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -344,8 +345,8 @@ async def test_disconnect_midstream_leaves_clean_state(pair):
     more frames. The original publisher's drainer task must abort
     cleanly; a leaked task would either keep the room open or panic on
     a torn-down LocalParticipant."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -369,8 +370,8 @@ async def test_get_video_frame_after_send(pair):
     """`get_video_frame` returns the latest received frame for the named
     track. After one send, the operator's pull-side slot must populate.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
     await pair.start()
 
     rgb = _gradient(32, 32, seed=9)
@@ -389,8 +390,8 @@ async def test_state_buffered_until_first_frame(pair):
     timestamp. The sync buffer should hold the state, then emit when the
     frame arrives — no observation drop.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     obs: list[Observation] = []
     drops: list = []
@@ -424,8 +425,8 @@ async def test_state_buffered_until_first_frame(pair):
 async def test_uniform_fill_byte_exact(pair, fill):
     """Pathological uniform frames stress the codec's entropy coder
     boundary. Lossless codecs must still be byte-exact."""
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()
@@ -449,8 +450,8 @@ async def test_operator_send_video_frame_wrong_role(pair):
     surface as `WrongRole`, not as the misleading `UnknownVideoTrack` it
     used to return.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
     await pair.start()
 
     sent = _gradient(8, 8)
@@ -470,8 +471,8 @@ async def test_publisher_full_metric_increments_on_burst(pair):
     will be dropped at the queue cap (60), and the metric must reflect
     that count.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.RAW)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.RAW)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.RAW)
     await pair.start()
 
     rgb = _gradient(320, 240, seed=5)
@@ -495,8 +496,8 @@ async def test_random_noise_byte_exact(pair):
     """High-entropy noise. PNG can't compress this much, exercising the
     largest typical PNG payload size on the wire.
     """
-    pair.robot_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
-    pair.operator_cfg.add_frame_video("cam", codec=VideoCodec.PNG)
+    pair.robot_cfg.add_video("cam", codec=VideoCodec.PNG)
+    pair.operator_cfg.add_video("cam", codec=VideoCodec.PNG)
 
     received: list[VideoFrameData] = []
     await pair.start()

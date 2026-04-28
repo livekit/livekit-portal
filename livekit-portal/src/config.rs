@@ -2,7 +2,7 @@ use crate::codec::Codec;
 use crate::dtype::DType;
 use crate::types::{Role, SyncConfig};
 
-/// Default JPEG quality for `add_frame_video` when MJPEG is selected without an
+/// Default JPEG quality for `add_video` when MJPEG is selected without an
 /// explicit value. Tuned for inference workloads: visually near-lossless on
 /// natural images, ~10-20x compression versus raw RGB.
 pub const DEFAULT_MJPEG_QUALITY: u8 = 90;
@@ -37,13 +37,15 @@ impl From<FieldSpec> for (String, DType) {
     }
 }
 
-/// One frame-video track declaration: name, codec, and per-codec quality.
+/// One byte-stream video track declaration: name, codec, and per-codec
+/// quality.
 ///
-/// Frame-video tracks bypass the WebRTC media path and ride a reliable
-/// byte-stream channel instead. Each frame is encoded once on the sender
-/// (Raw / PNG / MJPEG) and decoded back to RGB on the receiver. The
-/// user-facing API is identical to plain video — `send_video_frame` /
-/// `on_video_frame` / `get_video_frame` — only the wire transport differs.
+/// These tracks bypass the WebRTC media path and ride a reliable byte-stream
+/// channel instead. Each frame is encoded once on the sender (Raw / PNG /
+/// MJPEG) and decoded back to RGB on the receiver. The user-facing API is
+/// identical to WebRTC video — `send_video_frame` / `on_video_frame` /
+/// `get_video_frame` — only the wire transport differs. Selected at config
+/// time by passing a non-`H264` codec to `PortalConfig::add_video`.
 ///
 /// `quality` is honored for `Mjpeg` (1..=100) and ignored for `Raw` and
 /// `Png`.
@@ -127,44 +129,35 @@ impl PortalConfig {
         }
     }
 
-    pub fn add_video(&mut self, name: impl Into<String>) {
+    /// Declare a video track.
+    ///
+    /// `codec` picks both the encoding and the wire transport:
+    ///
+    /// - `Codec::H264` rides the WebRTC media path (RTP/SRTP, lossy,
+    ///   best-effort delivery, lowest latency at scale). `quality` is
+    ///   ignored — libwebrtc picks the operating bitrate.
+    /// - `Codec::Mjpeg`, `Codec::Png`, `Codec::Raw` ride a reliable
+    ///   per-frame byte-stream channel. The receiver decodes back to RGB so
+    ///   the user-facing `on_video_frame` / `get_video_frame` API is
+    ///   identical to H264. `quality` is in `1..=100` for `Mjpeg` and
+    ///   ignored for `Raw` / `Png`. Use `DEFAULT_MJPEG_QUALITY` (90) when
+    ///   in doubt.
+    ///
+    /// Track names must be unique across all `add_video` calls regardless
+    /// of codec; a duplicate panics.
+    ///
+    /// **Byte-stream latency**: frames on the byte-stream path pay roughly
+    /// `1 ms + 2 ms × ⌈size / BYTE_STREAM_CHUNK_SIZE⌉` per frame, set by
+    /// the SCTP data channel drain rate (not Portal's encode cost). Pick a
+    /// codec whose encoded size fits in one chunk for low-latency
+    /// closed-loop work. MJPEG at 224×224 to 480p typically does. Raw at
+    /// anything above ~70×70 spills into multiple chunks.
+    pub fn add_video(&mut self, name: impl Into<String>, codec: Codec, quality: u8) {
         let name = name.into();
         assert!(
             !self.has_track(&name),
             "video track '{name}' already declared (each track name must be unique \
-             across add_video and add_frame_video)"
-        );
-        self.video_tracks.push(name);
-    }
-
-    /// Declare a frame-video track. Frame-video tracks deliver each frame
-    /// independently over a reliable byte-stream channel, encoded with
-    /// `codec`. The receiver decodes back to RGB so the user-facing
-    /// `on_video_frame` / `get_video_frame` API matches plain video.
-    ///
-    /// `quality` is in `1..=100` for `Codec::Mjpeg` and ignored for `Codec::Raw`
-    /// / `Codec::Png`. Use `DEFAULT_MJPEG_QUALITY` (90) when in doubt.
-    ///
-    /// Track names must be unique across all `add_video` and
-    /// `add_frame_video` calls; a duplicate panics.
-    ///
-    /// **Latency**: byte-stream frames pay roughly `1 ms + 2 ms × ⌈size /
-    /// BYTE_STREAM_CHUNK_SIZE⌉` per frame, set by the SCTP data channel
-    /// drain rate (not Portal's encode cost). Pick a codec whose
-    /// encoded size fits in one chunk for low-latency closed-loop work.
-    /// MJPEG at 224×224 to 480p typically does. Raw at anything above
-    /// ~70×70 spills into multiple chunks.
-    pub fn add_frame_video(
-        &mut self,
-        name: impl Into<String>,
-        codec: Codec,
-        quality: u8,
-    ) {
-        let name = name.into();
-        assert!(
-            !self.has_track(&name),
-            "frame-video track '{name}' already declared (each track name must be \
-             unique across add_video and add_frame_video)"
+             across add_video calls)"
         );
         if codec == Codec::Mjpeg {
             assert!(
@@ -172,7 +165,11 @@ impl PortalConfig {
                 "MJPEG quality must be in 1..=100, got {quality}"
             );
         }
-        self.frame_video_tracks.push(FrameVideoSpec::new(name, codec, quality));
+        if codec.is_webrtc() {
+            self.video_tracks.push(name);
+        } else {
+            self.frame_video_tracks.push(FrameVideoSpec::new(name, codec, quality));
+        }
     }
 
     fn has_track(&self, name: &str) -> bool {

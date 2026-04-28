@@ -11,14 +11,21 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 
-from livekit.portal import DType, Portal, PortalConfig, Role
+from livekit.portal import (
+    DEFAULT_MJPEG_QUALITY,
+    DType,
+    Portal,
+    PortalConfig,
+    Role,
+    VideoCodec,
+)
 
 
 @TeleoperatorConfig.register_subclass("livekit")
@@ -34,6 +41,15 @@ class LiveKitTeleoperatorConfig(TeleoperatorConfig):
     # Ignored when a robot is provided.
     motors: tuple[str, ...] = ()
     camera_names: tuple[str, ...] = ()
+
+    # Video transport. `H264` rides the WebRTC media path (default).
+    # `MJPEG` / `PNG` / `RAW` ride a reliable per-frame byte stream — pick
+    # one of those for policy-grade pixels. `video_quality` is honored only
+    # for `MJPEG`. Both peers must agree, so set the same values on the
+    # robot's `LiveKitTeleoperatorConfig` and the operator's
+    # `LiveKitRobotConfig`.
+    video_codec: VideoCodec = VideoCodec.H264
+    video_quality: int = DEFAULT_MJPEG_QUALITY
 
     # Portal tuning.
     slack: int | None = None
@@ -145,7 +161,11 @@ class LiveKitTeleoperator(Teleoperator):
 
         self._portal_cfg = PortalConfig(self.config.session or "lerobot", Role.ROBOT)
         for cam in self._camera_names:
-            self._portal_cfg.add_video(cam)
+            self._portal_cfg.add_video(
+                cam,
+                codec=self.config.video_codec,
+                quality=self.config.video_quality,
+            )
         if self._state_motors:
             self._portal_cfg.add_state_typed(
                 [(name, DType.F64) for name in self._state_motors]

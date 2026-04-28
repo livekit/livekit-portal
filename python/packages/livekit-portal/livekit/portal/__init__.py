@@ -57,8 +57,8 @@ PortalError = _ffi.PortalError
 RpcInvocationData = _ffi.RpcInvocationData
 RpcError = _ffi.RpcError
 
-# Default JPEG quality for `add_frame_video` when no explicit value is given.
-# Mirrors the Rust core's `DEFAULT_MJPEG_QUALITY`.
+# Default JPEG quality for `add_video` with `VideoCodec.MJPEG` when no
+# explicit value is given. Mirrors the Rust core's `DEFAULT_MJPEG_QUALITY`.
 DEFAULT_MJPEG_QUALITY: int = 90
 
 # A schema entry accepted by add_state_typed/add_action_typed. Either a
@@ -633,48 +633,51 @@ class PortalConfig:
         """All declared action chunks, in declaration order."""
         return list(self._action_chunks)
 
-    def add_video(self, name: str) -> None:
-        self._inner.add_video(name)
-        self._video_tracks.append(name)
-
-    def add_frame_video(
+    def add_video(
         self,
         name: str,
-        codec: VideoCodec = VideoCodec.MJPEG,
+        codec: VideoCodec = VideoCodec.H264,
         quality: int = DEFAULT_MJPEG_QUALITY,
     ) -> None:
-        """Declare a frame-video track.
+        """Declare a video track.
 
-        Frames travel over a reliable byte-stream channel rather than the
-        WebRTC media path, encoded per-frame with `codec`. The user-facing
-        send/receive API is identical to plain video — `send_video_frame`
-        accepts RGB, `on_video_frame` / `get_video_frame` deliver RGB.
+        `codec` picks both the encoding and the wire transport. The
+        user-facing send/receive API is identical regardless of codec —
+        `send_video_frame` accepts RGB and `on_video_frame` /
+        `get_video_frame` deliver RGB.
 
-        `codec`:
-          * `VideoCodec.RAW` — uncompressed RGB24, largest payload, zero
-            encode cost.
-          * `VideoCodec.PNG` — lossless, ~2-3x compression on natural images.
-          * `VideoCodec.MJPEG` (default) — lossy per-frame JPEG, ~10-20x
+          * `VideoCodec.H264` (default) — WebRTC media path. Real-time
+            RTP/SRTP, lossy, best-effort. Lowest end-to-end latency at
+            scale. `quality` is ignored.
+          * `VideoCodec.RAW` — byte-stream, uncompressed RGB24. Largest
+            payload, zero encode cost. `quality` is ignored.
+          * `VideoCodec.PNG` — byte-stream, lossless. ~2-3x compression on
+            natural images. `quality` is ignored.
+          * `VideoCodec.MJPEG` — byte-stream, lossy per-frame JPEG. ~10-20x
             compression at quality 90, sub-millisecond decode. Use for
             inference where frame independence matters but bit-exactness
             doesn't.
 
         `quality` is in 1..=100 and is honored for `VideoCodec.MJPEG`. It is
-        ignored for `RAW` and `PNG`. Track names must be unique across all
-        `add_video` and `add_frame_video` calls; a duplicate raises.
+        ignored for every other codec. Track names must be unique across
+        all `add_video` calls; a duplicate raises.
 
-        **Latency**: each frame's byte-stream payload is fragmented at the
-        LiveKit chunk size (15 KB) and shipped over a single SCTP data
-        channel. Per-frame latency is roughly `1 ms + 2 ms × ⌈encoded_size
-        / 15 KB⌉` on localhost, set by the data-channel drain rate (not
-        Portal's encode cost). Pick a codec whose encoded output fits in
-        one chunk for low-latency closed-loop work — at typical inference
-        resolutions (224×224 to 480p) MJPEG q=80–95 usually does.
+        **Byte-stream latency** (non-H264 codecs): each frame's payload is
+        fragmented at the LiveKit chunk size (15 KB) and shipped over a
+        single SCTP data channel. Per-frame latency is roughly `1 ms + 2 ms
+        × ⌈encoded_size / 15 KB⌉` on localhost, set by the data-channel
+        drain rate (not Portal's encode cost). Pick a codec whose encoded
+        output fits in one chunk for low-latency closed-loop work — at
+        typical inference resolutions (224×224 to 480p) MJPEG q=80–95
+        usually does.
         """
-        self._inner.add_frame_video(name, codec, quality)
-        self._frame_video_tracks.append(
-            FrameVideoSpec(name=name, codec=codec, quality=quality)
-        )
+        self._inner.add_video(name, codec, quality)
+        if codec == VideoCodec.H264:
+            self._video_tracks.append(name)
+        else:
+            self._frame_video_tracks.append(
+                FrameVideoSpec(name=name, codec=codec, quality=quality)
+            )
 
     def add_state_typed(self, schema: Iterable[SchemaEntry]) -> None:
         """Declare state fields with per-field dtype.

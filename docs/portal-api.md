@@ -202,17 +202,17 @@ uint8. Width and height must both be even. Full details in
 
 ## Frame video (lossless or codec-of-your-choice)
 
-`add_video` uses the WebRTC media path (H.264, lossy). For policies that
-read the pixels — VLA inference, behavior cloning, any case where
-colorspace shift breaks the policy distribution — declare a frame-video
-track instead:
+`add_video(name)` defaults to `VideoCodec.H264`, the WebRTC media path
+(lossy). For policies that read the pixels — VLA inference, behavior
+cloning, any case where colorspace shift breaks the policy distribution
+— pass a non-H264 codec on the same call:
 
 ```python
 from livekit.portal import VideoCodec
 
-cfg.add_frame_video("front", codec=VideoCodec.MJPEG, quality=90)
-cfg.add_frame_video("wrist", codec=VideoCodec.PNG)
-cfg.add_frame_video("debug", codec=VideoCodec.RAW)
+cfg.add_video("front", codec=VideoCodec.MJPEG, quality=90)
+cfg.add_video("wrist", codec=VideoCodec.PNG)
+cfg.add_video("debug", codec=VideoCodec.RAW)
 ```
 
 The user-facing API is identical — `send_video_frame`, `on_video_frame`,

@@ -17,7 +17,15 @@ from typing import Any
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.robot import Robot
 
-from livekit.portal import DType, Portal, PortalConfig, Role, frame_bytes_to_numpy_rgb
+from livekit.portal import (
+    DEFAULT_MJPEG_QUALITY,
+    DType,
+    Portal,
+    PortalConfig,
+    Role,
+    VideoCodec,
+    frame_bytes_to_numpy_rgb,
+)
 
 
 @RobotConfig.register_subclass("livekit")
@@ -33,6 +41,15 @@ class LiveKitRobotConfig(RobotConfig):
     camera_names: tuple[str, ...] = ()
     camera_height: int = 480
     camera_width: int = 640
+
+    # Video transport. `H264` rides the WebRTC media path (default).
+    # `MJPEG` / `PNG` / `RAW` ride a reliable per-frame byte stream — pick
+    # one of those for policy-grade pixels. `video_quality` is honored only
+    # for `MJPEG`. Both peers must agree, so set the same values on the
+    # operator's `LiveKitRobotConfig` and the robot's
+    # `LiveKitTeleoperatorConfig`.
+    video_codec: VideoCodec = VideoCodec.H264
+    video_quality: int = DEFAULT_MJPEG_QUALITY
 
     # Portal tuning.
     slack: int | None = None
@@ -130,7 +147,11 @@ class LiveKitRobot(Robot):
 
         self._portal_cfg = PortalConfig(self.config.session or "lerobot", Role.OPERATOR)
         for cam in self._camera_names:
-            self._portal_cfg.add_video(cam)
+            self._portal_cfg.add_video(
+                cam,
+                codec=self.config.video_codec,
+                quality=self.config.video_quality,
+            )
         if self._state_motors:
             self._portal_cfg.add_state_typed(
                 [(name, DType.F64) for name in self._state_motors]

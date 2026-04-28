@@ -15,13 +15,20 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
 
-/// Codec used by a frame-video track.
+/// Codec used by a video track.
 ///
-/// Selected per-track at config time (see `PortalConfig::add_frame_video`).
-/// Choice drives the wire size and CPU cost; the user-facing payload is RGB
-/// in every case.
+/// Selected per-track at config time via `PortalConfig::add_video`. The codec
+/// also picks the wire transport: `H264` rides the WebRTC media path, every
+/// other variant rides a reliable byte-stream channel and is encoded by this
+/// module. The user-facing payload is RGB in every case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
+    /// WebRTC H.264, lossy. Real-time RTP/SRTP transport with libwebrtc's
+    /// adaptive bitrate. Best-effort delivery — frames may drop or arrive
+    /// late. Lowest end-to-end latency at scale. Encoded by libwebrtc,
+    /// not this module — the byte-stream encode/decode helpers below panic
+    /// for `H264`.
+    H264,
     /// Uncompressed RGB24. Largest payload, zero encode cost. Use when CPU is
     /// scarce or you want bit-exact frames with no codec dependency.
     Raw,
@@ -32,6 +39,14 @@ pub enum Codec {
     /// decode. Each frame is an independent JPEG (no temporal coding), so
     /// frame loss is contained.
     Mjpeg,
+}
+
+impl Codec {
+    /// Whether this codec rides the WebRTC media path. The remaining codecs
+    /// ride the per-frame byte-stream path.
+    pub fn is_webrtc(self) -> bool {
+        matches!(self, Codec::H264)
+    }
 }
 
 /// Decoded frame: RGB24 bytes plus the dimensions parsed from the payload
@@ -108,13 +123,16 @@ pub fn estimated_encoded_size(width: u32, height: u32, codec: Codec) -> usize {
         Codec::Raw => raw,
         Codec::Png => raw,
         Codec::Mjpeg => (raw / 8).max(1024),
+        Codec::H264 => unreachable!(
+            "Codec::H264 rides the WebRTC media path, not the byte-stream encode path"
+        ),
     }
 }
 
 /// Encode an RGB24 frame to the wire payload for `codec`. `quality` is in
 /// `1..=100` for `Mjpeg` and is ignored for `Raw` and `Png`.
 ///
-/// Quality range is enforced at config time by `PortalConfig::add_frame_video`,
+/// Quality range is enforced at config time by `PortalConfig::add_video`,
 /// so this hot-path encode skips re-validation.
 ///
 /// Allocates a fresh `Vec`. Prefer `encode_frame_into` when you already
@@ -176,6 +194,9 @@ pub fn encode_frame_into(
                 .map_err(|e| CodecError::EncodeFailed(e.to_string()))?;
             Ok(())
         }
+        Codec::H264 => unreachable!(
+            "Codec::H264 rides the WebRTC media path, not the byte-stream encode path"
+        ),
     }
 }
 
@@ -212,6 +233,9 @@ pub fn decode_frame(
             image::ImageFormat::Jpeg,
             declared_width,
             declared_height,
+        ),
+        Codec::H264 => unreachable!(
+            "Codec::H264 rides the WebRTC media path, not the byte-stream decode path"
         ),
     }
 }

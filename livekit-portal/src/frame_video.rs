@@ -112,6 +112,9 @@ fn codec_id(c: Codec) -> u8 {
         Codec::Raw => 0,
         Codec::Png => 1,
         Codec::Mjpeg => 2,
+        Codec::H264 => unreachable!(
+            "Codec::H264 rides the WebRTC media path, not the byte-stream wire format"
+        ),
     }
 }
 

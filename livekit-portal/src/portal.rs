@@ -351,10 +351,10 @@ impl Portal {
         timestamp_us: Option<u64>,
     ) -> PortalResult<()> {
         // Two transports, one user-facing method. WebRTC publishers and
-        // frame-video publishers are populated by the corresponding
-        // `add_video` / `add_frame_video` declarations at config time, and
-        // names are unique across both, so a track lives in exactly one
-        // map.
+        // frame-video publishers are populated by `add_video` at config
+        // time — codec selection routes the spec to one list or the
+        // other — and names are unique across both, so a track lives in
+        // exactly one map.
         if let Some(publisher) = self.video_publishers.lock().get(track_name).cloned() {
             return publisher.send_frame(rgb_data, width, height, timestamp_us);
         }
