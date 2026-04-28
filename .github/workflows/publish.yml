@@ -1,0 +1,166 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# One publish run at a time. A second tag push waits; it does not cancel the
+# in-flight run because cancelling a half-uploaded publish is worse than
+# letting it finish.
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+# System libraries required to link the livekit-portal Rust cdylib on Linux.
+# Mirrors the list in tests.yml so the two stay in sync.
+env:
+  LINUX_SYSTEM_DEPS: >-
+    libssl-dev
+    libglib2.0-dev
+    libx11-dev
+    libxext-dev
+    libxfixes-dev
+    libxdamage-dev
+    libxrandr-dev
+    libxcomposite-dev
+    libgl1-mesa-dev
+    libgbm-dev
+    libdrm-dev
+    libva-dev
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build — native wheels (per platform) + pure Python wheels/sdists.
+  #
+  # fetch-depth: 0 is required on every build job: hatch-vcs walks the full
+  # git history to derive the package version from the triggering tag. A
+  # shallow clone produces a dev/fallback version instead of the real one.
+  # ---------------------------------------------------------------------------
+
+  build-native:
+    name: Build native wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04        # Linux x86_64  (glibc 2.35)
+          - ubuntu-24.04-arm    # Linux aarch64 (glibc 2.39)
+          - macos-13            # macOS x86_64  (Intel)
+          - macos-latest        # macOS arm64   (Apple Silicon)
+          - windows-latest      # Windows x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so hatch-vcs resolves the version tag
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y $LINUX_SYSTEM_DEPS
+
+      # protoc is needed to compile proto-based Rust dependencies.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'livekit-portal-ffi/Cargo.toml') }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Compile the Rust cdylib and generate the UniFFI Python module.
+      # Both land in livekit/portal/ so hatchling picks them up as wheel
+      # artifacts (see [tool.hatch.build.targets.wheel] in pyproject.toml).
+      - name: Build FFI cdylib and generate Python bindings
+        run: bash scripts/build_ffi_python.sh release
+        shell: bash
+
+      - name: Build livekit-portal wheel
+        working-directory: python
+        run: uv build --package livekit-portal --wheel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-native-${{ matrix.os }}
+          path: python/dist/*.whl
+
+  build-pure:
+    name: Build pure Python packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so hatch-vcs resolves the version tag
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # uv build replaces the workspace source for livekit-portal with a
+      # plain PyPI dependency in the generated wheel metadata.
+      - name: Build lerobot-robot-livekit
+        working-directory: python
+        run: uv build --package lerobot-robot-livekit
+
+      - name: Build lerobot-teleoperator-livekit
+        working-directory: python
+        run: uv build --package lerobot-teleoperator-livekit
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pure
+          path: python/dist/
+
+  # ---------------------------------------------------------------------------
+  # Publish — upload every collected artifact to PyPI.
+  #
+  # Uses OIDC trusted publishing: no API key is stored in GitHub secrets.
+  # Configure each package's trusted publisher at pypi.org with:
+  #   Repository: <owner>/livekit-portal
+  #   Workflow:   publish.yml
+  #   Environment: pypi
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    needs: [build-native, build-pure]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for OIDC trusted publisher
+
+    steps:
+      - name: Download all distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show collected distributions
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
