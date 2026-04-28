@@ -47,7 +47,6 @@ packages = ["livekit"]
 artifacts = [
     "livekit/portal/liblivekit_portal_ffi.dylib",
     "livekit/portal/liblivekit_portal_ffi.so",
-    "livekit/portal/livekit_portal_ffi.dll",
     "livekit/portal/livekit_portal_ffi.py",
 ]
 
