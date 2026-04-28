@@ -8,6 +8,9 @@ on:
 # One publish run at a time. A second tag push waits; it does not cancel the
 # in-flight run because cancelling a half-uploaded publish is worse than
 # letting it finish.
+permissions:
+  contents: read
+
 concurrency:
   group: publish
   cancel-in-progress: false
