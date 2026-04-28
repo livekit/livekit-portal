@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 # One publish run at a time. A second tag push waits; it does not cancel the
 # in-flight run because cancelling a half-uploaded publish is worse than
@@ -50,9 +51,7 @@ jobs:
         os:
           - ubuntu-22.04        # Linux x86_64  (glibc 2.35)
           - ubuntu-24.04-arm    # Linux aarch64 (glibc 2.39)
-          - macos-13            # macOS x86_64  (Intel)
           - macos-latest        # macOS arm64   (Apple Silicon)
-          - windows-latest      # Windows x86_64
 
     steps:
       - uses: actions/checkout@v4
