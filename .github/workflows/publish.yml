@@ -95,6 +95,17 @@ jobs:
         working-directory: python
         run: uv build --package livekit-portal --wheel
 
+      # PyPI rejects plain linux_* tags — retag as manylinux_<glibc>_<arch>.
+      # The binary still requires system libs (X11, GLib, etc.) at runtime,
+      # which is expected for a robotics library on a desktop/embedded OS.
+      - name: Retag Linux wheel as manylinux
+        if: runner.os == 'Linux'
+        working-directory: python
+        run: |
+          glibc=$(python3 -c "import platform; v=platform.libc_ver()[1]; print(v.replace('.','_'))")
+          arch=$(python3 -c "import platform; print(platform.machine())")
+          uvx --from wheel wheel tags --platform-tag "manylinux_${glibc}_${arch}" --remove dist/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-native-${{ matrix.os }}
