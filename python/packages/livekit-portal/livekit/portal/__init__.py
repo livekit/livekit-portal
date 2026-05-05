@@ -300,7 +300,7 @@ def _wrap_action(
 ) -> Action:
     return Action(
         values=_cast_values(action.values, schema),
-        raw_values=dict(action.values),
+        raw_values=action.values,
         timestamp_us=action.timestamp_us,
         in_reply_to_ts_us=action.in_reply_to_ts_us,
     )
@@ -335,7 +335,7 @@ def _wrap_action_chunk(
     don't pay an unwanted widening on receipt.
     """
     fields = schema_by_name.get(chunk.name, [])
-    raw_data: Dict[str, List[float]] = {k: list(v) for k, v in chunk.data.items()}
+    raw_data: Dict[str, List[float]] = chunk.data
     if _np is None:
         # numpy is a hard runtime dep on this package, so this branch only
         # exists for hypothetical embedded builds. Hand back the raw lists
@@ -364,7 +364,7 @@ def _wrap_state(
 ) -> State:
     return State(
         values=_cast_values(state.values, schema),
-        raw_values=dict(state.values),
+        raw_values=state.values,
         timestamp_us=state.timestamp_us,
     )
 
@@ -374,8 +374,8 @@ def _wrap_observation(
 ) -> Observation:
     return Observation(
         state=_cast_values(obs.state, state_schema),
-        raw_state=dict(obs.state),
-        frames=dict(obs.frames),
+        raw_state=obs.state,
+        frames=obs.frames,
         timestamp_us=obs.timestamp_us,
     )
 
@@ -739,6 +739,13 @@ class PortalConfig:
 
     def set_ping_ms(self, ms: int) -> None:
         self._inner.set_ping_ms(ms)
+
+    def set_e2ee_key(self, key: bytes) -> None:
+        """Set a shared E2EE key. Both peers must call this with the same key
+        before connecting. The key is used as a GCM-AES shared secret for all
+        media tracks and data channels.
+        """
+        self._inner.set_e2ee_key(list(key))
 
     def set_reuse_stale_frames(self, enable: bool) -> None:
         """Reuse the most recent already-emitted frame on a track when the

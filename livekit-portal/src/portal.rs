@@ -271,6 +271,12 @@ impl Portal {
 
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
+        if let Some(key) = &self.config.shared_key {
+            use livekit::e2ee::{key_provider::{KeyProvider, KeyProviderOptions}, EncryptionType};
+            use livekit::E2eeOptions;
+            let key_provider = KeyProvider::with_shared_key(KeyProviderOptions::default(), key.clone());
+            options.encryption = Some(E2eeOptions { key_provider, encryption_type: EncryptionType::Gcm });
+        }
 
         log::info!("[{}] connecting as {:?} to {}", self.config.session, self.config.role, url);
 
