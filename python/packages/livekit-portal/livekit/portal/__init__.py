@@ -745,7 +745,7 @@ class PortalConfig:
         before connecting. The key is used as a GCM-AES shared secret for all
         media tracks and data channels.
         """
-        self._inner.set_e2ee_key(list(key))
+        self._inner.set_e2ee_key(bytes(key))
 
     def set_reuse_stale_frames(self, enable: bool) -> None:
         """Reuse the most recent already-emitted frame on a track when the

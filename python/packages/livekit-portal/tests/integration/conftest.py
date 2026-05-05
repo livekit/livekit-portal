@@ -36,7 +36,7 @@ API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "secret")
 collect_ignore = (
     []
     if URL
-    else ["test_chunks.py", "test_frame_video.py", "test_frame_video_stress.py"]
+    else ["test_chunks.py", "test_frame_video.py", "test_frame_video_stress.py", "test_e2ee.py"]
 )
 
 

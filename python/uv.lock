@@ -941,6 +941,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "livekit-api" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -954,6 +955,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "livekit-api", specifier = ">=1.1.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
 ]
