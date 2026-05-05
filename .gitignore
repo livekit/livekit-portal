@@ -27,5 +27,8 @@ build/
 **/livekit/portal/livekit_portal_ffi.dll
 **/livekit/portal/livekit_portal_ffi.py
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store

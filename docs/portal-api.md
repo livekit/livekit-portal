@@ -245,6 +245,21 @@ format, and metrics surface.
 - `await portal.connect(url, token)` / `await portal.disconnect()`.
 - `portal.close()` / `cfg.close()`: release native handles.
 
+## End-to-end encryption
+
+Call `cfg.set_e2ee_key(key: bytes)` before `connect`. Both peers must use the
+same key. All media tracks and data channels (state, actions, RPC) are
+encrypted with AES-GCM.
+
+```python
+import os
+
+cfg.set_e2ee_key(os.environ["PORTAL_E2EE_KEY"].encode())
+```
+
+See [e2ee.md](e2ee.md) for key generation, distribution patterns, and coverage
+details.
+
 ## Reference
 
 - [Concepts](concepts.md). Roles, observation model, frame format.
@@ -253,6 +268,7 @@ format, and metrics surface.
 - [Tuning](tuning.md). `fps`, `slack`, `tolerance`, asymmetric rates.
 - [Synchronization deep dive](synchronization.md). The match algorithm.
 - [RPC](rpc.md). Imperative commands on top of LiveKit RPC.
+- [E2EE](e2ee.md). Shared-key end-to-end encryption.
 - [`examples/python/basic/`](../examples/python/basic). The smallest
   end-to-end script using this API, with synthetic video.
 - [lerobot integration](lerobot.md). The optional convenience plugins that

@@ -526,6 +526,10 @@ impl PortalConfig {
     pub fn set_reuse_stale_frames(&self, enable: bool) {
         self.inner.lock().set_reuse_stale_frames(enable);
     }
+
+    pub fn set_e2ee_key(&self, key: Vec<u8>) {
+        self.inner.lock().set_e2ee_key(key);
+    }
 }
 
 // ---------------------------------------------------------------------------

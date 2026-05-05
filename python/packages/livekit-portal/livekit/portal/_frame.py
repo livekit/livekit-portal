@@ -34,20 +34,18 @@ def normalize_rgb(
             raise ValueError(f"width mismatch: array is {w}, argument is {width}")
         if height is not None and height != h:
             raise ValueError(f"height mismatch: array is {h}, argument is {height}")
-        contiguous = np.ascontiguousarray(frame)
-        return contiguous.tobytes(), w, h
+        return frame.tobytes(), w, h
 
     if isinstance(frame, (bytes, bytearray, memoryview)):
         if width is None or height is None:
             raise ValueError("width and height are required when frame is raw bytes")
-        data = bytes(frame)
         expected = width * height * 3
-        if len(data) != expected:
+        if len(frame) != expected:
             raise ValueError(
                 f"raw RGB frame size mismatch: expected {expected} bytes "
-                f"(W*H*3 = {width}*{height}*3), got {len(data)}"
+                f"(W*H*3 = {width}*{height}*3), got {len(frame)}"
             )
-        return data, width, height
+        return frame if isinstance(frame, bytes) else bytes(frame), width, height
 
     raise TypeError(
         f"unsupported frame type: {type(frame).__name__}. Pass bytes or np.ndarray (H,W,3) uint8."

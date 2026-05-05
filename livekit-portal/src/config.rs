@@ -107,6 +107,7 @@ pub struct PortalConfig {
     pub(crate) tolerance: f32,
     pub(crate) ping_ms: u64,
     pub(crate) reuse_stale_frames: bool,
+    pub(crate) shared_key: Option<Vec<u8>>,
 }
 
 impl PortalConfig {
@@ -126,7 +127,15 @@ impl PortalConfig {
             tolerance: 1.5,
             ping_ms: 1000,
             reuse_stale_frames: false,
+            shared_key: None,
         }
+    }
+
+    /// Set a shared E2EE key. Both peers must call this with the same key
+    /// before connecting. The key is used as a GCM-AES shared secret for all
+    /// media tracks and data channels.
+    pub fn set_e2ee_key(&mut self, key: Vec<u8>) {
+        self.shared_key = Some(key);
     }
 
     /// Declare a video track.

@@ -852,7 +852,6 @@ wheels = [
 
 [[package]]
 name = "lerobot-robot-livekit"
-version = "0.1.0"
 source = { editable = "packages/lerobot-robot-livekit" }
 dependencies = [
     { name = "lerobot" },
@@ -869,7 +868,6 @@ requires-dist = [
 
 [[package]]
 name = "lerobot-teleoperator-livekit"
-version = "0.1.0"
 source = { editable = "packages/lerobot-teleoperator-livekit" }
 dependencies = [
     { name = "lerobot" },
@@ -902,7 +900,6 @@ wheels = [
 
 [[package]]
 name = "livekit-portal"
-version = "0.1.0"
 source = { editable = "packages/livekit-portal" }
 dependencies = [
     { name = "numpy" },
@@ -944,6 +941,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "livekit-api" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -957,6 +955,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "livekit-api", specifier = ">=1.1.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
 ]
