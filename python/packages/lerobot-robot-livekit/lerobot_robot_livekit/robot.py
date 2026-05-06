@@ -10,6 +10,7 @@ LiveKitRobot forwards over the wire.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +27,8 @@ from livekit.portal import (
     VideoCodec,
     frame_bytes_to_numpy_rgb,
 )
+
+_log = logging.getLogger(__name__)
 
 
 @RobotConfig.register_subclass("livekit")
@@ -57,6 +60,11 @@ class LiveKitRobotConfig(RobotConfig):
     state_reliable: bool = True
     action_reliable: bool = True
     reuse_stale_frames: bool = False
+
+    # Extra state keys beyond the action schema (e.g. {"slider.pos": float}).
+    # Values are the Python types used in observation_features. Keys follow the
+    # same ".pos" convention as motor keys; bare names are also accepted.
+    state_features: dict | None = None
 
 
 class LiveKitRobot(Robot):
@@ -99,6 +107,10 @@ class LiveKitRobot(Robot):
         self._camera_names = list(self._cameras.keys())
 
         self._obs_features: dict = {k: float for k in self._state_keys}
+        if config.state_features:
+            for k, t in config.state_features.items():
+                if k in self._obs_features:
+                    self._obs_features[k] = t
         for name, shape in self._cameras.items():
             self._obs_features[name] = shape
         self._act_features: dict = {k: float for k in self._action_keys}
@@ -109,6 +121,7 @@ class LiveKitRobot(Robot):
         self._loop_thread: threading.Thread | None = None
         self._connected = False
         self._last_observation_timestamp_us: int | None = None
+        self._schema_mismatch_warned = False
 
     # -- lerobot interface ----------------------------------------------------
 
@@ -207,6 +220,20 @@ class LiveKitRobot(Robot):
         for key, motor in zip(self._state_keys, self._state_motors):
             if motor in obs.state:
                 out[key] = float(obs.state[motor])
+        if (
+            not self._schema_mismatch_warned
+            and self._state_motors
+            and obs.state
+            and not out
+        ):
+            _log.warning(
+                "get_observation() returned no state fields: robot sent %s"
+                " but operator schema expects %s. Check that both sides"
+                " declare matching state keys.",
+                sorted(obs.state.keys()),
+                sorted(self._state_motors),
+            )
+            self._schema_mismatch_warned = True
         for cam in self._camera_names:
             frame = obs.frames.get(cam)
             if frame is not None:
@@ -250,6 +277,7 @@ class LiveKitRobot(Robot):
     ) -> tuple[list[str], list[str], dict[str, tuple[int, ...]]]:
         camera_shape = (config.camera_height, config.camera_width, 3)
         cameras = {name: camera_shape for name in config.camera_names}
+        extra_state = sorted(config.state_features.keys()) if config.state_features else []
 
         if teleop is not None:
             act_features = dict(getattr(teleop, "action_features", {}))
@@ -262,11 +290,17 @@ class LiveKitRobot(Robot):
             # lerobot convention: observation mirrors action for telemetry
             # (each commanded motor reports its actual position back).
             state_keys = list(action_keys)
+            for k in extra_state:
+                if k not in state_keys:
+                    state_keys.append(k)
             return state_keys, action_keys, cameras
 
         if config.motors or config.camera_names:
             state_keys = sorted(f"{m}.pos" for m in config.motors)
             action_keys = list(state_keys)
+            for k in extra_state:
+                if k not in state_keys:
+                    state_keys.append(k)
             return state_keys, action_keys, cameras
 
         raise ValueError(
