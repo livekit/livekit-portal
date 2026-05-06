@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
 
@@ -31,6 +29,8 @@ from livekit.portal import (
 )
 
 from ._utils import split_observation_features
+
+logger = logging.getLogger(__name__)
 
 
 @TeleoperatorConfig.register_subclass("livekit")
@@ -62,7 +62,6 @@ class LiveKitTeleoperatorConfig(TeleoperatorConfig):
     state_reliable: bool = True
     action_reliable: bool = True
     reuse_stale_frames: bool = False
-
 
 
 class LiveKitTeleoperator(Teleoperator):
