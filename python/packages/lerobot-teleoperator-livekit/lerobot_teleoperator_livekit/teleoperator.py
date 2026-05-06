@@ -28,8 +28,9 @@ from livekit.portal import (
     PortalConfig,
     Role,
     VideoCodec,
-    split_observation_features,
 )
+
+from ._utils import split_observation_features
 
 
 @TeleoperatorConfig.register_subclass("livekit")

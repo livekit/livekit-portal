@@ -1030,25 +1030,6 @@ class Portal:
         self._inner = None  # type: ignore[assignment]
 
 
-def split_observation_features(
-    features: Dict,
-) -> Tuple[List[str], Dict[str, Tuple[int, ...]]]:
-    """Split a lerobot-style observation_features dict into motor keys and cameras.
-
-    Scalar-valued entries (types like ``float``, ``int``) are motor keys;
-    tuple-valued entries are camera names mapped to their shape.
-    Returns ``(sorted_motor_keys, cameras)``.
-    """
-    motor_keys: List[str] = []
-    cameras: Dict[str, Tuple[int, ...]] = {}
-    for key, val in features.items():
-        if isinstance(val, tuple):
-            cameras[key] = val
-        else:
-            motor_keys.append(key)
-    return sorted(motor_keys), cameras
-
-
 __all__ = [
     "Role",
     "DType",
@@ -1075,5 +1056,4 @@ __all__ = [
     "RpcInvocationData",
     "RpcError",
     "frame_bytes_to_numpy_rgb",
-    "split_observation_features",
 ]

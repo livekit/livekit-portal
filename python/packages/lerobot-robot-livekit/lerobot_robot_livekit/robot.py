@@ -26,8 +26,9 @@ from livekit.portal import (
     Role,
     VideoCodec,
     frame_bytes_to_numpy_rgb,
-    split_observation_features,
 )
+
+from ._utils import split_observation_features
 
 _log = logging.getLogger(__name__)
 
