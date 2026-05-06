@@ -70,6 +70,13 @@ class LiveKitRobotConfig(RobotConfig):
     # replaces the default "state mirrors action" assumption entirely.
     observation_features: dict | None = None
 
+    # Explicit action schema when action keys differ from observation keys and
+    # cannot be derived from config.motors (e.g. {"gripper.pos": float,
+    # "wrist.vel": float}). Follows the same scalar-type convention as
+    # observation_features. Ignored when a local Teleoperator is passed — the
+    # teleop's action_features take precedence.
+    action_features: dict | None = None
+
 
 class LiveKitRobot(Robot):
     """lerobot Robot that receives synced observations from a remote physical
@@ -118,7 +125,10 @@ class LiveKitRobot(Robot):
             self._obs_features = {k: float for k in self._state_keys}
             for name, shape in self._cameras.items():
                 self._obs_features[name] = shape
-        self._act_features: dict = {k: float for k in self._action_keys}
+        if config.action_features and teleop is None:
+            self._act_features: dict = dict(config.action_features)
+        else:
+            self._act_features: dict = {k: float for k in self._action_keys}
 
         self._portal: Portal | None = None
         self._portal_cfg: PortalConfig | None = None
@@ -300,6 +310,8 @@ class LiveKitRobot(Robot):
                         " schema"
                     )
                 return obs_state_keys, sorted(act_features.keys()), cameras
+            if config.action_features:
+                return obs_state_keys, sorted(config.action_features.keys()), cameras
             if config.motors:
                 return obs_state_keys, sorted(f"{m}.pos" for m in config.motors), cameras
             return obs_state_keys, obs_state_keys, cameras
@@ -315,13 +327,18 @@ class LiveKitRobot(Robot):
             # lerobot convention: observation mirrors action for telemetry.
             return list(action_keys), action_keys, cameras
 
+        if config.action_features:
+            action_keys = sorted(config.action_features.keys())
+            return list(action_keys), action_keys, cameras
+
         if config.motors or config.camera_names:
             state_keys = sorted(f"{m}.pos" for m in config.motors)
             return state_keys, list(state_keys), cameras
 
         raise ValueError(
             "LiveKitRobot needs either a local Teleoperator instance or"
-            " config.motors / config.camera_names to derive its schema"
+            " config.motors / config.action_features / config.camera_names to"
+            " derive its schema"
         )
 
     # -- background loop plumbing --------------------------------------------
