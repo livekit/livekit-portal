@@ -26,6 +26,7 @@ from livekit.portal import (
     Role,
     VideoCodec,
     frame_bytes_to_numpy_rgb,
+    split_observation_features,
 )
 
 _log = logging.getLogger(__name__)
@@ -223,20 +224,22 @@ class LiveKitRobot(Robot):
         for key, motor in zip(self._state_keys, self._state_motors):
             if motor in obs.state:
                 out[key] = float(obs.state[motor])
-        if (
-            not self._schema_mismatch_warned
-            and self._state_motors
-            and obs.state
-            and not out
-        ):
-            _log.warning(
-                "get_observation() returned no state fields: robot sent %s"
-                " but operator schema expects %s. Check that both sides"
-                " declare matching state keys.",
-                sorted(obs.state.keys()),
-                sorted(self._state_motors),
-            )
-            self._schema_mismatch_warned = True
+        if not self._schema_mismatch_warned and self._state_motors and obs.state:
+            received = set(obs.state.keys())
+            expected = set(self._state_motors)
+            if received != expected:
+                missing = sorted(expected - received)
+                unexpected = sorted(received - expected)
+                _log.warning(
+                    "State schema mismatch: operator expects %s but robot"
+                    " sent %s (missing=%s, unexpected=%s). Check that both"
+                    " sides declare matching state keys.",
+                    sorted(expected),
+                    sorted(received),
+                    missing,
+                    unexpected,
+                )
+                self._schema_mismatch_warned = True
         for cam in self._camera_names:
             frame = obs.frames.get(cam)
             if frame is not None:
@@ -284,7 +287,7 @@ class LiveKitRobot(Robot):
         # When observation_features is provided it is the authoritative state
         # schema — same pattern as LiveKitTeleoperator using robot.observation_features.
         if config.observation_features:
-            obs_state_keys, obs_cameras = _split_observation_features(
+            obs_state_keys, obs_cameras = split_observation_features(
                 config.observation_features
             )
             cameras = {**cameras, **obs_cameras}
@@ -354,17 +357,3 @@ class LiveKitRobot(Robot):
 
 def _strip_pos(key: str) -> str:
     return key[: -len(".pos")] if key.endswith(".pos") else key
-
-
-def _split_observation_features(
-    features: dict,
-) -> tuple[list[str], dict[str, tuple[int, ...]]]:
-    """Separate scalar motor keys from camera (tuple-valued) keys."""
-    motor_keys: list[str] = []
-    cameras: dict[str, tuple[int, ...]] = {}
-    for key, val in features.items():
-        if isinstance(val, tuple):
-            cameras[key] = val
-        else:
-            motor_keys.append(key)
-    return sorted(motor_keys), cameras
