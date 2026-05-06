@@ -164,6 +164,37 @@ LiveKitRobotConfig(
 
 The dict follows lerobot's own `observation_features` convention: scalar types for motors, shape tuples for cameras. The robot side must declare and send the same keys via its `send_feedback` call.
 
+### Declaring action keys explicitly
+
+When your action keys differ from the observation keys and can't be expressed as `"{motor}.pos"` names, set `action_features` on the config. It is the explicit action schema used when no local `Teleoperator` is passed.
+
+```python
+LiveKitRobotConfig(
+    ...,
+    observation_features={
+        "shoulder.pos": float,
+        "elbow.pos": float,
+        "slider.pos": float,
+    },
+    action_features={
+        "shoulder.pos": float,
+        "elbow.pos": float,
+        # slider is read-only — not commanded
+    },
+)
+```
+
+You can also use `action_features` without `observation_features`. In that case, state is assumed to mirror the action schema (the default lerobot convention):
+
+```python
+LiveKitRobotConfig(
+    ...,
+    action_features={"gripper.pos": float, "wrist.vel": float},
+)
+```
+
+`action_features` is ignored when a local `Teleoperator` is passed — the teleop's `action_features` always take precedence.
+
 ### CLI mode
 
 If you instantiate via `--robot.type=livekit`, supply `motors` on the config:
@@ -203,6 +234,7 @@ Operator-only (`LiveKitRobotConfig`):
 | `camera_height` | `480` | Camera shape advertised in `observation_features` (metadata only — Portal accepts any resolution at runtime). |
 | `camera_width` | `640` | See above. |
 | `observation_features` | `None` | Full state schema when the robot reports state beyond the action keys (e.g. `{"shoulder.pos": float, "slider.pos": float}`). When set, replaces the default "state mirrors action" assumption. Follows lerobot's `observation_features` convention: scalar types for motors, shape tuples for cameras. |
+| `action_features` | `None` | Explicit action schema when action keys differ from observation keys and can't be derived from `motors` (e.g. `{"gripper.pos": float, "wrist.vel": float}`). Ignored when a local `Teleoperator` is passed. |
 
 See [tuning.md](tuning.md) for the math behind `fps`, `slack`, and `tolerance`.
 
@@ -238,4 +270,4 @@ The loop also handles Portal's callback dispatch, so if you ever want to registe
 | High `states_dropped` | Encoder is throttling or a camera stopped publishing. Compare `portal.metrics().transport.frames_received` (operator) with `frames_sent` (robot). |
 | `WrongRole` `PortalError` | You're calling `send_action` on the robot side or `send_state`/`send_video_frame` on the operator side. Role is fixed at `PortalConfig` construction. |
 | `InvalidFrameDimensions` | Frame width or height is odd. Portal requires even dimensions for I420 chroma subsampling. |
-| `ValueError: ... cannot infer schema` | Constructor got neither a local instance nor `motors`/`camera_names` on the config. Pass one or the other. |
+| `ValueError: ... cannot infer schema` | Constructor got neither a local instance nor `motors`/`action_features`/`camera_names` on the config. Pass one or the other. |
