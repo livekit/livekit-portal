@@ -10,6 +10,7 @@ LiveKitRobot forwards over the wire.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +27,10 @@ from livekit.portal import (
     VideoCodec,
     frame_bytes_to_numpy_rgb,
 )
+
+from ._utils import split_observation_features
+
+_log = logging.getLogger(__name__)
 
 
 @RobotConfig.register_subclass("livekit")
@@ -57,6 +62,13 @@ class LiveKitRobotConfig(RobotConfig):
     state_reliable: bool = True
     action_reliable: bool = True
     reuse_stale_frames: bool = False
+
+    # Full observation schema when the remote robot reports state beyond the
+    # action schema (e.g. {"shoulder.pos": float, "slider.pos": float}).
+    # Mirrors lerobot's observation_features convention: scalar keys map to a
+    # Python type; camera keys map to a shape tuple. When provided this
+    # replaces the default "state mirrors action" assumption entirely.
+    observation_features: dict | None = None
 
 
 class LiveKitRobot(Robot):
@@ -98,9 +110,14 @@ class LiveKitRobot(Robot):
         self._action_motors = [_strip_pos(k) for k in self._action_keys]
         self._camera_names = list(self._cameras.keys())
 
-        self._obs_features: dict = {k: float for k in self._state_keys}
-        for name, shape in self._cameras.items():
-            self._obs_features[name] = shape
+        if config.observation_features:
+            self._obs_features = dict(config.observation_features)
+            for name, shape in self._cameras.items():
+                self._obs_features.setdefault(name, shape)
+        else:
+            self._obs_features = {k: float for k in self._state_keys}
+            for name, shape in self._cameras.items():
+                self._obs_features[name] = shape
         self._act_features: dict = {k: float for k in self._action_keys}
 
         self._portal: Portal | None = None
@@ -109,6 +126,7 @@ class LiveKitRobot(Robot):
         self._loop_thread: threading.Thread | None = None
         self._connected = False
         self._last_observation_timestamp_us: int | None = None
+        self._schema_mismatch_warned = False
 
     # -- lerobot interface ----------------------------------------------------
 
@@ -207,6 +225,22 @@ class LiveKitRobot(Robot):
         for key, motor in zip(self._state_keys, self._state_motors):
             if motor in obs.state:
                 out[key] = float(obs.state[motor])
+        if not self._schema_mismatch_warned and self._state_motors and obs.state:
+            received = set(obs.state.keys())
+            expected = set(self._state_motors)
+            if received != expected:
+                missing = sorted(expected - received)
+                unexpected = sorted(received - expected)
+                _log.warning(
+                    "State schema mismatch: operator expects %s but robot"
+                    " sent %s (missing=%s, unexpected=%s). Check that both"
+                    " sides declare matching state keys.",
+                    sorted(expected),
+                    sorted(received),
+                    missing,
+                    unexpected,
+                )
+                self._schema_mismatch_warned = True
         for cam in self._camera_names:
             frame = obs.frames.get(cam)
             if frame is not None:
@@ -251,6 +285,25 @@ class LiveKitRobot(Robot):
         camera_shape = (config.camera_height, config.camera_width, 3)
         cameras = {name: camera_shape for name in config.camera_names}
 
+        # When observation_features is provided it is the authoritative state
+        # schema — same pattern as LiveKitTeleoperator using robot.observation_features.
+        if config.observation_features:
+            obs_state_keys, obs_cameras = split_observation_features(
+                config.observation_features
+            )
+            cameras = {**cameras, **obs_cameras}
+            if teleop is not None:
+                act_features = dict(getattr(teleop, "action_features", {}))
+                if not act_features:
+                    raise ValueError(
+                        "local teleop has empty action_features; cannot infer"
+                        " schema"
+                    )
+                return obs_state_keys, sorted(act_features.keys()), cameras
+            if config.motors:
+                return obs_state_keys, sorted(f"{m}.pos" for m in config.motors), cameras
+            return obs_state_keys, obs_state_keys, cameras
+
         if teleop is not None:
             act_features = dict(getattr(teleop, "action_features", {}))
             if not act_features:
@@ -259,15 +312,12 @@ class LiveKitRobot(Robot):
                     " schema"
                 )
             action_keys = sorted(act_features.keys())
-            # lerobot convention: observation mirrors action for telemetry
-            # (each commanded motor reports its actual position back).
-            state_keys = list(action_keys)
-            return state_keys, action_keys, cameras
+            # lerobot convention: observation mirrors action for telemetry.
+            return list(action_keys), action_keys, cameras
 
         if config.motors or config.camera_names:
             state_keys = sorted(f"{m}.pos" for m in config.motors)
-            action_keys = list(state_keys)
-            return state_keys, action_keys, cameras
+            return state_keys, list(state_keys), cameras
 
         raise ValueError(
             "LiveKitRobot needs either a local Teleoperator instance or"

@@ -10,6 +10,7 @@ physical robot stays in the user's loop; the plugin just brokers the wire.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +27,10 @@ from livekit.portal import (
     Role,
     VideoCodec,
 )
+
+from ._utils import split_observation_features
+
+logger = logging.getLogger(__name__)
 
 
 @TeleoperatorConfig.register_subclass("livekit")
@@ -57,20 +62,6 @@ class LiveKitTeleoperatorConfig(TeleoperatorConfig):
     state_reliable: bool = True
     action_reliable: bool = True
     reuse_stale_frames: bool = False
-
-
-def _split_observation_features(
-    features: dict,
-) -> tuple[list[str], dict[str, tuple[int, ...]]]:
-    """Separate scalar motor keys from camera (tuple-valued) keys."""
-    motor_keys: list[str] = []
-    cameras: dict[str, tuple[int, ...]] = {}
-    for key, val in features.items():
-        if isinstance(val, tuple):
-            cameras[key] = val
-        else:
-            motor_keys.append(key)
-    return sorted(motor_keys), cameras
 
 
 class LiveKitTeleoperator(Teleoperator):
@@ -246,6 +237,12 @@ class LiveKitTeleoperator(Teleoperator):
                 )
             self._portal.send_video_frame(cam, frame)
 
+        if logger.isEnabledFor(logging.DEBUG):
+            known = set(self._state_keys) | set(self._camera_names)
+            skipped = [k for k in feedback if k not in known]
+            if skipped:
+                logger.debug("send_feedback: skipped %d unknown key(s): %s", len(skipped), skipped)
+
     # -- schema resolution ---------------------------------------------------
 
     @staticmethod
@@ -261,7 +258,7 @@ class LiveKitTeleoperator(Teleoperator):
                     "local robot has empty observation_features /"
                     " action_features; cannot infer schema"
                 )
-            state_keys, cameras = _split_observation_features(obs_features)
+            state_keys, cameras = split_observation_features(obs_features)
             action_keys = sorted(act_features.keys())
             return state_keys, action_keys, cameras
 
