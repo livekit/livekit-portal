@@ -147,6 +147,23 @@ finally:
 
 Recording datasets, evaluating policies, or invoking lerobot's built-in teleop loops all work with `robot` here — they never see that it's remote.
 
+### Declaring extra state keys
+
+By default the operator assumes the robot reports back exactly the motors it commands (state mirrors action). If your robot also sends readings that aren't commanded — slider positions, current sensors, anything else — set `observation_features` on the config. It is the authoritative state schema and replaces the mirror assumption entirely.
+
+```python
+LiveKitRobotConfig(
+    ...,
+    observation_features={
+        "shoulder.pos": float,
+        "elbow.pos": float,
+        "slider.pos": float,   # extra — not in the action schema
+    },
+)
+```
+
+The dict follows lerobot's own `observation_features` convention: scalar types for motors, shape tuples for cameras. The robot side must declare and send the same keys via its `send_feedback` call.
+
 ### CLI mode
 
 If you instantiate via `--robot.type=livekit`, supply `motors` on the config:
@@ -177,13 +194,15 @@ Shared between both plugin configs:
 | `tolerance` | `None` | `PortalConfig.set_tolerance(...)`. `1.5` widens to ±1 frame; `0.5` drops on loss. |
 | `state_reliable` | `True` | SCTP reliable delivery for state. |
 | `action_reliable` | `True` | SCTP reliable delivery for action. |
+| `reuse_stale_frames` | `False` | Re-emit the last matched frame when a newer one hasn't arrived yet. |
 
-Robot-only (for `observation_features` shape metadata, since Portal doesn't know the remote resolution at construction time):
+Operator-only (`LiveKitRobotConfig`):
 
-| Field | Default |
-|---|---|
-| `camera_height` | `480` |
-| `camera_width` | `640` |
+| Field | Default | Purpose |
+|---|---|---|
+| `camera_height` | `480` | Camera shape advertised in `observation_features` (metadata only — Portal accepts any resolution at runtime). |
+| `camera_width` | `640` | See above. |
+| `observation_features` | `None` | Full state schema when the robot reports state beyond the action keys (e.g. `{"shoulder.pos": float, "slider.pos": float}`). When set, replaces the default "state mirrors action" assumption. Follows lerobot's `observation_features` convention: scalar types for motors, shape tuples for cameras. |
 
 See [tuning.md](tuning.md) for the math behind `fps`, `slack`, and `tolerance`.
 
@@ -206,7 +225,7 @@ The loop also handles Portal's callback dispatch, so if you ever want to registe
 - **Protobuf constraint.** The plugins pin to `protobuf>=5,<6` because lerobot's transitive deps cap there. `packages/livekit-portal/scripts/generate_protos.sh` rewrites the `_pb2.py` gencode version to `5.26.0` after each `protoc` run to make it load on that runtime.
 - **macOS libwebrtc linker.** `-ObjC` is set in `livekit-portal-ffi/build.rs` so VideoToolbox's ObjC categories link correctly. Don't drop it or you'll hit `NSInvalidArgumentException` at first `PeerConnection` creation.
 - **Plugin discovery.** lerobot subclass registration fires at import time. Either the CLI's `--robot.type=livekit` / `--teleop.type=livekit` mechanism needs the package on the import path, or your script imports `lerobot_robot_livekit` / `lerobot_teleoperator_livekit` before instantiating the config.
-- **Schema inference is shallow.** The plugin reads `robot.observation_features` / `teleop.action_features` once at construction. If your local class mutates those later, reconstruct the plugin.
+- **Schema inference is shallow.** The plugin reads `robot.observation_features` / `teleop.action_features` once at construction. If your local class mutates those later, reconstruct the plugin. On the operator side, use `observation_features` on `LiveKitRobotConfig` to declare the schema explicitly rather than relying on inference from the teleop.
 
 ## Troubleshooting
 
@@ -215,6 +234,7 @@ The loop also handles Portal's callback dispatch, so if you ever want to registe
 | `ffi not initialized` | cdylib didn't load. Rerun `build_ffi_python.sh` or set `LIVEKIT_PORTAL_FFI_LIB`. |
 | `LiveKit*Config.url and .token are required` | Token mint returned empty string, or you forgot to set them in the config. |
 | Observations always empty | First sync hasn't happened yet. Confirm both sides joined the same room, camera names match, and `fps` is identical. |
+| Observations always empty (state only) | State schema mismatch — the operator and robot declared different motor keys. A `WARNING` log fires on the first dropped sync naming the missing and unexpected fields. Check `logging` output or set `logging.basicConfig(level=logging.WARNING)` to surface it. Use `observation_features` on `LiveKitRobotConfig` to declare the exact schema the robot sends. |
 | High `states_dropped` | Encoder is throttling or a camera stopped publishing. Compare `portal.metrics().transport.frames_received` (operator) with `frames_sent` (robot). |
 | `WrongRole` `PortalError` | You're calling `send_action` on the robot side or `send_state`/`send_video_frame` on the operator side. Role is fixed at `PortalConfig` construction. |
 | `InvalidFrameDimensions` | Frame width or height is odd. Portal requires even dimensions for I420 chroma subsampling. |
