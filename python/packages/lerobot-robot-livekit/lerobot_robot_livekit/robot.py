@@ -61,10 +61,12 @@ class LiveKitRobotConfig(RobotConfig):
     action_reliable: bool = True
     reuse_stale_frames: bool = False
 
-    # Extra state keys beyond the action schema (e.g. {"slider.pos": float}).
-    # Values are the Python types used in observation_features. Keys follow the
-    # same ".pos" convention as motor keys; bare names are also accepted.
-    state_features: dict | None = None
+    # Full observation schema when the remote robot reports state beyond the
+    # action schema (e.g. {"shoulder.pos": float, "slider.pos": float}).
+    # Mirrors lerobot's observation_features convention: scalar keys map to a
+    # Python type; camera keys map to a shape tuple. When provided this
+    # replaces the default "state mirrors action" assumption entirely.
+    observation_features: dict | None = None
 
 
 class LiveKitRobot(Robot):
@@ -106,13 +108,14 @@ class LiveKitRobot(Robot):
         self._action_motors = [_strip_pos(k) for k in self._action_keys]
         self._camera_names = list(self._cameras.keys())
 
-        self._obs_features: dict = {k: float for k in self._state_keys}
-        if config.state_features:
-            for k, t in config.state_features.items():
-                if k in self._obs_features:
-                    self._obs_features[k] = t
-        for name, shape in self._cameras.items():
-            self._obs_features[name] = shape
+        if config.observation_features:
+            self._obs_features = dict(config.observation_features)
+            for name, shape in self._cameras.items():
+                self._obs_features.setdefault(name, shape)
+        else:
+            self._obs_features = {k: float for k in self._state_keys}
+            for name, shape in self._cameras.items():
+                self._obs_features[name] = shape
         self._act_features: dict = {k: float for k in self._action_keys}
 
         self._portal: Portal | None = None
@@ -277,7 +280,25 @@ class LiveKitRobot(Robot):
     ) -> tuple[list[str], list[str], dict[str, tuple[int, ...]]]:
         camera_shape = (config.camera_height, config.camera_width, 3)
         cameras = {name: camera_shape for name in config.camera_names}
-        extra_state = sorted(config.state_features.keys()) if config.state_features else []
+
+        # When observation_features is provided it is the authoritative state
+        # schema — same pattern as LiveKitTeleoperator using robot.observation_features.
+        if config.observation_features:
+            obs_state_keys, obs_cameras = _split_observation_features(
+                config.observation_features
+            )
+            cameras = {**cameras, **obs_cameras}
+            if teleop is not None:
+                act_features = dict(getattr(teleop, "action_features", {}))
+                if not act_features:
+                    raise ValueError(
+                        "local teleop has empty action_features; cannot infer"
+                        " schema"
+                    )
+                return obs_state_keys, sorted(act_features.keys()), cameras
+            if config.motors:
+                return obs_state_keys, sorted(f"{m}.pos" for m in config.motors), cameras
+            return obs_state_keys, obs_state_keys, cameras
 
         if teleop is not None:
             act_features = dict(getattr(teleop, "action_features", {}))
@@ -287,21 +308,12 @@ class LiveKitRobot(Robot):
                     " schema"
                 )
             action_keys = sorted(act_features.keys())
-            # lerobot convention: observation mirrors action for telemetry
-            # (each commanded motor reports its actual position back).
-            state_keys = list(action_keys)
-            for k in extra_state:
-                if k not in state_keys:
-                    state_keys.append(k)
-            return state_keys, action_keys, cameras
+            # lerobot convention: observation mirrors action for telemetry.
+            return list(action_keys), action_keys, cameras
 
         if config.motors or config.camera_names:
             state_keys = sorted(f"{m}.pos" for m in config.motors)
-            action_keys = list(state_keys)
-            for k in extra_state:
-                if k not in state_keys:
-                    state_keys.append(k)
-            return state_keys, action_keys, cameras
+            return state_keys, list(state_keys), cameras
 
         raise ValueError(
             "LiveKitRobot needs either a local Teleoperator instance or"
@@ -342,3 +354,17 @@ class LiveKitRobot(Robot):
 
 def _strip_pos(key: str) -> str:
     return key[: -len(".pos")] if key.endswith(".pos") else key
+
+
+def _split_observation_features(
+    features: dict,
+) -> tuple[list[str], dict[str, tuple[int, ...]]]:
+    """Separate scalar motor keys from camera (tuple-valued) keys."""
+    motor_keys: list[str] = []
+    cameras: dict[str, tuple[int, ...]] = {}
+    for key, val in features.items():
+        if isinstance(val, tuple):
+            cameras[key] = val
+        else:
+            motor_keys.append(key)
+    return sorted(motor_keys), cameras
